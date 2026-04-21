@@ -86,4 +86,45 @@ class MultiLayerDecoder_mask(nn.Module):
             x = self.output_layers[i](x)
             x = F.relu(x)
         return x        
-        
+
+class MultiLayerDecoder_trans(nn.Module):
+    def __init__(self, embed_dim=512, seq_len=6, output_layers=[256, 128, 64], nhead=8, num_layers=8, ff_dim_factor=4):
+        super(MultiLayerDecoder_trans, self).__init__()
+        self.positional_encoding = PositionalEncoding(embed_dim, max_seq_len=seq_len)
+        self.sa_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=nhead, dim_feedforward=ff_dim_factor*embed_dim, activation="gelu", batch_first=True, norm_first=True)
+        self.sa_decoder = nn.TransformerEncoder(self.sa_layer, num_layers=num_layers)
+        #self.output_layers = nn.ModuleList([nn.Linear(seq_len*embed_dim+1, embed_dim)])
+        #self.output_layers.append(nn.Linear(embed_dim, output_layers[0]))
+        #for i in range(len(output_layers)-1):
+        #    self.output_layers.append(nn.Linear(output_layers[i], output_layers[i+1]))
+
+    def forward(self, x):
+        if self.positional_encoding: x = self.positional_encoding(x)
+        x = self.sa_decoder(x)
+        # currently, x is [batch_size, seq_len, embed_dim]
+        #x = torch.cat((x.reshape(x.shape[0], -1), taskid.unsqueeze(1)), dim=1)
+        #for i in range(len(self.output_layers)):
+        #    x = self.output_layers[i](x)
+        #    x = F.relu(x)
+        return x
+
+class MultiLayerDecoder_idcat(nn.Module):
+    def __init__(self, embed_dim=512, seq_len=6, output_layers=[256, 128, 64], nhead=8, num_layers=8, ff_dim_factor=4):
+        super(MultiLayerDecoder_idcat, self).__init__()
+        self.positional_encoding = PositionalEncoding(embed_dim, max_seq_len=seq_len)
+        self.sa_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=nhead, dim_feedforward=ff_dim_factor*embed_dim, activation="gelu", batch_first=True, norm_first=True)
+        self.sa_decoder = nn.TransformerEncoder(self.sa_layer, num_layers=num_layers)
+        self.output_layers = nn.ModuleList([nn.Linear(seq_len*embed_dim+1, embed_dim)])
+        self.output_layers.append(nn.Linear(embed_dim, output_layers[0]))
+        for i in range(len(output_layers)-1):
+            self.output_layers.append(nn.Linear(output_layers[i], output_layers[i+1]))
+
+    def forward(self, x, taskid):
+        if self.positional_encoding: x = self.positional_encoding(x)
+        x = self.sa_decoder(x)
+        # currently, x is [batch_size, seq_len, embed_dim]
+        x = torch.cat((x.reshape(x.shape[0], -1), taskid.unsqueeze(1)), dim=1)
+        for i in range(len(self.output_layers)):
+            x = self.output_layers[i](x)
+            x = F.relu(x)
+        return x
