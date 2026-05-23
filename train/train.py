@@ -110,7 +110,9 @@ def main(config):
             if data_split_type in data_config:
                 if config["project_name"] == "frodobot-gnm":                    
                     ratio_f = config["ratio_f"]
-                    split_train_test = int(11994*ratio_f)
+                    # split_train_test = int(11994*ratio_f)  # original: full FrodoBots-2K (11994 episodes)
+                    num_episodes = config.get("num_episodes", 11994)
+                    split_train_test = int(num_episodes * ratio_f)
                      
                     batch_gnm = int(config["batch_size"]*0.5) 
                     batch_frodobot = config["batch_size"] - batch_gnm
@@ -128,10 +130,12 @@ def main(config):
                     elif data_split_type == "test":
                         if config["model_type"] == "LogoNav": 
                             dataset = FrodbotDataset_LogoNav(repo_id=config["repo_id"], video="video", root=config["root"], image_size=config["image_size"], split="train", goal_horizon=config["horizon_short"], goal_horizon2=config["horizon_long"], sacson=config["SACSoN"], context_spacing=3, action_spacing=3)                  
-                            episode_sampler_test = EpisodeSampler_MBRA(dataset, split_train_test, 11994-1, goal_horizon=config["horizon_short"], data_split_type=data_split_type)                                                                                   
+                            # episode_sampler_test = EpisodeSampler_MBRA(dataset, split_train_test, 11994-1, ...)  # original
+                            episode_sampler_test = EpisodeSampler_MBRA(dataset, split_train_test, num_episodes - 1, goal_horizon=config["horizon_short"], data_split_type=data_split_type)  # num_episodes from config                                                                                   
                         else:
                             dataset = FrodbotDataset_MBRA(repo_id=config["repo_id"], video="video", root=config["root"], image_size=config["image_size"], split="train", goal_horizon=config["horizon_short"], sacson=config["SACSoN"], context_spacing=3, action_spacing=1)                                                 
-                            episode_sampler_test = EpisodeSampler_MBRA(dataset, split_train_test, 11994-1, goal_horizon=config["horizon_short"], data_split_type=data_split_type)                                               
+                            # episode_sampler_test = EpisodeSampler_MBRA(dataset, split_train_test, 11994-1, ...)  # original
+                            episode_sampler_test = EpisodeSampler_MBRA(dataset, split_train_test, num_episodes - 1, goal_horizon=config["horizon_short"], data_split_type=data_split_type)  # num_episodes from config                                               
                 else:                
                     dataset = ViNT_Dataset(
                         data_folder=data_config["data_folder"],
@@ -162,9 +166,10 @@ def main(config):
                     test_dataloaders[dataset_type] = dataset
 
     #Definition of sub dataset (MBRA project: GNM dataset)
+    use_sub_dataset = config.get("use_sub_dataset", True) and bool(config.get("datasets_sub"))
     train_dataset_sub = []
-    test_dataloaders_sub = {}    
-    if config["project_name"] == "frodobot-gnm":             
+    test_dataloaders_sub = {}
+    if config["project_name"] == "frodobot-gnm" and use_sub_dataset:
         for dataset_name in config["datasets_sub"]:                
             data_config_sub = config["datasets_sub"][dataset_name]
             if "negative_mining" not in data_config_sub:
@@ -252,26 +257,32 @@ def main(config):
 
     # combine all the datasets from different robots
     train_dataset = ConcatDataset(train_dataset)
+    if not use_sub_dataset:
+        batch_gnm = 0
+        batch_frodobot = config["batch_size"]
     print(len(episode_sampler_train), len(episode_sampler_test))
 
     if config["project_name"] == "frodobot-gnm":
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_frodobot,
-            shuffle=False,            
+            shuffle=False,
             num_workers=config["num_workers"],
             drop_last=True,
             persistent_workers=True,
             sampler=episode_sampler_train,
         )
-        train_loader_sub = DataLoader(
-            train_dataset_sub,
-            batch_size=batch_gnm,
-            shuffle=True,
-            num_workers=config["num_workers"],
-            drop_last=True,
-            persistent_workers=True,
-        )         
+        if use_sub_dataset:
+            train_loader_sub = DataLoader(
+                train_dataset_sub,
+                batch_size=batch_gnm,
+                shuffle=True,
+                num_workers=config["num_workers"],
+                drop_last=True,
+                persistent_workers=True,
+            )
+        else:
+            train_loader_sub = None         
     else:
         train_loader = DataLoader(
             train_dataset,
@@ -853,5 +864,5 @@ if __name__ == "__main__":
             wandb.run.name = config["run_name"]
         # update the wandb args with the training configurations
         if wandb.run:
-            wandb.config.update(config)
+            wandb.config.update(config, allow_val_change=True)
     main(config)

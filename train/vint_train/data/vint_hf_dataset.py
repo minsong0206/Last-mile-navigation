@@ -254,16 +254,18 @@ class FrodbotDataset_MBRA(LeRobotDataset):
         print("root_init", root)
         super().__init__(
             repo_id=repo_id,
-            video=video,
+            # video=video,  # removed: not supported in current lerobot version
             root=root,
             split=split,
             image_transforms=image_transforms,
+            # video_backend="video_reader",  # requires torchvision compiled from source
+            video_backend="pyav",
             delta_timestamps={
                 "observation.filtered_position": [0.0],
                 "observation.relative_position": [0.0],
                 "observation.filtered_heading": [0.0],
                 "observation.images.front": [i * context_spacing * self.dt for i in range(-context_size, 1)],
-                "action": [i * action_spacing * self.dt for i in range(action_horizon)],                
+                "action": [i * action_spacing * self.dt for i in range(action_horizon)],
             },
         )
 
@@ -352,7 +354,7 @@ class FrodbotDataset_MBRA(LeRobotDataset):
             self.tolerance_s,
         )
         
-        flip_tf = random.random() > 0.5 
+        flip_tf = random.random() > 0.5
         image_obs = self._image_transforms(load_from_videos(
             {"observation.images.front": item["observation.images.front"][:-1]},
             ["observation.images.front"],
@@ -502,16 +504,18 @@ class FrodbotDataset_LogoNav(LeRobotDataset):
         print("root_init", root)
         super().__init__(
             repo_id=repo_id,
-            video=video,
+            # video=video,  # removed: not supported in current lerobot version
             root=root,
             split=split,
             image_transforms=image_transforms,
+            # video_backend="video_reader",  # requires torchvision compiled from source
+            video_backend="pyav",
             delta_timestamps={
                 "observation.filtered_position": [0.0],
                 "observation.relative_position": [0.0],
                 "observation.filtered_heading": [0.0],
                 "observation.images.front": [i * context_spacing * self.dt for i in range(-context_size, 1)],
-                "action": [i * action_spacing * self.dt for i in range(action_horizon)],                
+                "action": [i * action_spacing * self.dt for i in range(action_horizon)],
             },
         )
 
@@ -522,7 +526,7 @@ class FrodbotDataset_LogoNav(LeRobotDataset):
         }
         self.min_action_distance = 3
         self.max_action_distance = 20
-        
+
     def _image_transforms(self, img: torch.Tensor, flip) -> torch.Tensor:
         """
         Args:
@@ -536,10 +540,10 @@ class FrodbotDataset_LogoNav(LeRobotDataset):
         original_height, original_width = img.shape[-2:]
         target_aspect = 4 / 3
         img = TF.resize(img, self.image_size)
-        
+
         if flip:
             img = torch.flip(img, dims=(-1,))
-        
+
         return img
 
     def _image_transforms_depth(self, img: torch.Tensor, flip) -> torch.Tensor:
@@ -606,7 +610,7 @@ class FrodbotDataset_LogoNav(LeRobotDataset):
             self.tolerance_s,
         )
         
-        flip_tf = random.random() > 0.5     
+        flip_tf = random.random() > 0.5
         image_obs = self._image_transforms(load_from_videos(
             {"observation.images.front": item["observation.images.front"][:-3]},
             ["observation.images.front"],
@@ -614,7 +618,7 @@ class FrodbotDataset_LogoNav(LeRobotDataset):
             self.tolerance_s,
             self.video_backend,
         )["observation.images.front"], flip_tf)
-        
+
         image_goal2 = self._image_transforms(load_from_videos(
             {"observation.images.front": item["observation.images.front"][-2]},
             ["observation.images.front"],
@@ -622,15 +626,15 @@ class FrodbotDataset_LogoNav(LeRobotDataset):
             self.tolerance_s,
             self.video_backend,
         )["observation.images.front"], flip_tf) #for inverse dynamics model
-                
+
         image_goal = self._image_transforms(load_from_videos(
             {"observation.images.front": item["observation.images.front"][-3]},
             ["observation.images.front"],
             self.videos_dir,
             self.tolerance_s,
             self.video_backend,
-        )["observation.images.front"], flip_tf)        
-        
+        )["observation.images.front"], flip_tf)
+
         image_current, image_raw = self._image_transforms_depth(load_from_videos(
             {"observation.images.front": item["observation.images.front"][-4]},
             ["observation.images.front"],

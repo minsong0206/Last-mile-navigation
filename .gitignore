@@ -9,3 +9,22 @@ map_cache
 train/vint_train/data/sampler
 train/config/LogoNav_.yaml
 download_youtube/videos
+
+# ── 추가: 데이터 / 대용량 파일 ────────────────────────────────────────────────
+FrodoBots-2K/
+frodo_dataset/
+cache/
+data_splits/
+osm_pipeline/osm_data/output_*/osm_maps/
+osm_pipeline/tile_cache/
+osm_pipeline/dataset/
+osm_pipeline/osrm/
+train/lelan.egg-info/
+diffusion_policy/
+tools/odom_dataset/
+tools/global_odom_maps/
+*.pth
+*.pt
+*.arrow
+*.zarr
+*.mp4

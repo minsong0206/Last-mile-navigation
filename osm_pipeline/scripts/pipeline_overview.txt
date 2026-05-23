@@ -1,0 +1,182 @@
+================================================================================
+  FrodoBots × OpenStreetMap 내비게이션 데이터셋 전처리 파이프라인 전체 정리
+================================================================================
+
+목적:
+  FrodoBots 실주행 데이터셋에서 OSM(OpenStreetMap) 경로와 실제 로봇 궤적이
+  잘 일치하는 구간만 선별하고, 각 프레임마다 ego-centric OSM 지도 이미지를
+  생성하여 NoMaD 스타일 비주얼 내비게이션 모델의 학습 데이터로 사용한다.
+
+데이터셋:
+  - FrodoBots-2K (HuggingFace lerobot 포맷, Apache Arrow)
+  - 총 252개 에피소드, 3개 지역: Perth(호주), Taipei(대만), Tokyo(일본)
+  - 주요 컬럼: observation.latitude/longitude, observation.filtered_position (EKF),
+               observation.filtered_heading, observation.images.front
+
+================================================================================
+  STEP 0. 지역별 OSRM 서버 구축 (보행자 foot profile)
+================================================================================
+
+이유:
+  FrodoBots 로봇은 보행자 경로(인도, 공원)로 이동한다.
+  차량 경로가 아닌 foot profile로 라우팅해야 실제 경로와 일치한다.
+  공개 OSRM API 대신 로컬 Docker 서버를 사용하여 속도·안정성 확보.
+
+과정:
+  1. 각 지역의 OSM 지도 데이터를 Overpass API로 다운로드
+       Perth  : bbox(-33.0, 115.7, -31.6, 116.1)
+       Taipei : bbox(25.0, 121.4, 25.2, 121.7)
+       Tokyo  : bbox(35.5, 139.5, 35.8, 139.9)
+       URL 형식: https://overpass-api.de/api/map?bbox=lon_min,lat_min,lon_max,lat_max
+
+  2. OSRM Docker로 각 지역 데이터 전처리 (foot.lua 프로파일)
+       docker run osrm/osrm-backend osrm-extract -p /opt/foot.lua /data/region.osm
+       docker run osrm/osrm-backend osrm-partition /data/region.osrm
+       docker run osrm/osrm-backend osrm-customize /data/region.osrm
+
+  3. 지역별 포트로 라우팅 서버 실행
+       Perth  → localhost:5001
+       Taipei → localhost:5002
+       Tokyo  → localhost:5003
+
+결과 파일:
+  osm_pipeline/osrm/perth.osm  + perth.osrm.*  (전처리 완료)
+  osm_pipeline/osrm/taipei.osm + taipei.osrm.*
+  osm_pipeline/osrm/tokyo.osm  + tokyo.osrm.*
+
+================================================================================
+  STEP 1. Episode Selection — 유효 세그먼트 선별
+================================================================================
+
+파일: osm_pipeline/episode_selector.py
+출력: osm_pipeline/episode_scores.json
+
+목적:
+  252개 에피소드 중 OSM 경로와 실제 EKF 궤적이 잘 일치하는 구간만 선별.
+  세 가지 새 기준을 추가하여 기존 v1 대비 품질을 향상.
+
+처리 순서:
+
+  [1] 정적 프레임 제거
+      - EKF filtered_position 기준 프레임 간 이동거리 < 0.05m 이면 정적으로 판단
+      - 정적 프레임은 궤적 분석에서 제외 (단, GPS 해상도 한계로 GPS 기준이 아닌
+        EKF 기준 사용 — GPS는 소수점 8자리에서도 이동 감지 불가)
+
+  [2] 세그먼트 분리 (Segment Splitting)
+      - 연속 정적 프레임이 50개 이상이면 로봇이 재시작한 것으로 판단
+      - 해당 지점에서 에피소드를 분리하여 각 연속 이동 구간을 독립 세그먼트로 평가
+      - 예: ep020 → seg0(2711프레임), seg1(1577프레임), seg2(743프레임) ...
+
+  [3] 기본 필터
+      - 세그먼트 프레임 수 < 100 → 제외
+      - 세그먼트 총 이동거리 < 30m → 제외
+
+  [4] 보행자 도로 검증 (Sidewalk Snap Check)
+      - 세그먼트 내 10개 지점을 OSRM /nearest/v1/foot/ API로 보행자 도로에 스냅
+      - 스냅 거리 > 15m 이면 인도가 아닌 것으로 판단 → off_sidewalk 제외
+
+  [5] OSRM 경로 정렬 비교 (Path Alignment Metrics)
+      - 세그먼트 궤적의 8개 waypoint로 OSRM foot 경로 요청
+      - 두 경로를 UTM 좌표로 변환 후 100점으로 리샘플링하여 비교:
+          Fréchet 거리 (normalized)  < 0.5
+          Chamfer 거리 (normalized)  < 0.15
+          평균 heading 오차          < 45도
+          경로 길이 비율 (OSM/EKF)   0.5 ~ 2.0 사이
+
+결과:
+  - 252개 에피소드 → 2617개 세그먼트 분리
+  - 최종 선별: 167개 세그먼트
+  - 제외 이유 분포:
+      too_short_frames : 2025개 (너무 짧은 구간)
+      too_short_traj   :  379개 (이동거리 30m 미만)
+      heading 오차 초과:   20개
+      off_sidewalk     :   13개
+      chamfer 초과     :    7개
+      fréchet 초과     :    6개
+
+================================================================================
+  STEP 2. OSM Map Generation — 프레임별 ego-centric 지도 생성
+================================================================================
+
+파일: osm_pipeline/osm_map_generator.py
+출력: osm_pipeline/osm_maps/episode_{ep:04d}_seg{seg:02d}/
+
+목적:
+  선별된 세그먼트의 각 프레임마다 로봇 시점 기준 OSM 지도 이미지를 생성.
+  모델 입력으로 사용할 224×224 PNG.
+
+처리 순서:
+
+  [1] OSM 타일 캔버스 빌드 (에피소드당 1회)
+      - zoom=18 (~0.6m/pixel) 기준
+      - 세그먼트 GPS bbox를 커버하는 모든 타일을 tile.openstreetmap.org에서 다운로드
+      - 디스크 캐시 사용 (osm_pipeline/tile_cache/)
+      - 타일들을 이어붙여 하나의 큰 캔버스로 구성
+
+  [2] 프레임별 렌더링 (각 프레임마다)
+      - 현재 위치에서 20m 앞 goal 지점 계산
+      - OSRM으로 현재 위치 → goal 경로 요청
+      - 캔버스 복사본에 오버레이:
+          회색 선: 과거 50프레임 EKF 궤적
+          빨간 선: OSRM 미래 경로 (현재 위치 → goal)
+          초록 원: 현재 ego 위치
+      - Heading-up 회전: rot_deg = 90° - heading_deg (OpenCV CCW)
+      - 회전 전 sqrt(2)×crop_r 크기로 pre-crop → 회전 후 다시 crop (코너 잘림 방지)
+      - 224×224로 리사이즈하여 저장
+
+  [3] GPS 좌표 저장 (세그먼트당 1회)
+      - gps.csv: frame_index, latitude, longitude
+
+  [4] BEV 조감도 저장 (세그먼트당 1회)
+      - zoom=17 (zoom-1)로 더 넓은 지역 캔버스 별도 빌드
+      - GPS 경로를 파란 선으로 오버레이
+      - 시작점(초록 원), 끝점(파란 원) 표시
+      - 경로 bbox + 80px 여백으로 crop하여 bev_overview.png 저장
+
+결과:
+  - 167개 폴더 생성
+  - 총 125,306개 osm_map_*.png
+  - 167개 gps.csv
+  - 167개 bev_overview.png
+  - 처리 속도: ~110 frames/sec (타일 캐시 적중 시)
+
+================================================================================
+  최종 출력 폴더 구조
+================================================================================
+
+osm_pipeline/
+├── episode_scores.json              ← 세그먼트별 선별 결과 및 메트릭
+├── episode_selector.py              ← Step 1 구현
+├── osm_map_generator.py             ← Step 2 구현
+├── osrm/                            ← OSRM 지도 데이터 및 전처리 결과
+│   ├── perth.osm  + perth.osrm.*
+│   ├── taipei.osm + taipei.osrm.*
+│   └── tokyo.osm  + tokyo.osrm.*
+├── tile_cache/                      ← OSM 타일 디스크 캐시
+└── osm_maps/
+    └── episode_{ep:04d}_seg{seg:02d}/
+        ├── osm_map_000000.png       ← 프레임별 224×224 ego-centric 지도
+        ├── osm_map_000001.png
+        ├── ...
+        ├── gps.csv                  ← 프레임별 GPS 좌표
+        └── bev_overview.png         ← 전체 경로 OSM 조감도
+
+================================================================================
+  다음 단계 (Step 3, 미구현)
+================================================================================
+
+Dataset Builder:
+  선별된 세그먼트의 각 프레임에서 학습 샘플 패키징
+
+  각 타임스텝 t 마다:
+    current_image.jpg    ← 현재 프레임 전방 카메라 이미지
+    past_image_1.jpg     ← t-1 프레임 카메라 이미지
+    past_image_2.jpg     ← t-2 프레임 카메라 이미지
+    osm_map.png          ← 해당 프레임의 ego-centric OSM 지도 (이미 생성됨)
+    metadata.json        ← GPS, timestamp, episode/segment/frame 정보
+
+  카메라 이미지 추출 방법:
+    Arrow 파일의 observation.images.front 컬럼 (VideoFrame 형식)
+    → 각 프레임의 video_path + frame_index로 실제 이미지 디코딩 필요
+
+================================================================================

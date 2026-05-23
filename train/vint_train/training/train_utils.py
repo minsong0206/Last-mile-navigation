@@ -1634,13 +1634,13 @@ def train_MBRA(
 ###
 def train_LogoNav(
     model: nn.Module,
-    model_mbra: nn.Module,    
+    model_mbra: nn.Module,
     ema_model: EMAModel,
     optimizer: Adam,
     lr_scheduler: torch.optim.lr_scheduler._LRScheduler,
     latest_path: str,
     dataloader: DataLoader,
-    dataloader_sub: DataLoader,    
+    dataloader_sub: Optional[DataLoader],
     transform: transforms,
     device: torch.device,
     project_folder: str,
@@ -1684,8 +1684,8 @@ def train_LogoNav(
         "total_loss": total_loss_logger,
         "action_loss": action_loss_logger,                
     }          
-    dataloader_sub_iter = iter(dataloader_sub)           
-    
+    dataloader_sub_iter = iter(dataloader_sub) if dataloader_sub is not None else None
+
     model_mbra.eval().to(device)          
     with tqdm.tqdm(dataloader, desc="Train Batch", leave=False) as tepoch:
         for i, data in enumerate(tepoch):
@@ -1711,102 +1711,105 @@ def train_LogoNav(
                 robot_list,
             ) = data
 
-            try:
-                (
-                    obs_image_sub,
-                    goal_image_sub,
-                    action_label_sub,
-                    dist_label_sub,
-                    goal_pos_sub,
-                    goal_yaw_sub,                    
-                    dataset_index_sub,
-                    action_mask_sub,
-                    #_,
-                    #_,
-                ) = next(dataloader_sub_iter)
-            except StopIteration:
-                dataloader_sub_iter = iter(dataloader_sub) 
-                (
-                    obs_image_sub,
-                    goal_image_sub,
-                    action_label_sub,
-                    dist_label_sub,
-                    goal_pos_sub,
-                    goal_yaw_sub,                     
-                    dataset_index_sub,
-                    action_mask_sub,
-                    #_,
-                    #_,
-                ) = next(dataloader_sub_iter)        
-    
-            Bsub, _, H, W = obs_image_sub.size()  
+            if dataloader_sub_iter is not None:
+                try:
+                    (
+                        obs_image_sub,
+                        goal_image_sub,
+                        action_label_sub,
+                        dist_label_sub,
+                        goal_pos_sub,
+                        goal_yaw_sub,
+                        dataset_index_sub,
+                        action_mask_sub,
+                    ) = next(dataloader_sub_iter)
+                except StopIteration:
+                    dataloader_sub_iter = iter(dataloader_sub)
+                    (
+                        obs_image_sub,
+                        goal_image_sub,
+                        action_label_sub,
+                        dist_label_sub,
+                        goal_pos_sub,
+                        goal_yaw_sub,
+                        dataset_index_sub,
+                        action_mask_sub,
+                    ) = next(dataloader_sub_iter)
 
-            obs_images_sub = torch.split(obs_image_sub, 3, dim=1)
-            viz_obs_image_sub = TF.resize(obs_images_sub[-1], VISUALIZATION_IMAGE_SIZE[::-1])
-            viz_obs_image_past_sub = TF.resize(obs_images_sub[0], VISUALIZATION_IMAGE_SIZE[::-1])
-            obs_images_sub = [transform(obs_image_sub).to(device) for obs_image_sub in obs_images_sub]
-            obs_image_sub = torch.cat(obs_images_sub, dim=1)
-
-            viz_goal_image_sub = TF.resize(goal_image_sub, VISUALIZATION_IMAGE_SIZE[::-1])
-            goal_image_sub = transform(goal_image_sub).to(device)
-
-            dist_label_sub = dist_label_sub.to(device)
-            action_label_sub = action_label_sub.to(device)
-            action_mask_sub = action_mask_sub.to(device)
-            goal_mask_sub = dist_label_sub > -1.0
-            
-            goal_pose_gps_sub = torch.cat((goal_pos_sub, torch.cos(goal_yaw_sub).unsqueeze(1), torch.sin(goal_yaw_sub).unsqueeze(1)), axis=1)
+                Bsub, _, H, W = obs_image_sub.size()
+                obs_images_sub = torch.split(obs_image_sub, 3, dim=1)
+                viz_obs_image_sub = TF.resize(obs_images_sub[-1], VISUALIZATION_IMAGE_SIZE[::-1])
+                viz_obs_image_past_sub = TF.resize(obs_images_sub[0], VISUALIZATION_IMAGE_SIZE[::-1])
+                obs_images_sub = [transform(obs_image_sub).to(device) for obs_image_sub in obs_images_sub]
+                obs_image_sub = torch.cat(obs_images_sub, dim=1)
+                viz_goal_image_sub = TF.resize(goal_image_sub, VISUALIZATION_IMAGE_SIZE[::-1])
+                goal_image_sub = transform(goal_image_sub).to(device)
+                dist_label_sub = dist_label_sub.to(device)
+                action_label_sub = action_label_sub.to(device)
+                action_mask_sub = action_mask_sub.to(device)
+                goal_mask_sub = dist_label_sub > -1.0
+                goal_pose_gps_sub = torch.cat((goal_pos_sub, torch.cos(goal_yaw_sub).unsqueeze(1), torch.sin(goal_yaw_sub).unsqueeze(1)), axis=1)
 
             if psutil.virtual_memory().percent > 90.0:
                 print("RAM usage (%)", psutil.virtual_memory().percent)
                 break
-            
-            B, _, H, W = obs_image.size()  
+
+            B, _, H, W = obs_image.size()
             obs_images = torch.split(obs_image, 3, dim=1)
             viz_obs_image = TF.resize(obs_images[-1], VISUALIZATION_IMAGE_SIZE[::-1])
-            viz_obs_image_past = TF.resize(obs_images[0], VISUALIZATION_IMAGE_SIZE[::-1])     
-            
+            viz_obs_image_past = TF.resize(obs_images[0], VISUALIZATION_IMAGE_SIZE[::-1])
+
             obs_images_future = torch.split(obs_image_future, 3, dim=1)
-                   
+
             obs_images = [transform(obs_image).to(device) for obs_image in obs_images]
             obs_image = torch.cat(obs_images, dim=1)
             actions = actions.to(device)
             action_mask = action_mask.to(device)
 
-            batch_goal_pos = goal_pos.to(device)    
+            batch_goal_pos = goal_pos.to(device)
             goal_pose_gps = torch.cat((goal_pos, local_goal_mat[:,1,1].unsqueeze(1), local_goal_mat[:,1,0].unsqueeze(1)), axis=1)
-                
+
             # Get distance label
             distance = distance.float().to(device)
-            goal_mask = distance > 0.1                        
+            goal_mask = distance > 0.1
 
             for ig in range(B):
                 if not goal_mask[ig]:
                     distance[ig] = 20
-                    igr = random.randint(0, B-1) 
+                    igr = random.randint(0, B-1)
                     while ig == igr:
-                        igr = random.randint(0, B-1) 
+                        igr = random.randint(0, B-1)
                     goal_image[ig] = goal_image[igr]
 
             viz_goal_image = TF.resize(goal_image, VISUALIZATION_IMAGE_SIZE[::-1])
-            goal_image = transform(goal_image).to(device)         
-            goal_image2 = transform(goal_image2).to(device)         
-                        
-            combined_obs_image = torch.cat((obs_image, obs_image_sub), axis=0)
-            combined_goal_image = torch.cat((goal_image, goal_image_sub), axis=0)            
-            combined_actions_origin = torch.cat((actions, action_label_sub), axis=0)   
-            
-            combined_distance = torch.cat((distance, dist_label_sub), axis=0)   
-            combined_goal_mask = torch.cat((goal_mask, goal_mask_sub), axis=0)                   
-            combined_action_mask = torch.cat((action_mask, action_mask_sub), axis=0) 
+            goal_image = transform(goal_image).to(device)
+            goal_image2 = transform(goal_image2).to(device)
 
-            combined_viz_obs_image = torch.cat((viz_obs_image, viz_obs_image_sub), axis=0)                   
-            combined_viz_obs_image_past = torch.cat((viz_obs_image_past, viz_obs_image_past_sub), axis=0) 
-            combined_viz_goal_image = torch.cat((viz_goal_image, viz_goal_image_sub), axis=0) 
-            combined_goal_pos = torch.cat((goal_pos, goal_pos_sub), axis=0) 
-            combined_goal_pos_gps = torch.cat((goal_pose_gps, goal_pose_gps_sub), axis=0).to(device) 
-            
-            combined_local_yaw = torch.cat((local_yaw, torch.ones(Bsub)), axis=0)                                            
+            if dataloader_sub_iter is not None:
+                combined_obs_image = torch.cat((obs_image, obs_image_sub), axis=0)
+                combined_goal_image = torch.cat((goal_image, goal_image_sub), axis=0)
+                combined_distance = torch.cat((distance, dist_label_sub), axis=0)
+                combined_goal_mask = torch.cat((goal_mask, goal_mask_sub), axis=0)
+                combined_action_mask = torch.cat((action_mask, action_mask_sub), axis=0)
+                combined_viz_obs_image = torch.cat((viz_obs_image, viz_obs_image_sub), axis=0)
+                combined_viz_obs_image_past = torch.cat((viz_obs_image_past, viz_obs_image_past_sub), axis=0)
+                combined_viz_goal_image = torch.cat((viz_goal_image, viz_goal_image_sub), axis=0)
+                combined_goal_pos = torch.cat((goal_pos, goal_pos_sub), axis=0)
+                combined_goal_pos_gps = torch.cat((goal_pose_gps, goal_pose_gps_sub), axis=0).to(device)
+                combined_local_yaw = torch.cat((local_yaw, torch.ones(Bsub)), axis=0)
+            else:
+                combined_obs_image = obs_image
+                combined_goal_image = goal_image
+                combined_distance = distance
+                combined_goal_mask = goal_mask
+                combined_action_mask = action_mask
+                combined_viz_obs_image = viz_obs_image
+                combined_viz_obs_image_past = viz_obs_image_past
+                combined_viz_goal_image = viz_goal_image
+                combined_goal_pos = goal_pos
+                combined_goal_pos_gps = goal_pose_gps.to(device)
+                combined_local_yaw = local_yaw
+
             combined_action_pred = model(combined_obs_image, combined_goal_pos_gps)   
 
             #To simplify the implementation, we give the fixed rsize(0.3), delay(0.0) and previous velocity (going straight) for MBRA model 
@@ -1841,7 +1844,10 @@ def train_LogoNav(
             metric_waypoint_spacing = 0.25*0.5
             # converting action commands on the camera coordinate into action commands on the robot coordinate. Following ViNT, we have the sequence of pose [normalized X, normalized Y, cos(yaw), sin(yaw)].
             action_estfrod = torch.cat((z_traj_cat.unsqueeze(-1)/metric_waypoint_spacing, -x_traj_cat.unsqueeze(-1)/metric_waypoint_spacing, torch.cos(-yaw_traj_cat).unsqueeze(-1), torch.sin(-yaw_traj_cat).unsqueeze(-1)), axis=2)     
-            combined_actions = torch.cat((action_estfrod.detach().to(device), action_label_sub), axis=0)   
+            if dataloader_sub_iter is not None:
+                combined_actions = torch.cat((action_estfrod.detach().to(device), action_label_sub), axis=0)
+            else:
+                combined_actions = action_estfrod.detach().to(device)   
                                                   
             losses = _compute_losses_gps(
                 action_label=combined_actions.to(device),
@@ -1914,7 +1920,7 @@ def train_LogoNav(
                     combined_local_yaw,
                     combined_action_pred,
                     combined_actions,
-                    combined_actions_origin,
+                    combined_actions,
                     "train",
                     project_folder,
                     epoch,

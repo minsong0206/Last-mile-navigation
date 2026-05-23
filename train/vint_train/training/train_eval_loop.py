@@ -194,7 +194,8 @@ def train_eval_loop_nomad(
         eval_freq: frequency of evaluation
     """
     latest_path = os.path.join(project_folder, f"latest.pth")
-    ema_model = EMAModel(model=model,power=0.75) #[TODO] for diffusion model
+    # ema_model = EMAModel(model=model,power=0.75)  # model= removed: API changed in diffusers
+    ema_model = EMAModel(parameters=model.parameters(), power=0.75)
     #ema_model = model
     no_emamodel = True
     
@@ -338,11 +339,12 @@ def train_eval_loop_MBRA(
         eval_freq: frequency of evaluation
     """
     latest_path = os.path.join(project_folder, f"latest.pth")
-    ema_model = EMAModel(model=model,power=0.75) #[TODO] for diffusion model
+    # ema_model = EMAModel(model=model,power=0.75)  # model= removed: API changed in diffusers
+    ema_model = EMAModel(parameters=model.parameters(), power=0.75)
     no_emamodel = False
 
-    device2 = device   
-    #device2 = "cuda:1" 
+    device2 = device
+    #device2 = "cuda:1"
     print(device, device2)
 
     bin_size = 16
@@ -352,8 +354,8 @@ def train_eval_loop_MBRA(
     aug = False
     model_depth = Depth_est(h_size, w_size, bin_size, batch_img, device2, aug)
     model_depth_test = Depth_est(h_size, w_size, bin_size, batch_size_test, device2, aug)
-    print("device_count", torch.cuda.device_count()) 
-            
+    print("device_count", torch.cuda.device_count())
+
     for epoch in range(current_epoch, current_epoch + epochs):
         if train_model:
             print(
@@ -408,11 +410,11 @@ def train_eval_loop_MBRA(
         latest_scheduler_path = os.path.join(project_folder, f"scheduler_latest.pth")
         torch.save(lr_scheduler.state_dict(), latest_scheduler_path)
         
-        if (epoch + 1) % eval_freq == 0: 
+        if (epoch + 1) % eval_freq == 0:
             for dataset_type in test_dataloaders_sub:
-            
+
                 #if dataset_type == "scand_test":
-                if True:                
+                if True:
                     print(
                         f"Start {dataset_type} ViNT DP Testing Epoch {epoch}/{current_epoch + epochs - 1}"
                     )
@@ -428,9 +430,9 @@ def train_eval_loop_MBRA(
                         sacson=sacson,
                         model_depth=model_depth_test,
                         #model_pedtraj=model_pedtraj,
-                        device2=device2,             
-                        len_traj_pred=len_traj_pred,   
-                        batch_size=batch_size_test,                                                           
+                        device2=device2,
+                        len_traj_pred=len_traj_pred,
+                        batch_size=batch_size_test,
                         print_log_freq=print_log_freq,
                         num_images_log=num_images_log,
                         wandb_log_freq=wandb_log_freq,
@@ -447,23 +449,23 @@ def train_eval_loop_MBRA(
             "lr": optimizer.param_groups[0]["lr"],
         }, commit=False)
 
-        if epoch == 10:        
+        if epoch == 9:
             break
-        
+
     # Flush the last set of eval logs
-    wandb.log({})    
+    wandb.log({})
         
 ###
 def train_eval_loop_LogoNav(
     train_model: bool,
     model: nn.Module,
-    model_mbra: nn.Module,    
-    optimizer: Adam, 
+    model_mbra: nn.Module,
+    optimizer: Adam,
     lr_scheduler: torch.optim.lr_scheduler._LRScheduler,
     train_loader: DataLoader,
     test_dataloaders: Dict[str, DataLoader],
-    train_loader_sub: DataLoader,
-    test_dataloaders_sub: Dict[str, DataLoader],    
+    train_loader_sub: Optional[DataLoader],
+    test_dataloaders_sub: Dict[str, DataLoader],
     transform: transforms,
     epochs: int,
     sacson: bool,
@@ -508,7 +510,8 @@ def train_eval_loop_LogoNav(
         eval_freq: frequency of evaluation
     """
     latest_path = os.path.join(project_folder, f"latest.pth")
-    ema_model = EMAModel(model=model,power=0.75) #[TODO] for diffusion model
+    # ema_model = EMAModel(model=model,power=0.75)  # model= removed: API changed in diffusers
+    ema_model = EMAModel(parameters=model.parameters(), power=0.75)
     no_emamodel = False
     for epoch in range(current_epoch, current_epoch + epochs):
         if train_model:
@@ -642,7 +645,8 @@ def train_eval_loop_lelan(
         save_freq: frequency of saving model            
     """
     latest_path = os.path.join(project_folder, f"latest.pth")
-    ema_model = EMAModel(model=model,power=0.75) #[TODO] for diffusion model
+    # ema_model = EMAModel(model=model,power=0.75)  # model= removed: API changed in diffusers
+    ema_model = EMAModel(parameters=model.parameters(), power=0.75)
         
     for epoch in range(current_epoch, current_epoch + epochs):
         if train_model:
@@ -772,8 +776,10 @@ def train_eval_loop_lelan_col(
         save_freq: frequency of saving model        
     """
     latest_path = os.path.join(project_folder, f"latest.pth")
-    ema_model = EMAModel(model=model,power=0.75) #[TODO] for diffusion model
-    ema_model_nomad = EMAModel(model=model_nomad,power=0.75) #[TODO] for diffusion model
+    # ema_model = EMAModel(model=model,power=0.75)  # model= removed: API changed in diffusers
+    ema_model = EMAModel(parameters=model.parameters(), power=0.75)
+    # ema_model_nomad = EMAModel(model=model_nomad,power=0.75)  # model= removed: API changed in diffusers
+    ema_model_nomad = EMAModel(parameters=model_nomad.parameters(), power=0.75)
             
     for epoch in range(current_epoch, current_epoch + epochs):
         if train_model:

@@ -73,3 +73,5 @@ youtube:
   metric_waypoint_spacing: 0.12
 
 # add your own dataset params here:
+frodobots_gnm:
+  metric_waypoint_spacing: 0.25
