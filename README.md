@@ -84,6 +84,13 @@ See [osm_pipeline/README.md](osm_pipeline/README.md) for the reusable setup,
 including OSRM preprocessing, port mapping, server startup, and pipeline
 commands.
 
+### Project Scripts
+
+Project-specific utilities for OmniVLA fine-tuning, dataset analysis, frame
+extraction, and MBRA reannotation are organized under `scripts/`. See
+[scripts/README.md](scripts/README.md) for the folder layout and example
+commands.
+
 ### Training
 1. Change the directory
     ```

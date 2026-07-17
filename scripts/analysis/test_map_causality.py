@@ -18,11 +18,11 @@ test_map_causality.py
      모델이 실제 도로 형태를 따라가는지, 아니면 map을 약한 신호로만 쓰는지 확인.
 
 실행 (host, mbra venv):
-  /home/ms/uv-envs/mbra/venv/bin/python test_map_causality.py --method all
-  /home/ms/uv-envs/mbra/venv/bin/python test_map_causality.py --method heldout
-  /home/ms/uv-envs/mbra/venv/bin/python test_map_causality.py --method swap
-  /home/ms/uv-envs/mbra/venv/bin/python test_map_causality.py --method matched
-  /home/ms/uv-envs/mbra/venv/bin/python test_map_causality.py --method sequence
+  /home/ms/uv-envs/mbra/venv/bin/python scripts/analysis/test_map_causality.py --method all
+  /home/ms/uv-envs/mbra/venv/bin/python scripts/analysis/test_map_causality.py --method heldout
+  /home/ms/uv-envs/mbra/venv/bin/python scripts/analysis/test_map_causality.py --method swap
+  /home/ms/uv-envs/mbra/venv/bin/python scripts/analysis/test_map_causality.py --method matched
+  /home/ms/uv-envs/mbra/venv/bin/python scripts/analysis/test_map_causality.py --method sequence
 """
 
 import sys
@@ -41,14 +41,14 @@ import matplotlib.pyplot as plt
 matplotlib.rcParams["font.family"] = "Noto Sans CJK JP"
 matplotlib.rcParams["axes.unicode_minus"] = False
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
 from model_omnivla_edge_odom import OmniVLA_edge_odom
 
-sys.path.insert(0, "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/py")
+sys.path.insert(0, str(REPO_ROOT / "osm_pipeline" / "py"))
 from rides11_dataset import Rides11Dataset, METRIC_WAYPOINT_SPACING, IMG_MEAN, IMG_STD, VideoReader
 
-sys.path.insert(0, "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA")
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "analysis"))
 import analyze_dataset_distribution as dd  # gps -> curvature/scenario 분류 재사용
 
 BASE       = Path("/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA")

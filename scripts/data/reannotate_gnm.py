@@ -15,6 +15,7 @@ import shutil
 import pickle
 import argparse
 import numpy as np
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 import cv2
@@ -22,14 +23,15 @@ from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
 
-sys.path.insert(0, "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/train")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "train"))
 
 from vint_train.models.exaug.exaug import ExAug_dist_delay
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
-MBRA_CKPT = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/train/logs/frodobot-gnm/frodobot-gnm_2026_04_27_10_31_23/mbra.pth"
-GNM_ROOT  = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/gnm_format"
-OUT_ROOT  = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed_gnm"
+MBRA_CKPT = str(REPO_ROOT / "train/logs/frodobot-gnm/frodobot-gnm_2026_04_27_10_31_23/mbra.pth")
+GNM_ROOT  = str(REPO_ROOT / "FrodoBots-2K/gnm_format")
+OUT_ROOT  = str(REPO_ROOT / "FrodoBots-2K/processed_gnm")
 
 IMAGE_SIZE   = (96, 96)   # W, H (MBRA config 기준)
 CONTEXT_SIZE = 5          # MBRA config

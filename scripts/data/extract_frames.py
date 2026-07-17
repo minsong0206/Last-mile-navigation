@@ -16,10 +16,10 @@ Arrow의 (episode_index, frame_index, timestamp, video_path)를 읽어,
 각 mp4에서 해당 timestamp의 프레임을 PyAV seek으로 추출.
 
 실행:
-  conda run -n mbra python extract_frames.py
-  conda run -n mbra python extract_frames.py --workers 8    # 병렬 worker 수
-  conda run -n mbra python extract_frames.py --resume       # 이미 추출된 파일 건너뜀
-  conda run -n mbra python extract_frames.py --ep 0 5       # episode 0~5만 추출 (테스트)
+  conda run -n mbra python scripts/data/extract_frames.py
+  conda run -n mbra python scripts/data/extract_frames.py --workers 8
+  conda run -n mbra python scripts/data/extract_frames.py --resume
+  conda run -n mbra python scripts/data/extract_frames.py --ep 0 5
 """
 
 import os
@@ -33,9 +33,11 @@ import pyarrow as pa
 import av
 from PIL import Image
 
-ARROW_PATH  = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11/train/data-00000-of-00001.arrow"
-VIDEO_ROOT  = Path("/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11")
-OUT_ROOT    = Path("/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11/frames")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+ARROW_PATH  = str(REPO_ROOT / "FrodoBots-2K/processed/output_rides_11/train/data-00000-of-00001.arrow")
+VIDEO_ROOT  = REPO_ROOT / "FrodoBots-2K/processed/output_rides_11"
+OUT_ROOT    = REPO_ROOT / "FrodoBots-2K/processed/output_rides_11/frames"
 
 JPEG_QUALITY = 90   # JPEG 품질 (1~95, 높을수록 고화질/용량 큼)
 IMG_SIZE     = None  # None = 원본 크기 유지. (96,96) 등으로 설정하면 리사이즈

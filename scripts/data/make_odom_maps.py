@@ -10,11 +10,14 @@ import pickle
 import argparse
 import numpy as np
 import cv2
+from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 
-GNM_ROOT = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/gnm_format"
-OUT_ROOT = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed_gnm"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+GNM_ROOT = str(REPO_ROOT / "FrodoBots-2K/gnm_format")
+OUT_ROOT = str(REPO_ROOT / "FrodoBots-2K/processed_gnm")
 
 MAP_PX     = 256
 MAP_SIZE_M = 20.0

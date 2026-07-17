@@ -11,12 +11,12 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
 
 from model_omnivla_edge_odom import OmniVLA_edge_odom
 
-sys.path.insert(0, "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/py")
+sys.path.insert(0, str(REPO_ROOT / "osm_pipeline" / "py"))
 from rides11_dataset import Rides11Dataset, METRIC_WAYPOINT_SPACING
 
 BASE = Path("/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA")

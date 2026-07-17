@@ -63,8 +63,8 @@ Step 5. 결과 시각화                vis_seg02_epochs.py
     │
     ├── config/
     │   └── rides11_finetune.yaml           # 학습 하이퍼파라미터
-    ├── finetune_omnivla_edge.py            # Step 4: 학습 스크립트
-    ├── vis_seg02_epochs.py                 # Step 5: 결과 시각화
+    ├── scripts/omnivla/finetune_omnivla_edge.py            # Step 4: 학습 스크립트
+    ├── scripts/analysis/vis_seg02_epochs.py                 # Step 5: 결과 시각화
     │
     └── checkpoints/omnivla_edge_rides11/
         ├── epoch_005.pth
@@ -212,7 +212,7 @@ wp_normalized = [x_ego / 0.125, y_ego / 0.125]
 
 ## Step 4. Fine-tuning
 
-**스크립트:** `finetune_omnivla_edge.py`  
+**스크립트:** `scripts/omnivla/finetune_omnivla_edge.py`  
 **설정 파일:** `config/rides11_finetune.yaml`
 
 ### 모델 입력/출력
@@ -286,7 +286,7 @@ freeze:        partial
 
 ```bash
 cd /media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA
-conda run -n mbra python finetune_omnivla_edge.py \
+conda run -n mbra python scripts/omnivla/finetune_omnivla_edge.py \
     --config config/rides11_finetune.yaml
 ```
 
@@ -305,7 +305,7 @@ checkpoints/omnivla_edge_rides11/
 
 ## Step 5. 결과 시각화
 
-**스크립트:** `vis_seg02_epochs.py`
+**스크립트:** `scripts/analysis/vis_seg02_epochs.py`
 
 **대상:** `ep0405_seg02` (valid frames: 693장, fi=67~759)
 
@@ -347,10 +347,10 @@ pixel_y = cy - wp_m[:, 0] * PX_PER_M   # forward → 위쪽
 
 ```bash
 # 테스트 (1장, vis/ 루트에 저장)
-conda run -n mbra python vis_seg02_epochs.py --test
+conda run -n mbra python scripts/analysis/vis_seg02_epochs.py --test
 
 # 전체 693장 생성
-conda run -n mbra python vis_seg02_epochs.py --overwrite
+conda run -n mbra python scripts/analysis/vis_seg02_epochs.py --overwrite
 
 # 옵션
 #   --device cuda:0   GPU 지정

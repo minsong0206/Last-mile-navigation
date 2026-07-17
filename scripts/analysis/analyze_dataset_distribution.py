@@ -20,7 +20,7 @@ Also produces:
 
 Run on host (no conda needed):
   cd /media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA
-  python3 analyze_dataset_distribution.py
+  python3 scripts/analysis/analyze_dataset_distribution.py
 """
 
 import os
@@ -36,7 +36,7 @@ import matplotlib.colors as mcolors
 from collections import defaultdict, Counter
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-BASE = Path("/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA")
+BASE = Path(__file__).resolve().parents[2]
 OSM_ROOT    = BASE / "osm_pipeline/osm_data/output_rides_11/osm_maps_arrow"
 SCORES_PATH = BASE / "osm_pipeline/osm_data/output_rides_11/episode_scores.json"
 OUT_DIR     = BASE / "dataset_analysis"

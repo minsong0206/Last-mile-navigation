@@ -10,7 +10,7 @@ odom map 전용 goal_encoder (in_channels=3) 로 변환.
   나머지 모든 weight: 1:1 복사 (shape 동일)
 
 실행:
-  conda run -n mbra python convert_goal_encoder_9ch_to_3ch.py \
+  conda run -n mbra python scripts/omnivla/convert_goal_encoder_9ch_to_3ch.py \
     --input  /media/ms/WD_BLACK_4TB/OmniVLA/omnivla-edge/omnivla-edge.pth \
     --output /media/ms/WD_BLACK_4TB/OmniVLA/omnivla-edge/omnivla-edge-odom3ch.pth
 """
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
 
 

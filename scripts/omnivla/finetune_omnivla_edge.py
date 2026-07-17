@@ -9,10 +9,10 @@ goal_encoder는 OSM 맵 1장(3ch)만 입력받도록 수정된 OmniVLA_edge_odom
 
 실행:
   cd /media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA
-  conda run -n mbra python finetune_omnivla_edge.py --config config/rides11_finetune.yaml
+  conda run -n mbra python scripts/omnivla/finetune_omnivla_edge.py --config config/rides11_finetune.yaml
 
 평가 전용 (test set trajectory 시각화):
-  conda run -n mbra python finetune_omnivla_edge.py --eval_only \
+  conda run -n mbra python scripts/omnivla/finetune_omnivla_edge.py --eval_only \
     --eval_ckpt checkpoints/omnivla_edge_rides11_odom/best.pth
 
 모델 입력 (forward 시그니처):
@@ -62,13 +62,13 @@ import matplotlib.pyplot as plt
 import clip
 
 # OmniVLA-Edge-Odom — goal_encoder in_channels=3 (OSM 맵 1장)
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
 
 from model_omnivla_edge_odom import OmniVLA_edge_odom
 
 # rides_11 데이터셋 — Arrow + episode_scores.json + OSM 맵 이미지
-sys.path.insert(0, "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/py")
+sys.path.insert(0, str(REPO_ROOT / "osm_pipeline" / "py"))
 from rides11_dataset import Rides11Dataset, METRIC_WAYPOINT_SPACING
 
 # ── 기본 경로 설정 ─────────────────────────────────────────────────────────────
