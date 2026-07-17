@@ -21,7 +21,8 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, "/media/ms/WD_BLACK_4TB/OmniVLA/OmniVLA/inference")
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
 
 
 def convert(input_path: str, output_path: str, verify: bool = True) -> None:

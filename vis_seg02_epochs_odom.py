@@ -46,7 +46,9 @@ FRAME_ROOT = BASE / "Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed
 CKPT_DIR   = BASE / "Learning-to-Drive-Anywhere-with-MBRA/checkpoints/omnivla_edge_rides11_odom"
 OUT_DIR    = CKPT_DIR / "vis" / "ep0405_seg02"
 
-sys.path.insert(0, str(BASE / "OmniVLA/OmniVLA/inference"))
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
+
 sys.path.insert(0, str(BASE / "Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/py"))
 
 from model_omnivla_edge_odom import OmniVLA_edge_odom

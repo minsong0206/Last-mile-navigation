@@ -47,7 +47,6 @@ import yaml
 import argparse
 import numpy as np
 from pathlib import Path
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,7 +62,9 @@ import matplotlib.pyplot as plt
 import clip
 
 # OmniVLA-Edge-Odom — goal_encoder in_channels=3 (OSM 맵 1장)
-sys.path.insert(0, "/media/ms/WD_BLACK_4TB/OmniVLA/OmniVLA/inference")
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
+
 from model_omnivla_edge_odom import OmniVLA_edge_odom
 
 # rides_11 데이터셋 — Arrow + episode_scores.json + OSM 맵 이미지

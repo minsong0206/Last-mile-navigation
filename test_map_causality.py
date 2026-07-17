@@ -41,7 +41,8 @@ import matplotlib.pyplot as plt
 matplotlib.rcParams["font.family"] = "Noto Sans CJK JP"
 matplotlib.rcParams["axes.unicode_minus"] = False
 
-sys.path.insert(0, "/media/ms/WD_BLACK_4TB/OmniVLA/OmniVLA/inference")
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
 from model_omnivla_edge_odom import OmniVLA_edge_odom
 
 sys.path.insert(0, "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/py")
