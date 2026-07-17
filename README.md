@@ -91,6 +91,25 @@ extraction, and MBRA reannotation are organized under `scripts/`. See
 [scripts/README.md](scripts/README.md) for the folder layout and example
 commands.
 
+Common commands:
+
+```bash
+# Fine-tune OmniVLA-Edge-Odom on rides_11
+conda run -n mbra python scripts/omnivla/finetune_omnivla_edge.py \
+  --config config/rides11_finetune_odom.yaml
+
+# Analyze selected OSM segments
+python3 scripts/analysis/analyze_dataset_distribution.py
+
+# Run map attention / ablation checks
+conda run -n mbra python scripts/analysis/check_map_attention.py \
+  --ckpt checkpoints/omnivla_edge_rides11_odom/best.pth \
+  --method all
+
+# Extract rides_11 frames for visualization
+conda run -n mbra python scripts/data/extract_frames.py --resume
+```
+
 ### Training
 1. Change the directory
     ```
