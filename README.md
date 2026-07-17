@@ -1,3 +1,16 @@
+  > **Fork note**
+  >
+  > This repository is a research fork of
+  > [NHirose/Learning-to-Drive-Anywhere-with-MBRA](https://github.com/NHirose/Learning-to-Drive-Anywhere-with-MBRA).
+  > It keeps the original MBRA/LogoNav codebase and adds project-specific
+  > extensions for FrodoBots OSM map generation, local OSRM Docker routing,
+  > OmniVLA-Edge fine-tuning, and map-attention analysis.
+  >
+  > For the original MBRA project, see the upstream repository and paper.
+  > For the added scripts in this fork, see [`scripts/README.md`](scripts/README.md)
+  > and [`osm_pipeline/README.md`](osm_pipeline/README.md).
+
+
 # Learning to Drive Anywhere with Model-Based Reannotation
 [![arXiv](https://img.shields.io/badge/arXiv-2407.08693-df2a2a.svg)](https://www.arxiv.org/abs/2505.05592)
 [![Python](https://img.shields.io/badge/python-3.10-blue)](https://www.python.org)
