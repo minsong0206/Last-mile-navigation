@@ -72,6 +72,18 @@ Please down load our code and install some tools for making a conda environment 
     python convert_to_hf.py
     ```
 
+### OSM Pipeline and Local OSRM
+
+This fork includes an OSM preprocessing pipeline for FrodoBots navigation data.
+It uses local OSRM servers through Docker with the official
+`osrm/osrm-backend` image. The scripts are tracked in `osm_pipeline/scripts/`,
+while raw `.osm.pbf`, generated `.osrm*`, tile caches, and rendered map images
+stay out of Git because they are large.
+
+See [osm_pipeline/README.md](osm_pipeline/README.md) for the reusable setup,
+including OSRM preprocessing, port mapping, server startup, and pipeline
+commands.
+
 ### Training
 1. Change the directory
     ```

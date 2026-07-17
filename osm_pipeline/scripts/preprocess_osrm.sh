@@ -30,7 +30,9 @@
 #   마드리드(ES)   ~30분
 # =============================================================================
 
-OSRM_DIR="/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osrm"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIPELINE_DIR="$(dirname "$SCRIPT_DIR")"
+OSRM_DIR="${OSRM_DIR:-$PIPELINE_DIR/osrm}"
 IMAGE="osrm/osrm-backend"
 DOCKER_PROFILE="/usr/local/share/osrm/profiles/foot.lua"
 

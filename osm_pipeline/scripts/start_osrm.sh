@@ -26,7 +26,9 @@
 #   bash scripts/start_osrm.sh stop         # 전체 종료
 # =============================================================================
 
-OSRM_DIR="/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osrm"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIPELINE_DIR="$(dirname "$SCRIPT_DIR")"
+OSRM_DIR="${OSRM_DIR:-$PIPELINE_DIR/osrm}"
 IMAGE="osrm/osrm-backend"
 
 start_server() {
