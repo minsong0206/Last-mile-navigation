@@ -1,0 +1,48 @@
+# ============================================================
+# rides11_finetune.yaml
+# OmniVLA-Edge fine-tuning config for FrodoBots rides_11
+#
+# 실행:
+#   cd /media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA
+#   conda run -n mbra python finetune_omnivla_edge.py --config config/rides11_finetune.yaml
+# ============================================================
+
+# ── 체크포인트 경로 ──────────────────────────────────────────
+# git clone https://huggingface.co/NHirose/omnivla-edge 로 다운받은 저자 체크포인트
+ckpt_path: "/media/ms/WD_BLACK_4TB/OmniVLA/omnivla-edge/omnivla-edge.pth"
+
+# ── 데이터 경로 ──────────────────────────────────────────────
+# convert_to_hf.py로 생성한 Arrow IPC 파일
+arrow_path:  "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11/train/data-00000-of-00001.arrow"
+
+# episode_selector.py 결과 (선별된 세그먼트 목록 538개)
+scores_path: "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/episode_scores.json"
+
+# osm_map_generator.py 결과 (Arrow frame_index 기준 PNG)
+# osm_maps_arrow 생성 완료 후 사용
+osm_root:    "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/osm_maps_arrow"
+
+# Arrow의 videos/ 경로 기준 루트 (videos/ride_XXXX.mp4)
+video_root:  "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11"
+
+# ── 체크포인트 저장 경로 ──────────────────────────────────────
+save_dir:    "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/checkpoints/omnivla_edge_rides11"
+
+# ── Freeze 전략 ───────────────────────────────────────────────
+# "map_encoder_only" : OSM map encoder만 학습 (Stage 1, 빠른 수렴)
+# "partial"          : obs_encoder freeze, transformer+head 학습 (Stage 2, 권장)
+# "none"             : 전체 학습 (Stage 3, 과적합 위험)
+freeze: "partial"
+
+# ── 학습 하이퍼파라미터 ───────────────────────────────────────
+epochs:        20
+batch_size:    16
+lr:            1.0e-4      # AdamW 학습률
+weight_decay:  1.0e-4      # AdamW weight decay
+val_ratio:     0.1         # validation 비율 (전체의 10%)
+num_workers:   4           # DataLoader worker 수
+smooth_weight: 0.1         # L_smooth 가중치 (L = L_wp + 0.1 * L_smooth)
+
+# ── 로깅 및 저장 ──────────────────────────────────────────────
+save_freq:  5     # 몇 epoch마다 체크포인트 저장
+log_freq:   50    # 몇 iteration마다 loss 출력

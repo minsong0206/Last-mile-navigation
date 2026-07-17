@@ -1,0 +1,48 @@
+# ============================================================
+# rides11_finetune_odom.yaml
+# OmniVLA-Edge-Odom fine-tuning config
+# goal_encoder: 9ch OSM → 3ch OSM 1장 (odom3ch 모델)
+#
+# 실행 (학습):
+#   cd /media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA
+#   conda run -n mbra python finetune_omnivla_edge.py --config config/rides11_finetune_odom.yaml
+#
+# 실행 (epoch 5 test):
+#   conda run -n mbra python finetune_omnivla_edge.py --config config/rides11_finetune_odom.yaml \
+#     --eval_only --eval_ckpt checkpoints/omnivla_edge_rides11_odom/epoch_005.pth
+# ============================================================
+
+# ── 체크포인트 경로 ──────────────────────────────────────────
+# Step 1에서 변환된 체크포인트 (goal_encoder 9ch→3ch 평균화)
+ckpt_path: "/media/ms/WD_BLACK_4TB/OmniVLA/omnivla-edge/omnivla-edge-odom3ch.pth"
+
+# ── 데이터 경로 ──────────────────────────────────────────────
+arrow_path:  "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11/train/data-00000-of-00001.arrow"
+scores_path: "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/episode_scores.json"
+osm_root:    "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/osm_maps_arrow"
+video_root:  "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11"
+
+# ── 체크포인트 저장 경로 ──────────────────────────────────────
+save_dir: "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/checkpoints/omnivla_edge_rides11_odom"
+
+# ── Freeze 전략 ───────────────────────────────────────────────
+# partial: obs_encoder freeze, transformer+head+goal_encoder 학습
+freeze: "partial"
+
+# ── 학습 하이퍼파라미터 ───────────────────────────────────────
+epochs:        20
+batch_size:    32          # GPU 1 (RTX 4090, 24GB) 기준, bs=32 → ~23분/epoch
+lr:            1.0e-4
+weight_decay:  1.0e-4
+val_ratio:     0.1
+test_ratio:    0.1
+num_workers:   4
+smooth_weight: 0.1
+
+# ── 로깅 및 저장 ──────────────────────────────────────────────
+save_freq:  5              # epoch 5, 10, 15, 20 저장
+log_freq:   50
+vis_freq:   1
+use_wandb:  true
+wandb_project: "omnivla-edge-rides11-odom"
+run_name:   "odom3ch_bs32_partial"
