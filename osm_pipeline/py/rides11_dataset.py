@@ -83,8 +83,10 @@ class VideoReader:
         """
         container = self._open(video_path)
         stream = container.streams.video[0]
-        # av의 seek은 마이크로초 단위
-        pts_target = int(timestamp_s * 1_000_000)
+        # stream=stream을 넘기면 offset은 마이크로초가 아니라 그 stream의 time_base 단위로
+        # 해석됨 (AV_TIME_BASE=1e6은 stream 인자 없이 컨테이너 전체를 seek할 때만 적용).
+        # 이전 코드는 마이크로초 값을 그대로 넘겨서 항상 영상 끝 근처로 seek되는 버그가 있었음.
+        pts_target = int(timestamp_s / stream.time_base)
         container.seek(pts_target, stream=stream, backward=True, any_frame=False)
         for frame in container.decode(stream):
             return frame.to_image().convert("RGB")
@@ -147,14 +149,18 @@ def build_lookup(
     from episode_selector import split_into_segments
 
     # episode별 fp, fi 캐시
+    # (lat/lon 전체 컬럼은 루프 밖에서 한 번만 변환 — 이전에는 episode마다 매번
+    #  전체 테이블을 to_pylist()로 재변환해 O(episodes × N)로 느렸음)
+    lat_arr = np.array(table["observation.latitude"].to_pylist(), dtype=np.float64)
+    lon_arr = np.array(table["observation.longitude"].to_pylist(), dtype=np.float64)
     ep_data_cache = {}
     for ep in sorted(set(s["episode"] for s in selected)):
         mask = ep_idx_arr == ep
         ep_data_cache[ep] = {
             "fp":  fp_arr[mask],
             "fi":  fi_arr[mask],
-            "lats": np.array(table["observation.latitude"].to_pylist())[mask],
-            "lons": np.array(table["observation.longitude"].to_pylist())[mask],
+            "lats": lat_arr[mask],
+            "lons": lon_arr[mask],
         }
 
     # valid_samples 구성
@@ -173,16 +179,19 @@ def build_lookup(
         fi_start = int(frame_indices[0])
         fi_end   = int(frame_indices[-1])
 
-        for fi in frame_indices:
+        for seg_local_idx, fi in enumerate(frame_indices):
             fi = int(fi)
             # Valid condition
             if fi < fi_start + PAST_MARGIN:
                 continue
             if fi > fi_end - FUTURE_MARGIN:
                 continue
-            valid_samples.append((ep, seg, fi))
+            # seg_local_idx: osm_map_{seg_local_idx:06d}.png 파일명과 1:1 대응
+            valid_samples.append((ep, seg, fi, seg_local_idx))
 
     print(f"[Dataset] Valid samples: {len(valid_samples):,}")
+    # valid_samples: List of (ep, seg, fi, seg_local_idx)
+    # seg_local_idx: 세그먼트 내 0-based 인덱스 → osm_map_{seg_local_idx:06d}.png
     return valid_samples, global_row_map, fp_arr, fh_arr, vf_paths, vf_ts
 
 
@@ -239,9 +248,20 @@ class Rides11Dataset(Dataset):
         return len(self.valid_samples)
 
     def _get_frame(self, ep: int, fi: int) -> Image.Image:
-        """(ep, fi) → RGB PIL Image."""
+        """
+        (ep, fi) → RGB PIL Image.
+
+        frames/ 디렉토리에 추출된 JPEG가 있으면 직접 읽고,
+        없으면 mp4에서 디코딩 (fallback).
+        """
+        # 추출된 JPEG 경로: frames/episode_{ep:04d}/{fi:06d}.jpg
+        jpeg_path = self.video_root / "frames" / f"episode_{ep:04d}" / f"{fi:06d}.jpg"
+        if jpeg_path.exists():
+            return Image.open(str(jpeg_path)).convert("RGB")
+
+        # fallback: mp4 디코딩 (frames 미추출 시)
         row = self.global_row_map[(ep, fi)]
-        rel_path = self.vf_paths[row]          # "videos/ride_XXXX_front_camera.mp4"
+        rel_path = self.vf_paths[row]
         ts       = float(self.vf_ts[row])
         abs_path = str(self.video_root / rel_path)
         return self.video_reader.get_frame(abs_path, ts)
@@ -281,7 +301,7 @@ class Rides11Dataset(Dataset):
         return torch.tensor(waypoints, dtype=torch.float32)  # (8, 2)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        ep, seg, fi = self.valid_samples[idx]
+        ep, seg, fi, seg_local_idx = self.valid_samples[idx]
 
         # ── obs_stack (과거 5장 + 현재 1장 = 6프레임, context_size=5) ───────────
         # 순서: [fi-15, fi-12, fi-9, fi-6, fi-3, fi] → cat → (18, 96, 96)
@@ -293,30 +313,30 @@ class Rides11Dataset(Dataset):
         obs_img = self.obs_transform(obs_pil)            # (3, 96, 96)
         obs_stack = torch.cat([*ctx_imgs, obs_img], dim=0)  # (18, 96, 96)
 
-        # ── map_images (9ch) ─────────────────────────────────────────────────
-        # OmniVLA-Edge: map_encoder expects (9, 96, 96)
-        # = [osm_map(3) + osm_map(3) + obs_cur(3)]
-        # current/goal map을 동일하게 사용 (GPS goal 없음)
+        # ── map_images (3ch) ─────────────────────────────────────────────────
+        # OmniVLA-edge-odom: goal_encoder expects (3, 96, 96) — OSM 맵 1장만 사용
+        # osm_map_generator.py는 세그먼트 내 0-based 인덱스로 파일명 생성
+        # → seg_local_idx 사용 (fi가 아님)
         map_path = (
             self.osm_root
             / f"episode_{ep:04d}_seg{seg:02d}"
-            / f"osm_map_{fi:06d}.png"
+            / f"osm_map_{seg_local_idx:06d}.png"
         )
         map_pil  = Image.open(map_path).convert("RGB")
-        map_tile = self.map_transform(map_pil)           # (3, 96, 96)
-        map_images = torch.cat([map_tile, map_tile, obs_img], dim=0)  # (9, 96, 96)
+        map_images = self.map_transform(map_pil)         # (3, 96, 96)
 
         # ── gt_waypoints ──────────────────────────────────────────────────────
         gt_waypoints = self._get_waypoints(ep, fi)       # (8, 2)
 
         return {
             "obs_stack":    obs_stack,      # (18, 96, 96) — 6프레임 스택
-            "map_images":   map_images,     # (9, 96, 96)  — OmniVLA-Edge map_encoder 입력
+            "map_images":   map_images,     # (3, 96, 96)  — OSM 맵 1장 (odom3ch model)
             "gt_waypoints": gt_waypoints,   # (8, 2)
             # metadata
-            "episode_index": torch.tensor(ep,  dtype=torch.long),
-            "frame_index":   torch.tensor(fi,  dtype=torch.long),
-            "segment":       torch.tensor(seg, dtype=torch.long),
+            "episode_index":   torch.tensor(ep,            dtype=torch.long),
+            "frame_index":     torch.tensor(fi,            dtype=torch.long),
+            "segment":         torch.tensor(seg,           dtype=torch.long),
+            "seg_local_idx":   torch.tensor(seg_local_idx, dtype=torch.long),
         }
 
     def __del__(self):

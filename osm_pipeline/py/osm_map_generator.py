@@ -46,7 +46,7 @@ from episode_selector import split_into_segments
 ARROW_PATH  = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11/train/data-00000-of-00001.arrow"
 SCORES_PATH = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/episode_scores.json"
 OUT_ROOT    = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/osm_maps_arrow"
-TILE_CACHE  = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBR/osm_pipeline/tile_cache"
+TILE_CACHE  = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/tile_cache"
 
 # ── OSRM server mapping (region → port) ──────────────────────────────────────
 def osrm_port(lat, lon):
