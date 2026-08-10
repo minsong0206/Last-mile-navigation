@@ -126,7 +126,15 @@ pre { background:#000; padding:8px; height:300px; overflow-y:auto; font-size:12p
 <h2>OmniVLA-Edge 실시간 배포 모니터</h2>
 <div class="row">
   <div class="card"><b>카메라</b><br><img src="/frame.jpg?t=__TS__"></div>
-  <div class="card"><b>실시간 생성 지도</b><br><img src="/map.jpg?t=__TS__"></div>
+  <div class="card"><b>실시간 생성 지도</b><br><img src="/map.jpg?t=__TS__">
+    <div style="font-size:11px; margin-top:4px; line-height:1.6;">
+      <span style="color:#f66;">■</span> 계획 경로(OSRM)&nbsp;
+      <span style="color:#999;">■</span> 지나온 길&nbsp;
+      <span style="color:#3f3;">●</span> 현재 위치&nbsp;
+      <span style="color:#0ff;">■</span> 모델 예측 궤적&nbsp;
+      <span style="color:#fff;">—</span> 스케일바
+    </div>
+  </div>
   <div class="card">
     <b>상태</b>
     <table id="status"><tbody></tbody></table>

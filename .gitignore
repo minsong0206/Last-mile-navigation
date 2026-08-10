@@ -1,5 +1,6 @@
 train/wandb
 train/logs
+deployment/logs
 deployment/model_weights
 __pycache__/
 *.pyc
@@ -35,3 +36,7 @@ tools/global_odom_maps/
 /wandb/
 /logs/
 /osm_data/
+
+# ── 추가: 로컬 가상환경 / 다운로드한 대용량 아카이브 (git에 올리면 안 됨) ───────
+venv/
+*.tar.gz

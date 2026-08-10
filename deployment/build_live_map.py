@@ -48,6 +48,7 @@ import sys
 import math
 from pathlib import Path
 
+import cv2
 import numpy as np
 import requests
 import torch
@@ -66,6 +67,13 @@ IMG_MEAN = [0.485, 0.456, 0.406]
 IMG_STD  = [0.229, 0.224, 0.225]
 
 LAT_M = 111320.0  # 위도 1도당 미터 (haversine 근사 대신 간단한 등적원통 근사, 근거리 오차 무시 가능)
+
+
+def _pick_scale_bar_m(map_range_m):
+    """스케일바용 '보기 좋은' 미터 값 선택 (지도 반경의 대략 절반 이하 중 가장 큰 값)."""
+    candidates = [1, 2, 5, 10, 20, 50]
+    fit = [c for c in candidates if c <= map_range_m * 0.6]
+    return fit[-1] if fit else candidates[0]
 
 
 def query_osrm_route(start_lat, start_lon, goal_lat, goal_lon, port,
@@ -123,6 +131,12 @@ class LiveMapBuilder:
         print(f"[LiveMapBuilder] 경로 캐싱 완료: {len(self._route_latlon)}개 포인트 "
               f"(출발=({start_lat:.5f},{start_lon:.5f}) → 목표=({goal_lat:.5f},{goal_lon:.5f}))")
 
+    def get_route_latlon(self):
+        """캐싱된 경로 전체를 (M,2) [[lat,lon],...] 리스트로 반환 (로그/분석용)."""
+        if self._route_latlon is None:
+            return None
+        return self._route_latlon.tolist()
+
     def _closest_route_idx(self, lat, lon):
         """process_episode()의 map_frames_to_route()와 같은 발상: 현재 위치가
         캐싱된 경로의 어느 지점에 가장 가까운지 찾는다 (매 프레임 O(M), M은
@@ -165,6 +179,44 @@ class LiveMapBuilder:
             past_lats, past_lons,
             out_size=self.out_size, map_range_m=self.map_range_m,
         )
+        return img
+
+    def draw_predicted_trajectory(self, map_img, pred_xy_m, target_step=2,
+                                   color=(0, 255, 255)):
+        """모델이 예측한 미래 waypoint(ego frame, x=forward m, y=left m, (N,2))를
+        get_map_image()가 만든 ego-centric·heading-up 지도 위에 같은 스케일로 겹쳐 그림.
+
+        지도가 heading-up이므로 ego 위치=이미지 정중앙, x=forward→위쪽(row 감소),
+        y=left→왼쪽(col 감소). render_frame()과 동일한 px/m 스케일
+        (out_size / (2*map_range_m))을 그대로 사용해야 실제 축척과 맞음.
+        같이 그리는 흰 눈금선은 미터 단위 스케일바(축척 확인용).
+        target_step: waypoint_to_control()이 실제로 조준하는 인덱스 — 더 크게 표시.
+        """
+        img = map_img.copy()
+        px_per_m = self.out_size / (2.0 * self.map_range_m)
+        cx, cy = self.out_size / 2.0, self.out_size / 2.0
+
+        pts = []
+        for x, y in pred_xy_m:
+            col = int(round(cx - y * px_per_m))
+            row = int(round(cy - x * px_per_m))
+            pts.append((col, row))
+        for k in range(1, len(pts)):
+            cv2.line(img, pts[k - 1], pts[k], color, 2, cv2.LINE_AA)
+        for k, p in enumerate(pts):
+            r = 5 if k == target_step else 3
+            cv2.circle(img, p, r, color, -1)
+            cv2.circle(img, p, r, (255, 255, 255), 1)
+
+        # 스케일바: map_range_m의 절반 정도 되는 "보기 좋은" 미터 값을 골라 하단에 표시
+        bar_m = _pick_scale_bar_m(self.map_range_m)
+        bar_px = int(round(bar_m * px_per_m))
+        x0, y0 = 8, self.out_size - 10
+        cv2.line(img, (x0, y0), (x0 + bar_px, y0), (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(img, (x0, y0 - 4), (x0, y0 + 4), (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(img, (x0 + bar_px, y0 - 4), (x0 + bar_px, y0 + 4), (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, f"{bar_m:g}m", (x0, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35, (255, 255, 255), 1, cv2.LINE_AA)
         return img
 
     def get_map_tensor(self, lat, lon, heading_rad, past_track=None, device="cpu"):
