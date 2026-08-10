@@ -37,18 +37,31 @@ pip install requests pillow opencv-python numpy
 
 ```bash
 hf auth login   # 최초 1회 (private repo이므로 로그인 필요)
+
+# 12m 체크포인트 (지금까지 가장 좋은 성능 — 아래 표 참고, 우선 추천)
 mkdir -p checkpoints/omnivla_edge_rides11_odom_12m
 hf download minsonganingee/omnivla-edge-rides11-odom-12m best.pth \
     --local-dir checkpoints/omnivla_edge_rides11_odom_12m/
+
+# 20m 체크포인트
+mkdir -p checkpoints/omnivla_edge_rides11_odom_20m
+hf download minsonganingee/omnivla-edge-rides11-odom-20m best.pth \
+    --local-dir checkpoints/omnivla_edge_rides11_odom_20m/
+
+# 25m 체크포인트 (baseline)
+mkdir -p checkpoints/omnivla_edge_rides11_odom
+hf download minsonganingee/omnivla-edge-rides11-odom-25m best.pth \
+    --local-dir checkpoints/omnivla_edge_rides11_odom/
 ```
 
-**체크포인트별로 `--map_range` 값이 다릅니다 — 반드시 맞는 값과 함께 사용하세요:**
+**체크포인트별로 `--map_range` 값이 다릅니다 — 반드시 맞는 값과 함께 사용하세요.**
+`--map_range`는 중심(로봇)에서 가장자리까지의 반경(half-width)이므로, 로봇이 실제로 보는 지도 전체 범위는 이 값의 2배입니다.
 
-| 체크포인트 | `--map_range` | val_loss (best epoch) | ADE |
-|---|---|---|---|
-| `omnivla_edge_rides11_odom/best.pth` (baseline) | 25 | - | - |
-| `omnivla_edge_rides11_odom_12m/best.pth` | 12 | 0.8143 (epoch5) | **0.234m** ← 지금까지 가장 좋음 |
-| `omnivla_edge_rides11_odom_20m/best.pth` | 20 | 0.8815 (epoch1) | 0.250m |
+| 체크포인트 | HF repo | `--map_range` | 실제 지도 범위 | val_loss (best epoch) | ADE |
+|---|---|---|---|---|---|
+| `omnivla_edge_rides11_odom/best.pth` (baseline) | `omnivla-edge-rides11-odom-25m` | 25 | 50m × 50m | - | - |
+| `omnivla_edge_rides11_odom_12m/best.pth` | `omnivla-edge-rides11-odom-12m` | 12 | 24m × 24m | 0.8143 (epoch5) | **0.234m** ← 지금까지 가장 좋음 |
+| `omnivla_edge_rides11_odom_20m/best.pth` | `omnivla-edge-rides11-odom-20m` | 20 | 40m × 40m | 0.8815 (epoch1) | 0.250m |
 
 ## 3. OSRM 라우팅 서버 준비 (배포 지역: 서울)
 
