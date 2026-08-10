@@ -10,6 +10,7 @@ FrodoBots rides_11 데이터로 파인튜닝한 OmniVLA-Edge-Odom 체크포인�
 |---|---|
 | `build_live_map.py` | 출발/목적지 GPS로 OSRM 경로를 1회 계산·캐싱하고, 현재 위치 기준으로 ego-centric 지도 이미지를 실시간 생성 |
 | `omnivla_edge_deploy.py` | FrodoBot SDK(REST API) 폴링 → 카메라 6프레임 컨텍스트 구성 → 지도 생성 → 모델 추론 → 제어 명령 전송, 전체 루프 |
+| `debug_web.py` | 배포 중 카메라/지도/GPS/예측/에러를 실시간으로 보여주는 모니터링 웹 대시보드 (외부 의존성 없음, 표준 라이브러리만 사용) |
 
 두 파일 모두 `osm_pipeline/py/osm_map_generator.py`와 `third_party/omnivla/inference/model_omnivla_edge_odom.py`를 import하므로, 이 두 경로도 함께 있어야 합니다.
 
@@ -121,6 +122,25 @@ python3 deployment/omnivla_edge_deploy.py \
 - 시작하면 첫 프레임에서 출발 위치 기준으로 OSRM 경로를 1회 계산(`set_goal`)하고, 이후 매 루프(3Hz)는 캐싱된 경로만 사용합니다 (매번 OSRM에 재쿼리하지 않음).
 - 로봇이 경로에서 15m 이상 벗어나면 자동으로 재라우팅합니다.
 - `Ctrl+C`로 정지하면 `linear=0, angular=0` 정지 명령을 자동 전송합니다.
+
+### 실시간 모니터링 대시보드
+
+FrodoBot SDK의 `/sdk` 페이지는 카메라 영상만 보여주고, 우리 파이프라인이 만드는 지도/GPS/예측/에러는
+안 보여주므로 별도 대시보드(`deployment/debug_web.py`)를 자동으로 같이 띄웁니다 — 배포 스크립트
+실행하면 기본적으로 **8080 포트**에서 뜹니다:
+
+```
+http://127.0.0.1:8080          # 같은 머신(노트북)에서
+http://<노트북 IP>:8080        # 같은 네트워크의 다른 기기(폰 등)에서
+```
+
+- 현재 카메라 프레임, 실시간 생성 중인 지도(경로선 포함) 이미지가 1초마다 갱신됩니다
+- GPS(fix 없으면 빨간색 경고), heading, 현재 제어 명령(linear/angular), 실제 루프 주기(Hz), 누적 에러 수 표시
+- 최근 로그 30줄(경로 재계산, GPS fix 없음, 에러 등)
+- 포트를 바꾸거나 끄고 싶으면 `--debug_port 8081` 또는 `--debug_port 0`
+
+⚠ 추론/네트워크 등 어떤 에러가 나든 로봇을 먼저 정지시키고 대시보드에 에러를 기록한 뒤 스크립트가
+중단되도록 되어 있습니다 (에러를 무시하고 계속 움직이지 않음).
 
 ## ⚠ 배포 전 안전 체크리스트
 

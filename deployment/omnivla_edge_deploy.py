@@ -51,6 +51,7 @@ sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
 sys.path.insert(0, str(REPO_ROOT / "deployment"))
 from model_omnivla_edge_odom import OmniVLA_edge_odom
 from build_live_map import LiveMapBuilder
+from debug_web import DeploymentState, start_debug_server
 
 FRODOBOT_BASE = "http://127.0.0.1:8000"
 
@@ -92,7 +93,12 @@ def clip_control(linear_vel, angular_vel, maxv=MAX_V, maxw=MAX_W):
 
 
 class OmniVLAEdgeDeployment:
-    def __init__(self, ckpt_path, map_range_m, goal_lat, goal_lon, device=None):
+    def __init__(self, ckpt_path, map_range_m, goal_lat, goal_lon, device=None,
+                 debug_port=8080):
+        self.state = DeploymentState()
+        if debug_port:
+            start_debug_server(self.state, port=debug_port)
+
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = OmniVLA_edge_odom(**MODEL_PARAMS)
         ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -126,6 +132,8 @@ class OmniVLAEdgeDeployment:
         lat, lon = gps["latitude"], gps["longitude"]
         # LogoNav_frodobot.py와 동일한 부호 규약: orientation(시계방향, deg) → CCW radian
         heading_rad = -float(gps["orientation"]) / 180.0 * math.pi
+        self.state.update(camera_img=img, lat=lat, lon=lon,
+                           heading_deg=math.degrees(heading_rad))
         return img, lat, lon, heading_rad
 
     def send_control(self, linear, angular):
@@ -146,7 +154,7 @@ class OmniVLAEdgeDeployment:
             self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
             self._route_initialized = True
         elif self.map_builder.is_off_route(lat, lon, threshold_m=15.0):
-            print("[deploy] 경로 이탈 감지 → 재라우팅")
+            self.state.log("경로 이탈 감지 → 재라우팅")
             self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
 
         # obs_stack: 컨텍스트가 아직 안 찼으면 가장 오래된 프레임으로 패딩
@@ -156,11 +164,12 @@ class OmniVLAEdgeDeployment:
         obs_stack = torch.cat(frames[-(N_CTX + 1):], dim=0).unsqueeze(0).to(self.device)  # (1,18,96,96)
         obs_cur = obs_stack[:, -3:]
 
-        map_tensor = self.map_builder.get_map_tensor(
+        map_np = self.map_builder.get_map_image(
             lat, lon, heading_rad,
             past_track=list(self.past_track) if self.past_track else None,
-            device=self.device,
-        )  # (1,3,96,96)
+        )
+        self.state.update(map_img=map_np)
+        map_tensor = self.map_builder.transform(Image.fromarray(map_np)).unsqueeze(0).to(self.device)  # (1,3,96,96)
 
         goal_pose = torch.zeros(1, 4, device=self.device)
         goal_mask = torch.zeros(1, dtype=torch.long, device=self.device)
@@ -174,6 +183,7 @@ class OmniVLAEdgeDeployment:
         with torch.no_grad():
             pred, _, _ = self.model(*inputs)
         pred_xy_m = pred[0, :, :2].detach().cpu().numpy() * METRIC_WAYPOINT_SPACING  # (8,2) ego x=fwd,y=left
+        self.state.update(pred_xy_m=pred_xy_m)
         return pred_xy_m
 
     def waypoint_to_control(self, pred_xy_m, target_step=2):
@@ -191,11 +201,17 @@ class OmniVLAEdgeDeployment:
 
     def step(self):
         img, lat, lon, heading_rad = self.poll_frodobot()
+
+        # GPS fix 없음(sentinel 1000) — 지도 자체를 만들 수 없으므로 정지 유지
+        if lat == 1000 or lon == 1000:
+            self.state.log_error("GPS fix 없음 (lat/lon=1000) — 정지 유지")
+            return 0.0, 0.0
+
         self.maybe_update_frame_buffer(img)
         self.past_track.append((lat, lon))
 
         if len(self.frame_buffer) < N_CTX + 1:
-            print("[deploy] context 채우는 중 ... 정지 유지")
+            self.state.log("context 채우는 중 ... 정지 유지")
             return 0.0, 0.0
 
         pred_xy_m = self.predict_waypoints(lat, lon, heading_rad)
@@ -208,10 +224,19 @@ class OmniVLAEdgeDeployment:
         try:
             while True:
                 t0 = time.time()
-                linear, angular = self.step()
+                try:
+                    linear, angular = self.step()
+                except Exception as e:
+                    # 추론/네트워크 등 어떤 에러든 로봇은 반드시 정지시키고 대시보드에 기록.
+                    # 에러를 삼키고 계속 움직이는 건 안전상 절대 금지 — 여기서 멈추고 재발생시킴.
+                    self.state.log_error(f"step() 실패: {e!r} — 정지 명령 전송 후 중단")
+                    self.send_control(0.0, 0.0)
+                    raise
                 self.send_control(linear, angular)
-                print(f"  linear={linear:+.3f} m/s  angular={angular:+.3f} rad/s")
                 elapsed = time.time() - t0
+                self.state.update(linear=linear, angular=angular,
+                                   loop_hz=round(1.0 / max(elapsed, 1e-6), 2))
+                print(f"  linear={linear:+.3f} m/s  angular={angular:+.3f} rad/s")
                 time.sleep(max(0.0, DT - elapsed))
         except KeyboardInterrupt:
             print("\n[deploy] 정지 요청됨 — 로봇 정지 명령 전송")
@@ -226,10 +251,13 @@ if __name__ == "__main__":
                         "(baseline=25, 12m실험=12, 20m실험=20). 체크포인트마다 다르므로 기본값 없음 — 반드시 명시.")
     p.add_argument("--goal_lat", type=float, required=True)
     p.add_argument("--goal_lon", type=float, required=True)
+    p.add_argument("--debug_port", type=int, default=8080,
+                   help="모니터링 웹 대시보드 포트 (0이면 비활성화)")
     args = p.parse_args()
 
     deployer = OmniVLAEdgeDeployment(
         ckpt_path=args.ckpt, map_range_m=args.map_range,
         goal_lat=args.goal_lat, goal_lon=args.goal_lon,
+        debug_port=args.debug_port,
     )
     deployer.run()
