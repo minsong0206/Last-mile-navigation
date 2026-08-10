@@ -60,6 +60,7 @@ def osrm_port(lat, lon):
     if 27 < lat < 28 and -81 < lon < -80:   return 5008  # Florida-B
     if 50 < lat < 51 and -1 < lon < 0:      return 5009  # Brighton
     if 40 < lat < 41 and -4 < lon < -3:     return 5010  # Madrid
+    if 37.4 < lat < 37.7 and 126.8 < lon < 127.2: return 5011  # Seoul (서울과학기술대 실배포 테스트)
     raise ValueError(f"No OSRM server for lat={lat}, lon={lon}")
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -70,7 +71,7 @@ ZOOM         = 18      # OSM tile zoom
 TILE_PX      = 256
 ROUTE_COLOR  = (0, 0, 255)    # BGR red
 PAST_COLOR   = (160, 160, 160)
-ROUTE_WIDTH  = 4
+ROUTE_WIDTH  = 2  # 교수님 피드백: 경로선을 더 얇게 (기존 4 → 2)
 EGO_COLOR    = (0, 200, 0)
 USER_AGENT   = "MBRA-Research/1.0 (minmum0206@gmail.com)"
 
@@ -434,7 +435,8 @@ def map_frames_to_route(fp_seg, route_latlon, lats_seg, lons_seg):
 
 
 def process_episode(ep, ep_data, out_dir,
-                    goal_dist_m=GOAL_DIST_M, zoom=ZOOM, out_size=MAP_SIZE_PX):
+                    goal_dist_m=GOAL_DIST_M, zoom=ZOOM, out_size=MAP_SIZE_PX,
+                    map_range_m=MAP_RANGE_M):
     os.makedirs(out_dir, exist_ok=True)
 
     lats = np.array(ep_data['lats'])
@@ -488,6 +490,7 @@ def process_episode(ep, ep_data, out_dir,
             future_lats_r, future_lons_r,
             past_lats_r,   past_lons_r,
             out_size=out_size,
+            map_range_m=map_range_m,
         )
 
         Image.fromarray(img).save(out_path)
@@ -499,7 +502,8 @@ def process_episode(ep, ep_data, out_dir,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
-    os.makedirs(OUT_ROOT, exist_ok=True)
+    out_root = args.out_root or OUT_ROOT
+    os.makedirs(out_root, exist_ok=True)
 
     with open(SCORES_PATH) as f:
         scores = json.load(f)
@@ -560,11 +564,12 @@ def main(args):
                 'filtered_heading': ep_fh[idxs].tolist(),
             }
 
-            out_dir = os.path.join(OUT_ROOT, f"episode_{ep:04d}_seg{seg_idx:02d}")
+            out_dir = os.path.join(out_root, f"episode_{ep:04d}_seg{seg_idx:02d}")
             n = process_episode(ep, seg_data, out_dir,
                                 goal_dist_m=args.goal_dist,
                                 zoom=args.zoom,
-                                out_size=args.out_size)
+                                out_size=args.out_size,
+                                map_range_m=args.map_range)
             tqdm.write(f"  ep{ep:03d}[{seg_idx}]: {n} maps → {out_dir}")
 
     print("\nDone.  © OpenStreetMap contributors")
@@ -580,5 +585,7 @@ if __name__ == "__main__":
     parser.add_argument("--seg",          type=int,   default=None,
                         help="Specific segment index (used with --ep)")
     parser.add_argument("--all_episodes", action="store_true")
+    parser.add_argument("--out_root",     type=str,   default=None,
+                        help="Override output root dir (default: OUT_ROOT constant)")
     args = parser.parse_args()
     main(args)

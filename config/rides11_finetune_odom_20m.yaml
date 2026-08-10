@@ -1,0 +1,49 @@
+# ============================================================
+# rides11_finetune_odom_20m.yaml
+# OmniVLA-Edge-Odom fine-tuning config — MAP_RANGE_M 20m + 얇은 경로선(width=2)
+#
+# 12m 실험(rides11_finetune_odom_12m.yaml) 이후 교수님 피드백 반영:
+#   - 근거리 곡률 선명도(12m)와 "다가오는 회전을 미리 보는 능력"(넓은 지도)
+#     사이의 절충으로 20m 선택
+#   - 경로선(ROUTE_COLOR route)을 4px→2px로 얇게 해서 넓어진 지도에서도
+#     배경 도로 구조가 가려지지 않도록 함 (osm_map_generator.py ROUTE_WIDTH)
+#
+# 실행:
+#   cd /media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA
+#   conda run -n mbra python scripts/omnivla/finetune_omnivla_edge.py --config config/rides11_finetune_odom_20m.yaml
+# ============================================================
+
+# ── 체크포인트 경로 (baseline과 동일한 시작점) ──────────────────
+ckpt_path: "/media/ms/WD_BLACK_4TB/OmniVLA/omnivla-edge/omnivla-edge-odom3ch.pth"
+
+# ── 데이터 경로 ──────────────────────────────────────────────
+arrow_path:  "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11/train/data-00000-of-00001.arrow"
+scores_path: "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/episode_scores.json"
+osm_root:    "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/osm_maps_arrow_20m"
+video_root:  "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11"
+map_range_m: 20.0  # visualize_waypoints()의 지도 오버레이 픽셀 환산용
+
+# ── 체크포인트 저장 경로 ──────────────────────────────────────
+save_dir: "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/checkpoints/omnivla_edge_rides11_odom_20m"
+
+# ── Freeze 전략 (baseline과 동일) ────────────────────────────
+freeze: "partial"
+
+# ── 학습 하이퍼파라미터 (12m 실험과 동일, val 정체가 epoch5 근처였으므로
+#    epochs는 20 유지하되 best.pth 기준으로 평가) ────────────
+epochs:        20
+batch_size:    32
+lr:            1.0e-4
+weight_decay:  1.0e-4
+val_ratio:     0.1
+test_ratio:    0.1
+num_workers:   4
+smooth_weight: 0.1
+
+# ── 로깅 및 저장 ──────────────────────────────────────────────
+save_freq:  5
+log_freq:   50
+vis_freq:   1
+use_wandb:  true
+wandb_project: "omnivla-edge-rides11-odom"
+run_name:   "odom3ch_bs32_partial_map20m_thinroute"

@@ -50,7 +50,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -213,6 +213,56 @@ def apply_freeze(model: nn.Module, strategy: str):
     print(f"[freeze] strategy={strategy} | trainable={trainable:,} / total={total:,} params")
 
 
+def episode_grouped_split(dataset, val_ratio: float, test_ratio: float, seed: int = 42):
+    """
+    프레임 단위 random_split 대신 episode 단위로 통째로 train/val/test에 배정.
+
+    같은 episode 안의 인접 프레임들은 카메라/맵이 거의 겹치므로, 프레임 단위로
+    무작위 분할하면 train에서 본 것과 사실상 같은 장면이 val/test에도 섞여 들어가
+    (leakage) 성능 지표가 실제보다 낙관적으로 나온다. episode를 통째로 한 쪽에만
+    배정하면 이 leakage를 없앨 수 있다.
+
+    dataset.valid_samples: List[(ep, seg, fi, seg_local_idx)] — 인덱스 순서가
+    Dataset.__getitem__(idx)와 1:1 대응하므로, 이미지 로딩 없이 메타데이터만으로
+    빠르게 그룹을 구성할 수 있다.
+    """
+    ep_of_idx = np.array([s[0] for s in dataset.valid_samples])
+    episodes = np.unique(ep_of_idx)
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(episodes)
+
+    ep_sample_count = {ep: int((ep_of_idx == ep).sum()) for ep in episodes}
+    total = len(dataset)
+    target_val  = int(total * val_ratio)
+    target_test = int(total * test_ratio)
+
+    val_eps, test_eps = set(), set()
+    n_val = n_test = 0
+    for ep in episodes:
+        c = ep_sample_count[ep]
+        if n_val < target_val:
+            val_eps.add(ep); n_val += c
+        elif n_test < target_test:
+            test_eps.add(ep); n_test += c
+        # 나머지는 전부 train
+
+    train_idx, val_idx, test_idx = [], [], []
+    for i, ep in enumerate(ep_of_idx):
+        if ep in val_eps:
+            val_idx.append(i)
+        elif ep in test_eps:
+            test_idx.append(i)
+        else:
+            train_idx.append(i)
+
+    print(f"[split] episode-grouped: train_eps={len(episodes)-len(val_eps)-len(test_eps)} "
+          f"val_eps={len(val_eps)} test_eps={len(test_eps)}  |  "
+          f"train={len(train_idx):,} val={len(val_idx):,} test={len(test_idx):,}")
+
+    return Subset(dataset, train_idx), Subset(dataset, val_idx), Subset(dataset, test_idx)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Loss 계산
 # ══════════════════════════════════════════════════════════════════════════════
@@ -351,6 +401,7 @@ def visualize_waypoints(
     fi_ids:       torch.Tensor = None,   # (B,) frame_index
     seg_ids:      torch.Tensor = None,   # (B,) segment
     n_vis: int = 4,
+    map_range_m: float = 25.0,
 ) -> plt.Figure:
     """
     각 샘플마다 3개 서브플롯:
@@ -379,7 +430,7 @@ def visualize_waypoints(
     """
     IMG_MEAN    = torch.tensor([0.485, 0.456, 0.406])
     IMG_STD     = torch.tensor([0.229, 0.224, 0.225])
-    MAP_RANGE_M = 25.0  # osm_map_generator.py의 MAP_RANGE_M
+    MAP_RANGE_M = map_range_m  # osm_map_generator.py의 MAP_RANGE_M — 반드시 실제 학습에 쓴 맵과 일치해야 함
 
     B = min(n_vis, obs_stack.shape[0])
     # 행=샘플, 열=3개 서브플롯
@@ -567,6 +618,8 @@ def validate(
     use_wandb:    bool,
     vis_freq:     int,
     save_dir:     Path,
+    global_step:  int = 0,
+    map_range_m:  float = 25.0,
 ) -> tuple:
     """
     Validation loss, ADE, FDE 계산 및 시각화.
@@ -620,7 +673,7 @@ def validate(
             obs_imgs, map_imgs, pred, gt, ep_ids, fi_ids, seg_ids = vis_batch
             fig = visualize_waypoints(obs_imgs, map_imgs, pred, gt,
                                       ep_ids=ep_ids, fi_ids=fi_ids, seg_ids=seg_ids,
-                                      n_vis=4)
+                                      n_vis=4, map_range_m=map_range_m)
 
             # wandb.Image로 변환해서 업로드
             log_dict["val/waypoint_vis"] = wandb.Image(fig)
@@ -631,7 +684,7 @@ def validate(
             fig.savefig(vis_dir / f"epoch_{epoch:03d}.png", dpi=100)
             plt.close(fig)
 
-        wandb.log(log_dict)
+        wandb.log(log_dict, step=global_step)
 
     return val_loss, ade, fde
 
@@ -647,6 +700,7 @@ def evaluate_test(
     device:       torch.device,
     smooth_weight: float,
     save_dir:     Path,
+    map_range_m:  float = 25.0,
 ) -> None:
     """
     Test set 전체 배치에 대해 ADE/FDE 계산 + trajectory 시각화 저장.
@@ -680,7 +734,7 @@ def evaluate_test(
         fig = visualize_waypoints(
             inp["obs_img"], inp["map_images"], action_pred, inp["gt_waypoints"],
             ep_ids=batch["episode_index"], fi_ids=batch["frame_index"],
-            seg_ids=batch["segment"], n_vis=4,
+            seg_ids=batch["segment"], n_vis=4, map_range_m=map_range_m,
         )
         fig.savefig(vis_dir / f"batch_{i:04d}.png", dpi=80)
         plt.close(fig)
@@ -701,8 +755,19 @@ def evaluate_test(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main(cfg: dict):
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-    print(f"[main] device: {device}")
+    n_gpus = torch.cuda.device_count()
+    preferred_gpu = cfg.get("gpu", 1)  # RTX 4090 (physical GPU1) 선호
+    if n_gpus == 0:
+        device = torch.device("cpu")
+    elif preferred_gpu < n_gpus:
+        device = torch.device(f"cuda:{preferred_gpu}")
+    else:
+        print(f"[main] WARNING: preferred gpu {preferred_gpu} not visible "
+              f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}, "
+              f"device_count={n_gpus}) -> falling back to cuda:0")
+        device = torch.device("cuda:0")
+    print(f"[main] device: {device}  "
+          f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}, device_count={n_gpus})")
 
     # wandb 초기화
     use_wandb = cfg.get("use_wandb", TRAIN_CONFIG["use_wandb"])
@@ -749,14 +814,7 @@ def main(cfg: dict):
 
     val_ratio  = cfg.get("val_ratio",  TRAIN_CONFIG["val_ratio"])
     test_ratio = cfg.get("test_ratio", TRAIN_CONFIG["test_ratio"])
-    val_size   = int(len(dataset) * val_ratio)
-    test_size  = int(len(dataset) * test_ratio)
-    train_size = len(dataset) - val_size - test_size
-    train_ds, val_ds, test_ds = random_split(
-        dataset, [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42),
-    )
-    print(f"[main] train={train_size:,}  val={val_size:,}  test={test_size:,}")
+    train_ds, val_ds, test_ds = episode_grouped_split(dataset, val_ratio, test_ratio, seed=42)
 
     bs = cfg.get("batch_size", TRAIN_CONFIG["batch_size"])
     nw = cfg.get("num_workers", TRAIN_CONFIG["num_workers"])
@@ -771,7 +829,8 @@ def main(cfg: dict):
     # ── eval_only: test set 평가 후 종료 ─────────────────────────────────────
     if cfg.get("eval_only", False):
         smooth_w = cfg.get("smooth_weight", TRAIN_CONFIG["smooth_weight"])
-        evaluate_test(model, test_loader, device, smooth_w, save_dir)
+        evaluate_test(model, test_loader, device, smooth_w, save_dir,
+                      map_range_m=cfg.get("map_range_m", 25.0))
         if use_wandb:
             wandb.finish()
         return
@@ -841,7 +900,8 @@ def main(cfg: dict):
 
         val_loss, ade, fde = validate(
             model, val_loader, device, MODEL_PARAMS, smooth_w,
-            epoch, use_wandb, vis_freq, save_dir,
+            epoch, use_wandb, vis_freq, save_dir, global_step=global_step,
+            map_range_m=cfg.get("map_range_m", 25.0),
         )
 
         # lr scheduler step (epoch 단위)
@@ -855,7 +915,7 @@ def main(cfg: dict):
 
         # wandb: epoch 단위 lr 로그
         if use_wandb:
-            wandb.log({"train/lr": current_lr, "epoch": epoch})
+            wandb.log({"train/lr": current_lr, "epoch": epoch}, step=global_step)
 
         # best 체크포인트 저장
         if val_loss < best_val_loss:

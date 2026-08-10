@@ -1,0 +1,49 @@
+# ============================================================
+# rides11_finetune_odom_12m.yaml
+# OmniVLA-Edge-Odom fine-tuning config — MAP_RANGE_M 12m ablation
+#
+# rides11_finetune_odom.yaml(맵 반경 25m)과 동일하되, 맵 반경만 12m(총 24m)로
+# 줄인 osm_maps_arrow_12m/ 를 사용. 예측 horizon(8 step, 약 2m)에 비해 기존
+# 25m crop이 지나치게 넓어(=근거리 곡률이 픽셀 몇 개에 뭉개짐) map-zero
+# 우회전 편향과 관련 있을 수 있다는 가설을 검증하기 위한 ablation.
+# 다른 변수(freeze 전략, split, augmentation)는 전부 baseline과 동일하게 유지
+# — 맵 반경 하나만 바꾼 순수 비교를 위함.
+#
+# 실행:
+#   cd /media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA
+#   conda run -n mbra python scripts/omnivla/finetune_omnivla_edge.py --config config/rides11_finetune_odom_12m.yaml
+# ============================================================
+
+# ── 체크포인트 경로 (baseline과 동일한 시작점) ──────────────────
+ckpt_path: "/media/ms/WD_BLACK_4TB/OmniVLA/omnivla-edge/omnivla-edge-odom3ch.pth"
+
+# ── 데이터 경로 ──────────────────────────────────────────────
+arrow_path:  "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11/train/data-00000-of-00001.arrow"
+scores_path: "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/episode_scores.json"
+osm_root:    "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/osm_maps_arrow_12m"
+map_range_m: 12.0  # visualize_waypoints()의 지도 오버레이 픽셀 환산용 — osm_maps_arrow_12m 생성 시 쓴 반경과 일치해야 함
+video_root:  "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11"
+
+# ── 체크포인트 저장 경로 ──────────────────────────────────────
+save_dir: "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/checkpoints/omnivla_edge_rides11_odom_12m"
+
+# ── Freeze 전략 (baseline과 동일) ────────────────────────────
+freeze: "partial"
+
+# ── 학습 하이퍼파라미터 (baseline과 동일) ────────────────────
+epochs:        20
+batch_size:    32
+lr:            1.0e-4
+weight_decay:  1.0e-4
+val_ratio:     0.1
+test_ratio:    0.1
+num_workers:   4
+smooth_weight: 0.1
+
+# ── 로깅 및 저장 ──────────────────────────────────────────────
+save_freq:  5
+log_freq:   50
+vis_freq:   1
+use_wandb:  true
+wandb_project: "omnivla-edge-rides11-odom"
+run_name:   "odom3ch_bs32_partial_map12m"

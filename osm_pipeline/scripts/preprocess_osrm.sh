@@ -120,6 +120,7 @@ case "${1:-}" in
     florida)    preprocess florida    "florida-latest.osm.pbf" ;;
     brighton)   preprocess brighton   "great-britain-latest.osm.pbf" ;;
     madrid)     preprocess madrid     "spain-latest.osm.pbf" ;;
+    seoul)      preprocess seoul      "south-korea-latest.osm.pbf" ;;
     rides11)
         echo "output_rides_11 전체 지역 전처리 시작..."
         preprocess wuhan      "hubei-latest.osm.pbf"
@@ -133,6 +134,6 @@ case "${1:-}" in
     status)
         status_check ;;
     *)
-        echo "사용법: $0 [wuhan|manila|rome|wellington|florida|brighton|madrid|rides11|status]"
+        echo "사용법: $0 [wuhan|manila|rome|wellington|florida|brighton|madrid|seoul|rides11|status]"
         exit 1 ;;
 esac

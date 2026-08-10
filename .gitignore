@@ -16,6 +16,7 @@ frodo_dataset/
 cache/
 data_splits/
 osm_pipeline/osm_data/output_*/osm_maps/
+osm_pipeline/osm_data/output_*/osm_maps_arrow*/
 osm_pipeline/tile_cache/
 osm_pipeline/dataset/
 osm_pipeline/osrm/
@@ -28,3 +29,9 @@ tools/global_odom_maps/
 *.arrow
 *.zarr
 *.mp4
+
+# ── 추가: 실행 산출물 (체크포인트/로그/wandb/샘플 이미지) ──────────────────────
+/checkpoints/
+/wandb/
+/logs/
+/osm_data/

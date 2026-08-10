@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import random_split
+from torch.utils.data import random_split, Subset
 from PIL import Image
 from torchvision import transforms
 import matplotlib
@@ -85,18 +85,42 @@ def load_model(ckpt_path):
 
 
 def get_test_split(seed=42, val_ratio=0.1, test_ratio=0.1):
-    """finetune_omnivla_edge.py의 main()과 완전히 동일한 split 로직 재현.
-    이 test_ds에 속한 샘플만 fine-tuning 중 절대 gradient를 본 적이 없음."""
+    """finetune_omnivla_edge.py의 main()과 완전히 동일한 episode-grouped split 로직 재현.
+    이 test_ds에 속한 episode는 fine-tuning 중 절대 gradient를 본 적이 없음
+    (프레임 단위가 아니라 episode 단위로 통째로 배정 — leakage 방지)."""
     dataset = Rides11Dataset(str(ARROW), str(SCORES), str(OSM_ROOT), str(VID_ROOT))
-    val_size = int(len(dataset) * val_ratio)
-    test_size = int(len(dataset) * test_ratio)
-    train_size = len(dataset) - val_size - test_size
-    train_ds, val_ds, test_ds = random_split(
-        dataset, [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(seed),
-    )
+
+    ep_of_idx = np.array([s[0] for s in dataset.valid_samples])
+    episodes = np.unique(ep_of_idx)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(episodes)
+
+    ep_sample_count = {ep: int((ep_of_idx == ep).sum()) for ep in episodes}
+    total = len(dataset)
+    target_val = int(total * val_ratio)
+    target_test = int(total * test_ratio)
+
+    val_eps, test_eps = set(), set()
+    n_val = n_test = 0
+    for ep in episodes:
+        c = ep_sample_count[ep]
+        if n_val < target_val:
+            val_eps.add(ep); n_val += c
+        elif n_test < target_test:
+            test_eps.add(ep); n_test += c
+
+    train_idx, val_idx, test_idx = [], [], []
+    for i, ep in enumerate(ep_of_idx):
+        if ep in val_eps:
+            val_idx.append(i)
+        elif ep in test_eps:
+            test_idx.append(i)
+        else:
+            train_idx.append(i)
+
+    train_ds, val_ds, test_ds = Subset(dataset, train_idx), Subset(dataset, val_idx), Subset(dataset, test_idx)
     print(f"[split] dataset={len(dataset):,}  train={len(train_ds):,}  "
-          f"val={len(val_ds):,}  test={len(test_ds):,}")
+          f"val={len(val_ds):,}  test={len(test_ds):,}  (episode-grouped)")
     return dataset, train_ds, val_ds, test_ds
 
 
@@ -380,6 +404,54 @@ def pick_map_png(seg_stat, frac=0.6):
     return pngs[idx]
 
 
+def pick_locally_curved_frame(seg_stat, want_curve: bool, lookahead_m=12.0, margin_frac=0.1):
+    """
+    seg_stat["scenario"](세그먼트 전체 평균 곡률 기준 라벨)이 아니라, 그 프레임의
+    map crop(반경 이내)에서 실제로 커브가 "보이는지"를 기준으로 대표 프레임을 고른다.
+
+    이전 방식(pick_map_png, frac=0.6 고정)은 segment 전체 평균으로 curve라고
+    분류된 segment도, 정작 frac=0.6 지점은 직진 구간일 수 있어서 straight/curve
+    map이 육안으로 구분이 안 되는 문제가 있었다 (사용자 피드백으로 발견).
+
+    이 함수는 세그먼트 내 모든 후보 프레임에 대해 "그 지점부터 lookahead_m 앞까지
+    누적 heading 변화량"을 직접 계산해서, want_curve=True면 그 값이 가장 큰 프레임을,
+    want_curve=False(straight)면 가장 작은 프레임을 고른다 — 즉 osm_map PNG 한 장
+    안에서 실제로 휘어 보이는(또는 실제로 곧게 보이는) 지점을 직접 찾아낸다.
+    """
+    lats, lons = dd.read_gps(seg_stat["seg_dir"])
+    if lats is None or len(lats) < 20:
+        return pick_map_png(seg_stat)
+
+    x, y = dd.latlon_to_xy(lats, lons)
+    n = len(x)
+    dists = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2)
+    cum = np.concatenate([[0.0], np.cumsum(dists)])
+
+    lo = int(n * margin_frac)
+    hi = int(n * (1 - margin_frac))
+    best_idx, best_score = None, None
+    for i in range(lo, hi):
+        end = np.searchsorted(cum, cum[i] + lookahead_m, side="left")
+        end = min(end, n - 1)
+        if end - i < 5:
+            continue
+        wx, wy = x[i:end + 1], y[i:end + 1]
+        headings = dd.compute_headings(wx, wy)
+        changes = dd.compute_heading_changes(headings, smooth_w=min(3, max(1, len(headings) // 2)))
+        score = float(np.abs(changes).sum())
+        if best_score is None or (want_curve and score > best_score) or (not want_curve and score < best_score):
+            best_score, best_idx = score, i
+
+    if best_idx is None:
+        return pick_map_png(seg_stat)
+
+    pngs = sorted(seg_stat["seg_dir"].glob("osm_map_*.png"))
+    png_path = seg_stat["seg_dir"] / f"osm_map_{best_idx:06d}.png"
+    if not png_path.exists():
+        return pngs[min(best_idx, len(pngs) - 1)] if pngs else None
+    return png_path
+
+
 def run_map_swap_test(model, n_each=3):
     print("\n" + "=" * 60)
     print("C) STRAIGHT vs CURVE MAP SWAP TEST (output_rides_00, obs 고정)")
@@ -423,7 +495,7 @@ def run_map_swap_test(model, n_each=3):
     all_pred_xy = []
     cases = []  # {label, seg_key, pred_m, map_np, color}
     for label, seg_stat in selected:
-        png_path = pick_map_png(seg_stat)
+        png_path = pick_locally_curved_frame(seg_stat, want_curve=(label == "curve"))
         if png_path is None:
             continue
         map_tensor = load_map_tensor(png_path, DEVICE)
@@ -794,11 +866,114 @@ def _run_one_sequence(model, label, seg_stat, n_steps):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# F) Left-right flip symmetry test — obs+map을 좌우 반전해서 넣었을 때
+#    예측도 좌우 반전되는지 확인 (map-zero 우회전 편향이 "입력과 무관하게
+#    항상 오른쪽을 선호"하는 학습된 편향인지 직접 진단)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_flip_symmetry_test(model, n_samples=16):
+    print("\n" + "=" * 60)
+    print("F) LEFT-RIGHT FLIP SYMMETRY TEST (held-out test set)")
+    print("=" * 60)
+    print("""
+  로직: obs(카메라 6장)와 map을 좌우로 뒤집어서(torch.flip, 수평 미러) 다시 넣는다.
+  모델이 입력 내용을 보고 판단한다면, 뒤집은 입력에 대한 예측도 좌우가 뒤집혀
+  나와야 한다 (ego-frame에서 y=left이므로, 뒤집힌 예측의 y는 부호가 반대여야 함).
+  만약 뒤집어도 예측이 거의 안 바뀌거나 여전히 같은 방향(e.g. 오른쪽)으로 쏠린다면,
+  이는 "입력과 무관하게 학습된 방향 편향"이 존재한다는 직접적인 증거가 된다.
+    """)
+
+    _, _, _, test_ds = get_test_split()
+    rng = np.random.default_rng(1)
+    idxs = rng.permutation(len(test_ds))[:n_samples]
+
+    orig_y_sum, flip_y_sum, asym = [], [], []
+    viz = []
+    for j in idxs:
+        sample = test_ds[int(j)]
+        obs = sample["obs_stack"].unsqueeze(0).to(DEVICE)
+        map_img = sample["map_images"].unsqueeze(0).to(DEVICE)
+        obs_cur = obs[:, -3:]
+        goal_pose = torch.zeros(1, 4, device=DEVICE)
+        goal_mask = torch.zeros(1, dtype=torch.long, device=DEVICE)
+        feat_text = torch.zeros(1, 512, device=DEVICE)
+        cur_img = F.interpolate(obs_cur, (224, 224), mode='bilinear', align_corners=False)
+
+        obs_f = torch.flip(obs, dims=[-1])
+        map_f = torch.flip(map_img, dims=[-1])
+        obs_cur_f = obs_f[:, -3:]
+        cur_img_f = F.interpolate(obs_cur_f, (224, 224), mode='bilinear', align_corners=False)
+
+        with torch.no_grad():
+            pred, _, _ = model(obs, goal_pose, map_img, obs_cur, goal_mask, feat_text, cur_img)
+            pred_f, _, _ = model(obs_f, goal_pose, map_f, obs_cur_f, goal_mask, feat_text, cur_img_f)
+
+        pred_m   = pred[0, :, :2].detach().cpu().numpy()   * METRIC_WAYPOINT_SPACING
+        pred_f_m = pred_f[0, :, :2].detach().cpu().numpy() * METRIC_WAYPOINT_SPACING
+
+        y_o = float(pred_m[:, 1].sum())
+        y_f = float(pred_f_m[:, 1].sum())
+        # 대칭이면 y_f ≈ -y_o 이어야 함 → 잔차 = y_f + y_o (0에 가까울수록 정상)
+        orig_y_sum.append(y_o)
+        flip_y_sum.append(y_f)
+        asym.append(y_f + y_o)
+
+        if len(viz) < 4:
+            viz.append(dict(obs=denorm_img(obs[0, -3:]), obs_f=denorm_img(obs_f[0, -3:]),
+                             pred_m=pred_m, pred_f_m=pred_f_m))
+
+    orig_y_sum = np.array(orig_y_sum); flip_y_sum = np.array(flip_y_sum); asym = np.array(asym)
+    print(f"  n={len(idxs)}")
+    print(f"  원본 예측 lateral(y) 합 평균: {orig_y_sum.mean():+.4f} m  (양수=왼쪽 누적, 음수=오른쪽 누적)")
+    print(f"  반전 예측 lateral(y) 합 평균: {flip_y_sum.mean():+.4f} m")
+    print(f"  비대칭 잔차(y_flip + y_orig) 평균: {asym.mean():+.4f} m   (0에 가까울수록 정상)")
+    print(f"  비대칭 잔차 표준편차: {asym.std():.4f} m")
+    same_sign = np.mean((np.sign(orig_y_sum) == np.sign(flip_y_sum)) & (np.abs(orig_y_sum) > 0.01) & (np.abs(flip_y_sum) > 0.01))
+    print(f"  원본과 반전 예측이 '같은 방향'을 가리키는 비율: {same_sign*100:.0f}%  "
+          f"(대칭이면 이 비율이 낮아야 정상, 항상 오른쪽 편향이면 이 비율이 높게 나옴)")
+
+    if abs(asym.mean()) > 0.05 and same_sign > 0.5:
+        print(f"\n  ⚠ 입력을 뒤집어도 예측 방향이 잘 안 뒤집힘 → 입력과 무관한 방향 편향 의심")
+    else:
+        print(f"\n  ✓ 입력을 뒤집으면 예측도 대체로 같이 뒤집힘 → 입력 기반 판단으로 보임 (구조적 편향 약함)")
+
+    # ── 시각화 ──
+    fig, axes = plt.subplots(len(viz), 3, figsize=(9, 2.8 * len(viz)))
+    if len(viz) == 1:
+        axes = axes[np.newaxis, :]
+    for row, v in enumerate(viz):
+        axes[row, 0].imshow(v["obs"]); axes[row, 0].set_xticks([]); axes[row, 0].set_yticks([])
+        axes[row, 1].imshow(v["obs_f"]); axes[row, 1].set_xticks([]); axes[row, 1].set_yticks([])
+        if row == 0:
+            axes[row, 0].set_title("original obs", fontsize=9)
+            axes[row, 1].set_title("flipped obs", fontsize=9)
+
+        ax = axes[row, 2]
+        gx, gy = to_ego_plot_xy(v["pred_m"])
+        fx, fy = to_ego_plot_xy(v["pred_f_m"])
+        ax.plot(gx, gy, '-o', ms=4, lw=2, color="#1E88E5", label="pred(original)")
+        ax.plot(-fx, fy, '-o', ms=4, lw=2, color="#E53935", ls="--", label="mirror(pred(flipped))")
+        ax.plot(0, 0, 'k*', ms=9)
+        ax.axhline(0, color='lightgray', lw=0.6); ax.axvline(0, color='lightgray', lw=0.6)
+        ax.set_aspect('equal'); ax.tick_params(labelsize=6)
+        if row == 0:
+            ax.set_title("대칭이면 두 선이 겹쳐야 함", fontsize=9)
+            ax.legend(fontsize=6, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+    fig.suptitle("Flip symmetry test: obs+map을 좌우 반전했을 때 예측도 반전되는가?", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 0.85, 0.95])
+    out_path = OUT_DIR / "flip_symmetry_test.png"
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  → Saved: {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, default=str(CKPT))
     parser.add_argument("--method", type=str, default="all",
-                        choices=["heldout", "swap", "matched", "sequence", "all"])
+                        choices=["heldout", "swap", "matched", "sequence", "flip", "all"])
     args = parser.parse_args()
 
     model = load_model(args.ckpt)
@@ -814,6 +989,9 @@ def main():
 
     if args.method in ("sequence", "all"):
         run_matched_sequence_test(model)
+
+    if args.method in ("flip", "all"):
+        run_flip_symmetry_test(model)
 
     print(f"\n모든 결과 저장 위치: {OUT_DIR}")
 

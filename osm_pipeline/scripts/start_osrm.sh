@@ -88,7 +88,7 @@ stop_server() {
 
 status_check() {
     echo "OSRM 서버 상태:"
-    local regions=("perth:5001" "taipei:5002" "tokyo:5003" "wuhan:5004" "manila:5005" "rome:5006" "wellington:5007" "florida:5008" "brighton:5009" "madrid:5010")
+    local regions=("perth:5001" "taipei:5002" "tokyo:5003" "wuhan:5004" "manila:5005" "rome:5006" "wellington:5007" "florida:5008" "brighton:5009" "madrid:5010" "seoul:5011")
     for entry in "${regions[@]}"; do
         local region="${entry%%:*}"
         local port="${entry##*:}"
@@ -111,6 +111,7 @@ case "${1:-all}" in
     florida)    start_server florida    5008 ;;
     brighton)   start_server brighton   5009 ;;
     madrid)     start_server madrid     5010 ;;
+    seoul)      start_server seoul      5011 ;;
     rides11)
         echo "output_rides_11 OSRM 서버 시작 (ports 5004-5010)..."
         start_server wuhan      5004
@@ -124,7 +125,7 @@ case "${1:-all}" in
         status_check ;;
     stop)
         echo "모든 OSRM 서버 종료..."
-        for region in perth taipei tokyo wuhan manila rome wellington florida brighton madrid; do
+        for region in perth taipei tokyo wuhan manila rome wellington florida brighton madrid seoul; do
             stop_server "$region"
         done ;;
     status)
@@ -144,6 +145,6 @@ case "${1:-all}" in
         echo "완료."
         status_check ;;
     *)
-        echo "사용법: $0 [perth|taipei|tokyo|wuhan|manila|rome|wellington|florida|brighton|madrid|rides11|all|stop|status]"
+        echo "사용법: $0 [perth|taipei|tokyo|wuhan|manila|rome|wellington|florida|brighton|madrid|seoul|rides11|all|stop|status]"
         exit 1 ;;
 esac
