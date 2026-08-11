@@ -26,7 +26,15 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
+
+# 예측 궤적 확대 패널 전용 스케일. 지도(map.jpg)는 MAP_RANGE_M(예: 20m, 전체 40m)
+# 축척 그대로라 8-step 예측(~2m)이 전체 폭의 5%(≈11px)밖에 안 돼서 육안으로 방향
+# 판단이 사실상 불가능함 — 그래서 지도와 별개로, 예측 궤적만 이 좁은 고정 범위로
+# 확대해서 그리는 패널을 추가함 (모델/제어 로직과 무관, 순수 시각화용).
+TRAJ_ZOOM_SIZE = 224
+TRAJ_ZOOM_LATERAL_M = 1.2   # 좌우 ±1.2m
+TRAJ_ZOOM_FORWARD_M = 2.2   # 전방 0~2.2m (ego는 하단 근처)
 
 
 class DeploymentState:
@@ -101,6 +109,58 @@ class DeploymentState:
             img = self.map_img
         return _to_jpeg(img)
 
+    def snapshot_traj_jpeg(self):
+        with self._lock:
+            pred = self.pred_xy_m
+        return _to_jpeg(_render_traj_zoom(pred))
+
+
+def _render_traj_zoom(pred_xy_m, target_step=2):
+    """예측 waypoint(ego frame, x=forward m, y=left m)를 지도 축척과 무관한
+    좁은 고정 범위(TRAJ_ZOOM_*)로 확대해서 그린 이미지 반환. 격자선(0.5m 간격)과
+    스케일 라벨을 넣어서 지도(map.jpg)보다 훨씬 크게, 방향이 눈에 보이게 함."""
+    size = TRAJ_ZOOM_SIZE
+    img = Image.new("RGB", (size, size), (18, 18, 18))
+    d = ImageDraw.Draw(img)
+
+    lat_m, fwd_m = TRAJ_ZOOM_LATERAL_M, TRAJ_ZOOM_FORWARD_M
+    px_per_m = min(size / (2 * lat_m), (size - 30) / fwd_m)
+    cx = size / 2.0
+    cy = size - 15  # ego를 하단 근처에 둬서 전방으로 뻗어나갈 공간 확보
+
+    def to_px(x, y):  # x=forward(m), y=left(m) → (col, row)
+        return (cx - y * px_per_m, cy - x * px_per_m)
+
+    # 격자선 0.5m 간격
+    step_px = 0.5 * px_per_m
+    x_ = cx
+    while x_ < size:
+        d.line([(x_, 0), (x_, size)], fill=(40, 40, 40)); x_ += step_px
+    x_ = cx - step_px
+    while x_ > 0:
+        d.line([(x_, 0), (x_, size)], fill=(40, 40, 40)); x_ -= step_px
+    y_ = cy
+    while y_ > 0:
+        d.line([(0, y_), (size, y_)], fill=(40, 40, 40)); y_ -= step_px
+
+    # 중심축(로봇 정면 방향) 강조
+    d.line([(cx, 0), (cx, size)], fill=(70, 70, 70))
+    d.line([(0, cy), (size, cy)], fill=(70, 70, 70))
+
+    if pred_xy_m is not None and len(pred_xy_m) > 0:
+        pts = [to_px(x, y) for x, y in pred_xy_m]
+        d.line(pts, fill=(0, 255, 255), width=2)
+        for k, p in enumerate(pts):
+            r = 5 if k == target_step else 3
+            d.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r],
+                      fill=(0, 255, 255), outline=(255, 255, 255))
+
+    # ego 마커
+    ex, ey = to_px(0, 0)
+    d.ellipse([ex - 5, ey - 5, ex + 5, ey + 5], fill=(60, 255, 60), outline=(255, 255, 255))
+    d.text((4, 2), f"±{lat_m}m / {fwd_m}m  (0.5m 격자)", fill=(180, 180, 180))
+    return img
+
 
 def _to_jpeg(img):
     if img is None:
@@ -137,6 +197,9 @@ pre { background:#000; padding:8px; height:300px; overflow-y:auto; font-size:12p
       <span style="color:#0ff;">■</span> 모델 예측 궤적&nbsp;
       <span style="color:#fff;">—</span> 스케일바
     </div>
+  </div>
+  <div class="card"><b>예측 궤적 확대(지도와 별개 축척)</b><br><img src="/traj.jpg?t=__TS__">
+    <div style="font-size:11px; margin-top:4px;">지도(40m 등)가 넓어서 실제 예측(~2m)이 안 보이는 문제 때문에 추가된 확대 패널</div>
   </div>
   <div class="card">
     <b>상태</b>
@@ -184,6 +247,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(self.state.snapshot_camera_jpeg(), "image/jpeg")
         elif self.path.startswith("/map.jpg"):
             self._send(self.state.snapshot_map_jpeg(), "image/jpeg")
+        elif self.path.startswith("/traj.jpg"):
+            self._send(self.state.snapshot_traj_jpeg(), "image/jpeg")
         else:
             body = _PAGE_HTML.replace("__TS__", str(int(time.time() * 1000))).encode()
             self._send(body, "text/html; charset=utf-8")
