@@ -72,7 +72,15 @@ MODEL_PARAMS = dict(
 # ── 제어 안전 한계 (LogoNav_frodobot.py와 동일한 안전장치 재사용) ──
 MAX_V = 0.3   # m/s
 MAX_W = 0.3   # rad/s
-DT    = 1.0 / 3.0  # 제어 루프 주기 (3Hz, 학습 waypoint 간격 0.3초와 근접)
+DT    = 1.0 / 3.0  # 제어 루프 주기 (3Hz) — waypoint_to_control()에서는 안 씀(2026-08 버그 수정, 아래 참고)
+
+# heading 변환 보정값. FrodoBot /data의 orientation이 "표준 나침반 방위각"
+# (0=북, 시계방향 증가)이라고 가정하면 math 좌표계(0=동, 반시계 양수)로 바꾸려면
+# heading_math_deg = HEADING_OFFSET_DEG - orientation_deg 여야 함(90도 필요).
+# 예전 코드(LogoNav_frodobot.py에서 그대로 가져옴)는 이 90도가 빠져 있어서
+# 지도가 90도 어긋나 보이는 원인으로 추정됨. 실제 기기에서 로봇을 정지시켜두고
+# 대시보드의 raw orientation과 지도 정렬을 비교하면서 이 값을 보정할 것.
+HEADING_OFFSET_DEG = 90.0
 
 
 def decode_frame(b64_str) -> Image.Image:
@@ -94,7 +102,8 @@ def clip_control(linear_vel, angular_vel, maxv=MAX_V, maxw=MAX_W):
 
 class OmniVLAEdgeDeployment:
     def __init__(self, ckpt_path, map_range_m, goal_lat, goal_lon, device=None,
-                 debug_port=8080):
+                 debug_port=8080, heading_sign=1):
+        self.heading_sign = heading_sign  # 지도 정렬이 반대로 보이면 -1로 실행할 것
         self.state = DeploymentState()
         if debug_port:
             start_debug_server(self.state, port=debug_port)
@@ -130,10 +139,14 @@ class OmniVLAEdgeDeployment:
         gps = requests.get(f"{FRODOBOT_BASE}/data", timeout=1.0).json()
         img = decode_frame(cam["front_frame"])
         lat, lon = gps["latitude"], gps["longitude"]
-        # LogoNav_frodobot.py와 동일한 부호 규약: orientation(시계방향, deg) → CCW radian
-        heading_rad = -float(gps["orientation"]) / 180.0 * math.pi
+        orientation_deg_raw = float(gps["orientation"])
+        # 나침반 방위각(0=북, 시계방향) → math 좌표계(0=동, 반시계 양수) 변환.
+        # HEADING_OFFSET_DEG=90이 이전 버그(90도 어긋남) 수정분 — 실기기에서 안 맞으면
+        # 이 상수를 조정하거나 self.heading_sign을 -1로 뒤집어서 보정할 것.
+        heading_deg = (HEADING_OFFSET_DEG - orientation_deg_raw) * self.heading_sign
+        heading_rad = math.radians(heading_deg)
         self.state.update(camera_img=img, lat=lat, lon=lon,
-                           heading_deg=math.degrees(heading_rad))
+                           heading_deg=heading_deg, orientation_deg_raw=orientation_deg_raw)
         return img, lat, lon, heading_rad
 
     def send_control(self, linear, angular):
@@ -187,16 +200,24 @@ class OmniVLAEdgeDeployment:
         return pred_xy_m
 
     def waypoint_to_control(self, pred_xy_m, target_step=2):
-        """LogoNav_frodobot.py와 동일한 기하학적 변환 (목표 waypoint까지의 각도/거리로
-        linear/angular 속도 산출). target_step=2 → 세 번째 예측 지점(약 0.9초 앞)을 조준."""
+        """LogoNav_frodobot.py와 동일한 기하학적 변환(목표 waypoint까지의 각도/거리로
+        linear/angular 속도 산출)이되, 시간 분모는 반드시 그 waypoint의 실제 시점과
+        일치시켜야 함. LogoNav는 DT=1/4를 쓰는데 이건 "NoMaD 모델 자체의 웨이포인트
+        간격이 0.25초"이기 때문에 맞는 값이었음 — 우리 모델의 웨이포인트 간격은
+        0.3초(CTX_STRIDE_SEC)이고, index i(0-based)는 (i+1)*0.3초 뒤를 의미함
+        (rides11_dataset.py의 k=range(1, N_WAYPOINTS+1) 인덱싱과 동일).
+        이걸 제어 루프 주기 DT(=1/3)로 나누면 시점이 안 맞아서 속도가 실제보다
+        부풀려지고, 그 결과 항상 MAX_V/MAX_W 안전 캡에 걸려 모델 예측의 크기 정보가
+        사라지는 문제가 있었음 (2026-08 실배포 테스트에서 "명령이 항상 작다"로 발견됨)."""
+        target_time_s = (target_step + 1) * CTX_STRIDE_SEC  # 예: target_step=2 → 0.9초
         x, y = pred_xy_m[target_step]  # x=forward(m), y=left(m)
         EPS = 1e-8
         if abs(x) < EPS and abs(y) < EPS:
             return 0.0, 0.0
         if abs(x) < EPS:
-            return 0.0, np.sign(y) * math.pi / (2 * DT)
-        linear = x / DT
-        angular = math.atan2(y, x) / DT  # y=left이므로 양수 angular=왼쪽 회전(CCW)이 되도록
+            return 0.0, np.sign(y) * math.pi / (2 * target_time_s)
+        linear = x / target_time_s
+        angular = math.atan2(y, x) / target_time_s  # y=left이므로 양수 angular=왼쪽 회전(CCW)이 되도록
         return float(np.clip(linear, 0, MAX_V * 2)), float(np.clip(angular, -MAX_W * 2, MAX_W * 2))
 
     def step(self):
@@ -253,11 +274,13 @@ if __name__ == "__main__":
     p.add_argument("--goal_lon", type=float, required=True)
     p.add_argument("--debug_port", type=int, default=8080,
                    help="모니터링 웹 대시보드 포트 (0이면 비활성화)")
+    p.add_argument("--heading_sign", type=int, default=1, choices=[1, -1],
+                   help="대시보드 지도 회전이 실제 heading과 반대로 보이면 -1로 실행")
     args = p.parse_args()
 
     deployer = OmniVLAEdgeDeployment(
         ckpt_path=args.ckpt, map_range_m=args.map_range,
         goal_lat=args.goal_lat, goal_lon=args.goal_lon,
-        debug_port=args.debug_port,
+        debug_port=args.debug_port, heading_sign=args.heading_sign,
     )
     deployer.run()

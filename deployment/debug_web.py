@@ -40,6 +40,7 @@ class DeploymentState:
         self.lat = None
         self.lon = None
         self.heading_deg = None
+        self.orientation_deg_raw = None
         self.linear = 0.0
         self.angular = 0.0
         self.pred_xy_m = None       # (8,2) numpy, 예측 웨이포인트
@@ -50,13 +51,14 @@ class DeploymentState:
 
     def update(self, camera_img=None, map_img=None, lat=None, lon=None,
                heading_deg=None, linear=None, angular=None, pred_xy_m=None,
-               loop_hz=None):
+               loop_hz=None, orientation_deg_raw=None):
         with self._lock:
             if camera_img is not None: self.camera_img = camera_img
             if map_img is not None: self.map_img = map_img
             if lat is not None: self.lat = lat
             if lon is not None: self.lon = lon
             if heading_deg is not None: self.heading_deg = heading_deg
+            if orientation_deg_raw is not None: self.orientation_deg_raw = orientation_deg_raw
             if linear is not None: self.linear = linear
             if angular is not None: self.angular = angular
             if pred_xy_m is not None: self.pred_xy_m = pred_xy_m
@@ -79,6 +81,7 @@ class DeploymentState:
             return {
                 "lat": self.lat, "lon": self.lon,
                 "heading_deg": self.heading_deg,
+                "orientation_deg_raw": self.orientation_deg_raw,
                 "linear": self.linear, "angular": self.angular,
                 "loop_hz": self.loop_hz,
                 "age_sec": round(age, 2) if age is not None else None,
@@ -145,7 +148,7 @@ async function poll() {
   const ageClass = (s.age_sec !== null && s.age_sec < 2.0) ? 'ok' : 'bad';
   tb.innerHTML = `
     <tr><td>GPS</td><td class="${gpsClass}">${s.lat}, ${s.lon} ${s.gps_ok ? '' : '(FIX 없음!)'}</td></tr>
-    <tr><td>heading</td><td>${s.heading_deg}&deg;</td></tr>
+    <tr><td>heading (변환됨)</td><td>${s.heading_deg}&deg; <span style="color:#888">(raw orientation=${s.orientation_deg_raw}&deg;)</span></td></tr>
     <tr><td>제어명령</td><td>linear=${s.linear} m/s, angular=${s.angular} rad/s</td></tr>
     <tr><td>루프 주기</td><td>${s.loop_hz} Hz</td></tr>
     <tr><td>마지막 갱신</td><td class="${ageClass}">${s.age_sec}s 전</td></tr>
