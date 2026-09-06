@@ -22,6 +22,9 @@ deployment/LogoNav_frodobot.py의 FrodoBot SDK 연동 패턴(REST API: /v2/front
   - N_CTX=5, CTX_STRIDE=3프레임(~0.3초 간격), 카메라 6장(과거5+현재1)
   - modality_id / goal_mask = 0 ("map only")
   - METRIC_WAYPOINT_SPACING = 0.125 (출력 waypoint를 미터로 변환할 때)
+  - WAYPOINT_STRIDE_SEC: 체크포인트가 학습된 WAYPOINT_STRIDE와 정확히 일치시킬 것.
+      위 25/12/20m 체크포인트는 전부 WAYPOINT_STRIDE=3(≈2m horizon) → 0.3으로 설정.
+      2026-09 이후 5m-horizon(WAYPOINT_STRIDE=7)으로 재학습한 체크포인트는 0.7 사용.
 
 실행 예 (20m 체크포인트 기준):
   /home/ms/uv-envs/mbra/venv/bin/python deployment/omnivla_edge_deploy.py \
@@ -59,7 +62,13 @@ FRODOBOT_BASE = "http://127.0.0.1:8000"
 
 # rides11_dataset.py와 동일한 학습 시 상수
 N_CTX = 5
-CTX_STRIDE_SEC = 0.3          # 프레임 간격 (WAYPOINT_STRIDE=3 frames @ ~10Hz)
+CTX_STRIDE_SEC = 0.3          # 컨텍스트 이미지 캡처 간격 (CTX_STRIDE=3 frames @ ~10Hz)
+                               # ⚠ WAYPOINT_STRIDE_SEC과는 별개 상수임 — 우연히 값이
+                               # 같았을 뿐(둘 다 예전엔 3프레임), 바꿀 때 혼동하지 말 것.
+WAYPOINT_STRIDE_SEC = 0.7      # waypoint 간 시간 간격 (rides11_dataset.py WAYPOINT_STRIDE=7
+                               # frames @ ~10Hz). 체크포인트가 어느 WAYPOINT_STRIDE로
+                               # 학습됐는지에 정확히 맞춰야 함 (예전 25/12/20m 체크포인트는
+                               # WAYPOINT_STRIDE=3 → 이 값 0.3으로 되돌려서 추론할 것).
 METRIC_WAYPOINT_SPACING = 0.125
 IMG_MEAN = [0.485, 0.456, 0.406]
 IMG_STD  = [0.229, 0.224, 0.225]
@@ -90,17 +99,33 @@ def decode_frame(b64_str) -> Image.Image:
 LAT_M = 111320.0  # 위도 1도당 미터 (근거리 근사)
 
 
-def estimate_heading_from_track(past_track, min_disp_m=0.3):
-    """로봇이 실제로 지나온 GPS 궤적(past_track) 최근 두 점으로 진행방향을 추정.
+def estimate_heading_from_track(past_track, min_disp_m=1.5):
+    """로봇이 실제로 지나온 GPS 궤적(past_track)에서 진행방향을 추정.
     osm_map_generator_rides11.py::estimate_headings()와 동일한 공식(atan2(북쪽성분, 동쪽성분),
     East=0/North=+90 CCW) — 학습 데이터의 heading이 바로 이 방식으로 만들어졌음.
-    이동량이 min_disp_m보다 작으면(정지/GPS 지터) None 반환."""
+
+    직전 두 점만 비교하지 않는다 — GPS가 ~0.42m 단위로만 갱신되는 양자화 잡음 때문에,
+    인접한 두 fix만 보면 위도/경도 중 어느 쪽이 먼저 양자화 경계를 넘었는지에 따라
+    heading이 순간적으로 남↔서로 튀는 문제가 실측으로 확인됨(docs/0825.md 1-1, 원래는
+    시각화 스크립트에서 발견·수정된 문제). 그 수정과 동일하게, 누적 이동거리가
+    min_disp_m 이상 되는 지점까지 거슬러 올라가 그 구간 전체의 변위로 추정해서
+    양자화 스텝 하나짜리 잡음을 평균화한다. 이동량이 부족하면(정지/막 시작) None."""
     if len(past_track) < 2:
         return None
-    lat1, lon1 = past_track[-2]
-    lat2, lon2 = past_track[-1]
-    dlat = (lat2 - lat1) * LAT_M
-    dlon = (lon2 - lon1) * LAT_M * math.cos(math.radians(lat1))
+    lat_end, lon_end = past_track[-1]
+    lat_start, lon_start = past_track[-2]
+    cum_m = 0.0
+    for i in range(len(past_track) - 2, -1, -1):
+        lat_a, lon_a = past_track[i]
+        lat_b, lon_b = past_track[i + 1]
+        dlat = (lat_b - lat_a) * LAT_M
+        dlon = (lon_b - lon_a) * LAT_M * math.cos(math.radians(lat_a))
+        cum_m += math.hypot(dlat, dlon)
+        lat_start, lon_start = lat_a, lon_a
+        if cum_m >= min_disp_m:
+            break
+    dlat = (lat_end - lat_start) * LAT_M
+    dlon = (lon_end - lon_start) * LAT_M * math.cos(math.radians(lat_start))
     if math.hypot(dlat, dlon) < min_disp_m:
         return None
     return math.atan2(dlat, dlon)
@@ -252,12 +277,12 @@ class OmniVLAEdgeDeployment:
         linear/angular 속도 산출)이되, 시간 분모는 반드시 그 waypoint의 실제 시점과
         일치시켜야 함. LogoNav는 DT=1/4를 쓰는데 이건 "NoMaD 모델 자체의 웨이포인트
         간격이 0.25초"이기 때문에 맞는 값이었음 — 우리 모델의 웨이포인트 간격은
-        0.3초(CTX_STRIDE_SEC)이고, index i(0-based)는 (i+1)*0.3초 뒤를 의미함
+        0.7초(WAYPOINT_STRIDE_SEC)이고, index i(0-based)는 (i+1)*0.7초 뒤를 의미함
         (rides11_dataset.py의 k=range(1, N_WAYPOINTS+1) 인덱싱과 동일).
         이걸 제어 루프 주기 DT(=1/3)로 나누면 시점이 안 맞아서 속도가 실제보다
         부풀려지고, 그 결과 항상 MAX_V/MAX_W 안전 캡에 걸려 모델 예측의 크기 정보가
         사라지는 문제가 있었음 (2026-08 실배포 테스트에서 "명령이 항상 작다"로 발견됨)."""
-        target_time_s = (target_step + 1) * CTX_STRIDE_SEC  # 예: target_step=2 → 0.9초
+        target_time_s = (target_step + 1) * WAYPOINT_STRIDE_SEC  # 예: target_step=2 → 2.1초
         x, y = pred_xy_m[target_step]  # x=forward(m), y=left(m)
         EPS = 1e-8
         if abs(x) < EPS and abs(y) < EPS:
@@ -288,22 +313,29 @@ class OmniVLAEdgeDeployment:
         self.maybe_update_frame_buffer(img)
         self.past_track.append((lat, lon))
 
-        # [진단용] IMU(컴퍼스) heading vs GPS 궤적 기반 heading 비교.
-        #   imu_heading  = -orientation/180*pi (로봇 컴퍼스 센서, 현재 배포 코드가 실제로 쓰는 값)
-        #   gps_heading  = 방금 지나온 GPS 두 점 사이 방향, atan2 (학습 데이터 heading과 동일 방식)
-        # 두 값이 계속 크게 어긋나면 컴퍼스 heading이 학습 때 heading과 안 맞는다는 뜻 —
-        # render_frame()에 들어가는 heading이 부정확해서 지도가 heading-up으로 안 맞을 수 있음.
+        # heading 소스: 2026-08-25 실배포 로그 분석(docs/0825.md 2-2)에서 IMU 컴퍼스와
+        # GPS궤적 기반 heading이 평균 +97° 어긋남을 확인 — 학습 데이터의 heading은
+        # GPS궤적 기반(atan2, osm_map_generator_rides11.py::estimate_headings()와 동일
+        # 공식)으로 만들어지므로, render_frame()에 넣는 heading도 같은 소스로 맞춰서
+        # 학습/배포 간 heading 정의 자체가 갈라지는 것을 원천 차단한다.
+        #   imu_heading  = -orientation/180*pi (로봇 컴퍼스 센서, 진단/폴백 전용)
+        #   gps_heading  = 방금 지나온 GPS 두 점 사이 방향 (학습 heading과 동일 산출 방식)
+        # GPS 이동량이 부족(정지/막 시작)해서 gps_heading을 못 구할 때만 IMU로 폴백.
         gps_heading_rad = estimate_heading_from_track(list(self.past_track))
         if gps_heading_rad is not None:
+            map_heading_rad = gps_heading_rad
             gps_deg = math.degrees(gps_heading_rad)
             diff = (gps_deg - imu_deg + 180) % 360 - 180
             record["gps_heading_deg"] = gps_deg
             record["heading_diff_deg"] = diff
-            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°  GPS궤적={gps_deg:+7.1f}°  차이={diff:+7.1f}°")
+            record["map_heading_source"] = "gps_track"
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°  GPS궤적={gps_deg:+7.1f}°(사용)  차이={diff:+7.1f}°")
         else:
+            map_heading_rad = heading_rad  # 폴백: 이동량 부족(정지/막 시작)
             record["gps_heading_deg"] = None
             record["heading_diff_deg"] = None
-            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°  GPS궤적=(이동량 부족, 추정불가)")
+            record["map_heading_source"] = "imu_fallback"
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(폴백 사용)  GPS궤적=(이동량 부족, 추정불가)")
 
         if len(self.frame_buffer) < N_CTX + 1:
             self.state.log("context 채우는 중 ... 정지 유지")
@@ -311,7 +343,7 @@ class OmniVLAEdgeDeployment:
             self._log_jsonl(record)
             return 0.0, 0.0
 
-        pred_xy_m = self.predict_waypoints(lat, lon, heading_rad)
+        pred_xy_m = self.predict_waypoints(lat, lon, map_heading_rad)
         linear, angular = self.waypoint_to_control(pred_xy_m)
         linear, angular = clip_control(linear, angular)
         record.update(linear=linear, angular=angular,

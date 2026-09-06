@@ -24,6 +24,10 @@ Step 5. 배포                    deployment/                          → Frodo
 - 체크포인트별로 **`MAP_RANGE_M`이 다름**(25m/20m/12m) — 학습에 쓴 값과 추론/배포 시 값이 반드시
   일치해야 함 (안 그러면 학습-추론 스케일 불일치). `deployment/omnivla_edge_deploy.py --map_range`는
   기본값 없이 필수 인자로 만들어져 있음 — 실수 방지용.
+  **⚠ 2026-09-05부터 `MAP_RANGE_M`의 의미 자체가 바뀜**: 기존 25/20/12m 체크포인트는 "정중앙 대칭
+  half-width"였고, 그 이후 새로 학습하는 체크포인트는 "전방 reach"(로봇이 화면 아래쪽 앵커에 위치,
+  후방=전방×`REAR_RATIO`)로 기하가 다름 — 두 세대 체크포인트를 절대 같은 것으로 착각하지 말 것.
+  자세한 배경은 `docs/0905.md` 참고.
 - **`.gitignore`에 예전에 구멍이 있었음** — `osm_maps_arrow_12m/20m/25m`(각 11~13GB), 루트 `wandb/`,
   `checkpoints/` 등이 안 걸러지고 있었음. push 전에 `git status`로 대용량 미추적 디렉토리 없는지 항상
   확인할 것. 체크포인트(`*.pth`)와 대용량 데이터는 git이 아니라 Hugging Face에 올림
@@ -44,17 +48,11 @@ Step 5. 배포                    deployment/                          → Frodo
   포화 109회 vs 최대 음수(우회전) 포화 35회 (3.1배). 평균 +0.0875 rad/s로 지속적 좌측 편향.
 - 같은 구간을 OSRM으로 직접 계산해보면 실제 경로는 **우회전 위주**(우회전 합 461° vs 좌회전 합 89°) —
   "지도가 왼쪽 경로라서 그렇다"는 가설은 반박됨. 경로와 반대 방향으로, 그것도 강하게 치우침.
-- 현재 유력 가설: **학습 때와 배포 때 heading 소스가 다름**. `output_rides_11` 학습 데이터는
-  `osm_map_generator_rides11.py::estimate_headings()`(GPS 궤적 기반 `atan2`, 순수 이동방향)로 heading을
-  만들었는데, 배포(`omnivla_edge_deploy.py`)는 로봇 IMU 컴퍼스(`orientation` 필드)를 씀. `render_frame()`의
-  heading-up 회전 공식(`rot_deg = 90 - heading_deg`) 자체는 수학적으로 검증 완료(문제 없음) — 그러니 값
-  자체가 부정확하면(자북 편각/마운트 오프셋 등) 지도가 잘못된 방향으로 회전해서 들어갈 수 있음.
-- **아직 확정 아님 — 검증 중.** 이번 세션에 진단 도구를 깔아뒀으니 다음 실주행에서 확인:
-  - 콘솔/로그의 `heading_diff_deg`(IMU vs GPS궤적 heading 차이)가 일정한 오프셋으로 나오면 컴퍼스
-    캘리브레이션 문제로 확정, 들쭉날쭉하면 다른 원인 재조사 필요.
-  - 대시보드 지도에서 빨강(계획 경로) vs 청록(모델 예측 궤적)이 얼마나 어긋나는지 시각 확인.
-  - 확정되면 배포 시 heading을 IMU 대신 `past_track` GPS 궤적 기반으로 바꾸는 게 후보 수정안
-    (`estimate_heading_from_track()`가 이미 진단용으로 구현돼 있음 — 검증되면 실제 제어에도 전환).
+- 유력 가설이었던 **heading 소스 불일치**(학습=GPS궤적 `atan2`, 배포=IMU 컴퍼스)는 2026-08-25 실배포
+  로그 분석에서 `heading_diff_deg` 평균 +97°로 실측 확인됨 (정황 증거, 완전 확정은 아니었음).
+  **2026-09-05 세션에서 배포 heading 소스를 GPS궤적 기반으로 전환 완료** — 상세는 `docs/0905.md` 및
+  아래 "2026-09-05 세션 변경사항" 참고. **다음 실주행에서 `heading_diff_deg`/좌회전 편향이 실제로
+  해소됐는지 재검증 필요 — 아직 실기기 검증 전.**
 
 ## 배포 파이프라인
 
@@ -97,6 +95,32 @@ Step 5. 배포                    deployment/                          → Frodo
 **진단 도구 추가** (좌회전 편향 조사용, 위 "알려진 이슈" 참고): IMU vs GPS궤적 heading 비교 로그,
 `deployment/logs/deploy_<시각>.jsonl`(매 tick GPS/heading/예측/명령/HTTP상태/원본 텔레메트리/OSRM 경로
 전체 기록), 대시보드 지도 위 예측 궤적 오버레이(실제 축척 px/m 일치 + 스케일바).
+
+## ⚠ 2026-09-06 진행 중 이슈 (상세: `docs/0906.md`) — 다음 세션 최우선으로 읽을 것
+
+538개 세그먼트 전체 재생성 도중 **cartocdn 타일 서버가 API 키를 요구**하기 시작해서 데이터에
+"API KEY REQUIRED" 워터마크가 섞여 들어감 (건물을 가로지르는 것처럼 보이는 원인). 대체로 쓰려던
+`tile.openstreetmap.org`도 2026-03 TOTP 스크래핑 방지 정책으로 막힘. CARTO 무료 API 키 발급
+대기 중 — 받으면 `fetch_tile()` URL에 반영 후 재생성 재시작. 상세 절차는 `docs/0906.md` 참고.
+
+## 2026-09-05 세션 변경사항 (상세: `docs/0905.md`)
+
+waypoint horizon 확장(2m→5m) + map scale 재확정 + 배포 heading 소스 수정을 같이 진행. 아직 **실제
+데이터 재생성/재학습/실기기 검증 전** — 코드만 변경된 상태.
+
+- `osm_pipeline/py/osm_map_generator.py`: 스케일 확정(전방20m/후방7m, `REAR_RATIO=0.35`), 줌 18→19,
+  타일 provider→cartocdn voyager_nolabels(캐시 디렉터리 분리), 회전+리스케일+앵커배치를 단일
+  `warpAffine`(bicubic)로 통합, robot 마커를 warp 이후에 그리도록 변경, 지도 밖 채움색 흰색→회색,
+  goal 마커 추가(기존엔 정의만 있고 렌더링 안 되던 버그).
+- `deployment/build_live_map.py`: 새 앵커/스케일에 맞춰 예측궤적 오버레이 좌표 수정.
+- `deployment/omnivla_edge_deploy.py`: heading 소스 IMU컴퍼스→GPS궤적 기반(`estimate_heading_from_track`)
+  전환, 그 함수의 GPS 양자화 잡음 취약점(직전 2점 비교)도 누적 1.5m 구간 방식으로 수정,
+  `WAYPOINT_STRIDE_SEC`을 `CTX_STRIDE_SEC`과 분리된 상수로 신설(둘이 우연히 같은 값이라 혼동 위험 있었음).
+- `osm_pipeline/py/rides11_dataset.py`: `WAYPOINT_STRIDE` 3→7 (실측 평균속도 0.90m/s 기준 ~5m horizon,
+  기존은 ~2.17m).
+
+**다음에 할 일**: (1) 에피소드 1개만 실제 타일로 재생성해서 눈으로 확인 → (2) 전체 재처리(OSRM 서버
+필요, 몇 시간) → (3) 재학습 → (4) 실주행에서 `heading_diff_deg`/좌회전 편향/waypoint 예측거리 재검증.
 
 ## 자주 쓰는 명령
 

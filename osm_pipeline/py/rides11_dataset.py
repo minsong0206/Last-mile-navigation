@@ -36,7 +36,11 @@ import av   # PyAV — VideoFrame 디코딩
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 METRIC_WAYPOINT_SPACING = 0.125      # 0.25 * 0.5 m — OmniVLA-Edge 기준
 N_WAYPOINTS             = 8          # gt_waypoints 개수
-WAYPOINT_STRIDE         = 3          # 프레임 간격 (0.3초)
+# WAYPOINT_STRIDE=7(0.7초/step)면 실측 평균속도(~0.90 m/s, 538개 selected 세그먼트
+# 기준) 하에서 8-waypoint horizon이 약 5m가 됨 (stride=3일 땐 약 2.17m였음).
+# 이 값을 바꾸면 deployment/omnivla_edge_deploy.py의 CTX_STRIDE_SEC도 반드시
+# 같이 바꿔야 함 (그쪽은 이 stride를 초 단위로 하드코딩해서 별도로 들고 있음).
+WAYPOINT_STRIDE         = 7          # 프레임 간격 (0.7초, ≈5m horizon @ 실측 평균속도)
 CTX_STRIDE              = 3          # context 프레임 간격
 N_CTX                   = 5          # 과거 이미지 수 (context_size=5, pretrained weight 호환)
 PAST_MARGIN             = CTX_STRIDE * N_CTX    # = 15

@@ -26,7 +26,7 @@ Arrow(Zarr) 기준으로 rides_11 OSM 맵 재생성.
       --zarr_path /path/to/dataset_cache.zarr \
       --out_root  /path/to/osm_maps_arrow \
       [--episode 42]        # 특정 episode만 처리 (디버그용)
-      [--zoom 18]
+      [--zoom 19]
       [--out_size 224]
       [--workers 4]         # 병렬 episode 처리 수
 """

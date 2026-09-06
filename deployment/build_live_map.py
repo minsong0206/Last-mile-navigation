@@ -19,9 +19,15 @@ build_live_map.py
          과거/미래를 나눠 그리기만 한다. 매 프레임 네트워크 요청 없음.
 
 학습 때와 동일하게 유지해야 하는 것 (osm_map_generator.py 기준):
-  - MAP_RANGE_M, 회전 공식(rot_deg = 90 - heading_deg), heading-up 정렬
+  - MAP_RANGE_M(전방 reach)/REAR_RATIO/앵커, 회전 공식(rot_deg = 90 - heading_deg),
+    heading-up 정렬, 타일 제공자(cartocdn voyager_nolabels), ZOOM=19 — 전부
+    osm_map_generator.py에서 import해서 쓰므로 이 파일에 값을 복제하지 말 것
   - ROUTE_COLOR(빨강)=미래 경로, PAST_COLOR(회색)=과거 경로, ROUTE_WIDTH
   - 최종 리사이즈 96x96 + IMG_MEAN/IMG_STD 정규화 (모델 입력 직전 rides11_dataset과 동일)
+  - heading_rad의 "소스"도 학습과 같아야 함 — 학습 heading은 GPS 궤적 기반(atan2)이므로
+    이 함수에 IMU 컴퍼스를 그대로 넣지 말 것 (2026-08-25 실배포에서 IMU-vs-GPS 궤적
+    heading이 평균 +97° 어긋남을 확인 — omnivla_edge_deploy.py는 이제
+    estimate_heading_from_track()로 만든 GPS궤적 기반 heading을 넘김, IMU는 폴백 전용)
 
 실로봇에서 학습 때와 다를 수밖에 없는 것:
   - future route가 GT 기록이 아니라 출발 전 미리 계산해둔 OSRM 경로
@@ -59,7 +65,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "osm_pipeline" / "py"))
 from osm_map_generator import (
     osrm_port, build_canvas, render_frame, _densify_route,
-    MAP_RANGE_M as TRAIN_MAP_RANGE_M, ZOOM as TRAIN_ZOOM, MAP_SIZE_PX,
+    MAP_RANGE_M as TRAIN_MAP_RANGE_M, ZOOM as TRAIN_ZOOM, MAP_SIZE_PX, REAR_RATIO,
 )
 
 # rides11_dataset.py와 동일한 정규화 (모델이 학습 때 본 것과 동일한 분포로 맞추기 위함)
@@ -108,6 +114,9 @@ class LiveMapBuilder:
         """
         map_range_m: 학습 때 쓴 것과 반드시 동일해야 함 (예: 20m 재학습 체크포인트를
                      쓴다면 여기도 20.0으로 맞출 것 — 다르면 학습-추론 분포 불일치).
+                     2026-09 기준 이 값은 "전방 reach(m)"이지 half-width가 아님
+                     (osm_map_generator.py::render_frame, REAR_RATIO 참고) — ego는
+                     이미지 정중앙이 아니라 앵커(전방:후방=1:REAR_RATIO)에 위치함.
         """
         self.map_range_m = map_range_m
         self.zoom = zoom
@@ -193,8 +202,11 @@ class LiveMapBuilder:
         target_step: waypoint_to_control()이 실제로 조준하는 인덱스 — 더 크게 표시.
         """
         img = map_img.copy()
-        px_per_m = self.out_size / (2.0 * self.map_range_m)
-        cx, cy = self.out_size / 2.0, self.out_size / 2.0
+        rear_m = self.map_range_m * REAR_RATIO
+        total_span_m = self.map_range_m + rear_m
+        px_per_m = self.out_size / total_span_m
+        cx = self.out_size / 2.0
+        cy = (self.map_range_m / total_span_m) * self.out_size
 
         pts = []
         for x, y in pred_xy_m:

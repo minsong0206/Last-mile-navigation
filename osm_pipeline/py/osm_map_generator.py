@@ -28,7 +28,7 @@ Usage:
   python osm_map_generator.py --ep 9 --seg 1  # specific segment
 """
 
-import os, sys, json, math, time, argparse
+import os, sys, json, math, time, argparse, hashlib
 import numpy as np
 import pyarrow as pa
 import cv2
@@ -46,7 +46,10 @@ from episode_selector import split_into_segments
 ARROW_PATH  = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/FrodoBots-2K/processed/output_rides_11/train/data-00000-of-00001.arrow"
 SCORES_PATH = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/episode_scores.json"
 OUT_ROOT    = "/media/ms/WD_BLACK_4TB/Learning-to-Drive-Anywhere-with-MBRA/osm_pipeline/osm_data/output_rides_11/osm_maps_arrow"
-TILE_CACHE  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tile_cache")
+# 타일 제공자별로 캐시 디렉터리를 분리 (map_image_spec.md 5절: 다른 제공자 타일이
+# 같은 캐시에 섞여서 실제로 겪었던 사고 사례 — z/x/y만으로는 출처가 구분 안 됨)
+TILE_PROVIDER = "cartocdn_voyager_nolabels"
+TILE_CACHE  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tile_cache", TILE_PROVIDER)
 
 # ── OSRM server mapping (region → port) ──────────────────────────────────────
 def osrm_port(lat, lon):
@@ -64,15 +67,26 @@ def osrm_port(lat, lon):
     raise ValueError(f"No OSRM server for lat={lat}, lon={lon}")
 
 # ── Config ───────────────────────────────────────────────────────────────────
+# 2026-09 맵 스케일 확정 (배포 튜닝안 "B안"): 정중앙 대칭 크롭 대신, 로봇을
+# 화면 아래쪽에 앵커시켜 후방보다 전방을 넓게 본다. MAP_RANGE_M은 이제
+# "half-width"가 아니라 "전방 reach(m)"이고, 후방 reach = MAP_RANGE_M*REAR_RATIO로
+# 고정 비율 파생된다 (기존 검증된 20m-forward 대칭크롭과 96px 모델입력 기준
+# 유효 해상도를 비슷하게 유지하기 위해 7:20 비율로 확정 — 더 이상 실험적으로
+# 흔들지 않음). 스케일(m/px)은 (전방+후방)/MAP_SIZE_PX로 유일하게 결정되고
+# 좌우 폭도 여기서 자동으로 나온다 (out_size가 정사각형이므로 half-width는
+# 항상 (전방+후방)/2와 같음) — 별도 파라미터 아님.
 MAP_SIZE_PX  = 224
-MAP_RANGE_M  = 25.0    # half-width of ego view in meters
+MAP_RANGE_M  = 20.0    # forward reach in meters (앵커 기준, half-width 아님)
+REAR_RATIO   = 0.35    # rear_m = MAP_RANGE_M * REAR_RATIO (20m→7m, 확정값)
 GOAL_DIST_M  = 20.0    # future horizon distance
-ZOOM         = 18      # OSM tile zoom
+ZOOM         = 19      # OSM tile zoom (map_image_spec.md 규격값)
 TILE_PX      = 256
 ROUTE_COLOR  = (0, 0, 255)    # BGR red
 PAST_COLOR   = (160, 160, 160)
+GOAL_COLOR   = (0, 165, 255)  # BGR orange — route 끝(진짜 goal) 표시, 이전엔 안 그려지던 버그
 ROUTE_WIDTH  = 2  # 교수님 피드백: 경로선을 더 얇게 (기존 4 → 2)
 EGO_COLOR    = (0, 200, 0)
+FILL_COLOR   = (200, 200, 200)  # 지도 밖 채움색 (map_image_spec.md 규격값, 기존 흰색에서 변경)
 USER_AGENT   = "MBRA-Research/1.0 (minmum0206@gmail.com)"
 
 
@@ -96,21 +110,43 @@ def latlon_to_pixel_global(lat, lon, zoom):
 
 # ── Tile fetching & stitching ─────────────────────────────────────────────────
 
+# 2026-09-06: cartocdn returns a static "API KEY REQUIRED" placeholder tile (HTTP 200,
+# not an error status) when the request is missing/over-quota on its API key — this silently
+# looked like a successful fetch and got cached as if it were real map content. The
+# placeholder is a fixed, coordinate-independent image, so its content hash is a reliable,
+# zero-false-positive signature (unlike heuristics like "low color diversity", which also
+# flags plenty of genuinely blank/rural real tiles — checked empirically against 127 cached
+# tiles, ~16% false-positive rate, rejected for that reason).
+_BAD_TILE_MD5 = {
+    "6975bf716d5d075bdf895ed0c0be8e50",  # cartocdn rastertiles "API KEY REQUIRED" placeholder
+}
+
 def fetch_tile(tx, ty, zoom, session):
     os.makedirs(TILE_CACHE, exist_ok=True)
     cache = os.path.join(TILE_CACHE, f"{zoom}_{tx}_{ty}.png")
     if os.path.exists(cache):
         return Image.open(cache).convert("RGB")
-    url = f"https://tile.openstreetmap.org/{zoom}/{tx}/{ty}.png"
+    url = f"https://basemaps.cartocdn.com/rastertiles/voyager_nolabels/{zoom}/{tx}/{ty}.png"
+    # cartocdn now requires a free API key (carto.com/basemaps/apikey) for anonymous requests.
+    # Key read from env var, never hardcoded here, to avoid committing a secret.
+    carto_key = os.environ.get("CARTO_API_KEY")
+    if carto_key:
+        url += f"?key={carto_key}"
     for attempt in range(3):
         try:
             r = session.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
             r.raise_for_status()
+            if hashlib.md5(r.content).hexdigest() in _BAD_TILE_MD5:
+                raise RuntimeError(
+                    f"tile {zoom}/{tx}/{ty} returned known placeholder (API key missing/"
+                    f"quota exceeded?) - not caching, will retry"
+                )
             img = Image.open(BytesIO(r.content)).convert("RGB")
             img.save(cache)
             time.sleep(0.05)
             return img
-        except Exception:
+        except Exception as e:
+            tqdm.write(f"  [fetch_tile] {zoom}/{tx}/{ty} attempt {attempt+1}/3 failed: {e}")
             time.sleep(1.0 * (attempt + 1))
     return None
 
@@ -155,11 +191,27 @@ def render_frame(canvas_bgr, gx0, gy0, zoom,
                  past_lats, past_lons,      # fixed route: points behind current position
                  out_size=MAP_SIZE_PX, map_range_m=MAP_RANGE_M):
     """
-    Draw past (gray) and future (red) portions of the fixed planned route,
-    then crop a square around ego and rotate heading-up.
+    Draw past (gray)/future (red) route + goal marker on the tile canvas,
+    then a SINGLE affine warp (rotate heading-up + rescale to a fixed m/px +
+    place ego at its anchor pixel), then draw the ego marker post-warp so it
+    stays a fixed pixel size regardless of latitude/scale.
+
+    map_range_m = forward reach in meters (NOT half-width — see REAR_RATIO
+    above). rear reach = map_range_m*REAR_RATIO, so ego sits below center;
+    left-right half-width is whatever (forward+rear)/2 works out to, since a
+    single isotropic scale applies to the square out_size frame.
     Returns (out_size, out_size, 3) uint8 RGB.
     """
     img = canvas_bgr.copy()
+
+    rear_m = map_range_m * REAR_RATIO
+    total_span_m = map_range_m + rear_m
+    scale_m_per_px = total_span_m / out_size
+    anchor_px_x = 0.5 * out_size
+    anchor_px_y = (map_range_m / total_span_m) * out_size
+
+    ego_gx, ego_gy = latlon_to_pixel_global(lat_curr, lon_curr, zoom)
+    ego_cx, ego_cy = global_to_canvas(ego_gx, ego_gy, gx0, gy0)
 
     # ── Past trajectory (gray) ──
     if past_lats is not None and len(past_lats) >= 2:
@@ -173,8 +225,6 @@ def render_frame(canvas_bgr, gx0, gy0, zoom,
 
     # ── Future route (red), starting from current ego position ──
     if future_lats is not None and len(future_lats) >= 1:
-        ego_gx, ego_gy = latlon_to_pixel_global(lat_curr, lon_curr, zoom)
-        ego_cx, ego_cy = global_to_canvas(ego_gx, ego_gy, gx0, gy0)
         pts = [(ego_cx, ego_cy)]
         for lat, lon in zip(future_lats, future_lons):
             gx, gy = latlon_to_pixel_global(lat, lon, zoom)
@@ -183,58 +233,39 @@ def render_frame(canvas_bgr, gx0, gy0, zoom,
         for k in range(1, len(pts)):
             cv2.line(img, pts[k-1], pts[k], ROUTE_COLOR, ROUTE_WIDTH, cv2.LINE_AA)
 
-    # ── Ego marker ──
-    ego_gx, ego_gy = latlon_to_pixel_global(lat_curr, lon_curr, zoom)
-    ego_cx, ego_cy = global_to_canvas(ego_gx, ego_gy, gx0, gy0)
-    cv2.circle(img, (ego_cx, ego_cy), 7, EGO_COLOR, -1)
-    cv2.circle(img, (ego_cx, ego_cy), 7, (255, 255, 255), 2)
+        # ── Goal marker (route end) — drawn pre-warp so it rotates/scales with the map ──
+        cv2.circle(img, pts[-1], 5, GOAL_COLOR, -1, cv2.LINE_AA)
 
-    # ── Crop & rotate ────────────────────────────────────────────────────────
-    mpp = meters_per_pixel(lat_curr, zoom)
-    crop_r = int(map_range_m / mpp)  # half-side in pixels at native resolution
-
-    # Use sqrt(2)*crop_r for pre-rotation crop to avoid corner clipping
-    big_r = int(crop_r * math.sqrt(2)) + 4
-    pad = big_r + 10
-    img_pad = cv2.copyMakeBorder(img, pad, pad, pad, pad,
-                                  cv2.BORDER_CONSTANT, value=(255, 255, 255))
-    cx_p = ego_cx + pad
-    cy_p = ego_cy + pad
-
-    x1 = max(0, cx_p - big_r); x2 = min(img_pad.shape[1], cx_p + big_r)
-    y1 = max(0, cy_p - big_r); y2 = min(img_pad.shape[0], cy_p + big_r)
-    crop = img_pad[y1:y2, x1:x2]
-    if crop.size == 0:
-        return np.ones((out_size, out_size, 3), dtype=np.uint8) * 255
-
-    # Make square
-    h, w = crop.shape[:2]
-    sq = max(h, w)
-    sq_img = cv2.copyMakeBorder(crop,
-        (sq-h)//2, (sq-h+1)//2, (sq-w)//2, (sq-w+1)//2,
-        cv2.BORDER_CONSTANT, value=(255, 255, 255))
-
-    # Ego-heading-up 회전:
+    # ── Single affine warp: rotate heading-up + rescale + place ego at anchor ──
     # filtered_heading: East=0, North=+90°, South=-90° (standard math CCW)
     # OSM tiles: North-up (위=북쪽, 오른쪽=동쪽)
-    # 로봇 진행 방향이 이미지 위를 향하려면:
-    #   rot_deg = 90 - heading_deg  (OpenCV CCW 기준)
+    # 로봇 진행 방향이 이미지 위를 향하려면: rot_deg = 90 - heading_deg (OpenCV CCW 기준)
     # 검증: heading=-90°(남쪽) → rot=180° CCW → 남쪽이 위
+    mpp = meters_per_pixel(lat_curr, zoom)      # native tile resolution at this latitude
+    k = mpp / scale_m_per_px                     # native-px → output-px multiplier
     heading_deg = math.degrees(heading_rad)
     rot_deg = 90.0 - heading_deg
-    M = cv2.getRotationMatrix2D((sq / 2, sq / 2), rot_deg, 1.0)
-    rotated = cv2.warpAffine(sq_img, M, (sq, sq),
-                              flags=cv2.INTER_LINEAR,
-                              borderValue=(255, 255, 255))
 
-    # 중심 crop 후 리사이즈
-    c = sq // 2
-    r = min(crop_r, c)
-    final = rotated[c - r:c + r, c - r:c + r]
-    if final.size == 0:
-        final = rotated
-    final = cv2.resize(final, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
-    return cv2.cvtColor(final, cv2.COLOR_BGR2RGB)
+    # getRotationMatrix2D(center=(0,0), ...) → pure scale+rotate about the origin,
+    # so we build it about the ego point and translate the result onto the anchor.
+    R = cv2.getRotationMatrix2D((0, 0), rot_deg, k)
+    a, b = R[0, 0], R[0, 1]
+    c, d = R[1, 0], R[1, 1]
+    tx = anchor_px_x - (a * ego_cx + b * ego_cy)
+    ty = anchor_px_y - (c * ego_cx + d * ego_cy)
+    M = np.array([[a, b, tx], [c, d, ty]], dtype=np.float64)
+
+    warped = cv2.warpAffine(img, M, (out_size, out_size),
+                             flags=cv2.INTER_CUBIC,
+                             borderMode=cv2.BORDER_CONSTANT,
+                             borderValue=FILL_COLOR)
+
+    # ── Ego marker, drawn AFTER warp (fixed pixel size, independent of scale) ──
+    anchor_pt = (int(round(anchor_px_x)), int(round(anchor_px_y)))
+    cv2.circle(warped, anchor_pt, 7, EGO_COLOR, -1)
+    cv2.circle(warped, anchor_pt, 7, (255, 255, 255), 2)
+
+    return cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
 
 
 # ── Per-episode processing ────────────────────────────────────────────────────
@@ -505,7 +536,7 @@ def main(args):
     out_root = args.out_root or OUT_ROOT
     os.makedirs(out_root, exist_ok=True)
 
-    with open(SCORES_PATH) as f:
+    with open(args.scores_path, encoding="utf-8") as f:
         scores = json.load(f)
 
     # Build list of (episode, segment) pairs to process
@@ -526,7 +557,7 @@ def main(args):
     print(f"  OSRM: Perth:5001  Taipei:5002  Tokyo:5003")
 
     print("Loading dataset...")
-    table = pa.ipc.open_stream(open(ARROW_PATH, 'rb')).read_all()
+    table = pa.ipc.open_stream(open(args.arrow_path, 'rb')).read_all()
     ep_idx_arr = np.array(table['episode_index'].to_pylist())
     lats_arr   = np.array(table['observation.latitude'].to_pylist())
     lons_arr   = np.array(table['observation.longitude'].to_pylist())
@@ -570,9 +601,9 @@ def main(args):
                                 zoom=args.zoom,
                                 out_size=args.out_size,
                                 map_range_m=args.map_range)
-            tqdm.write(f"  ep{ep:03d}[{seg_idx}]: {n} maps → {out_dir}")
+            tqdm.write(f"  ep{ep:03d}[{seg_idx}]: {n} maps -> {out_dir}")
 
-    print("\nDone.  © OpenStreetMap contributors")
+    print("\nDone. (c) OpenStreetMap contributors")
 
 
 if __name__ == "__main__":
@@ -587,5 +618,10 @@ if __name__ == "__main__":
     parser.add_argument("--all_episodes", action="store_true")
     parser.add_argument("--out_root",     type=str,   default=None,
                         help="Override output root dir (default: OUT_ROOT constant)")
+    parser.add_argument("--arrow_path",   type=str,   default=ARROW_PATH,
+                        help="Override .arrow dataset path (default: ARROW_PATH constant, "
+                             "which is hardcoded to the original author's machine)")
+    parser.add_argument("--scores_path",  type=str,   default=SCORES_PATH,
+                        help="Override episode_scores.json path (default: SCORES_PATH constant)")
     args = parser.parse_args()
     main(args)
