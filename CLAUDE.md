@@ -96,6 +96,13 @@ Step 5. 배포                    deployment/                          → Frodo
 `deployment/logs/deploy_<시각>.jsonl`(매 tick GPS/heading/예측/명령/HTTP상태/원본 텔레메트리/OSRM 경로
 전체 기록), 대시보드 지도 위 예측 궤적 오버레이(실제 축척 px/m 일치 + 스케일바).
 
+## ⚠ 2026-09-06 RunPod 파인튜닝 셋업 진행 중 (상세: `docs/0906_runpod_setup.md`) — 최우선으로 읽을 것
+
+데이터(프레임+맵+GPS+체크포인트) RunPod network volume(`0yymo3grjw`, EU-RO-1)에 업로드
+완료, GPU pod(`vbfkj917vm5mkr`, RTX 4090) 생성 완료, 레포 clone + 패키지 설치 완료,
+tar 압축 해제 진행 중(백그라운드). **다음 세션은 압축 해제 완료 확인 → config yaml
+작성 → 학습 시작 순서로 이어갈 것.** SSH 접속 명령/재현 절차 전부 위 문서에 있음.
+
 ## ⚠ 2026-09-06 진행 중 이슈 (상세: `docs/0906.md`) — 다음 세션 최우선으로 읽을 것
 
 538개 세그먼트 전체 재생성 도중 **cartocdn 타일 서버가 API 키를 요구**하기 시작해서 데이터에
