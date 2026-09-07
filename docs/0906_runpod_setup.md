@@ -1,5 +1,25 @@
 # RunPod 파인튜닝 셋업 진행 상황 (2026-09-06)
 
+## 2026-09-07 밤 ~ 09-08: 자율 실행 재시도 (사용자 수면 중, Claude가 전체 파이프라인 재실행)
+
+- 1차 재시도(volume `8z9ehr268k`, pod `vy4oxjt6uz0j7j`)에서 데이터 업로드/압축해제까지는
+  성공했으나, **학습 시작 직후 크래시** — 일부 프레임의 JPEG가 없고 mp4 폴백도 없어서
+  (`videos/` 원본 비디오를 안 올렸음) `FileNotFoundError`로 전체 학습이 죽음.
+  자동 정리 로직은 정상 작동해서 pod은 즉시 삭제됨(과금 안전).
+- **원인 수정**: `osm_pipeline/py/rides11_dataset.py::_get_frame()`이 JPEG도 mp4도 없을 때
+  같은 episode의 가장 가까운 JPEG로 대체하도록 수정 (커밋 `ee3419e`). 크래시 대신
+  드문 결손 프레임을 근사치로 넘어가게 함.
+- **2차 시도**: 코드 수정 반영 후 volume(`3ajx1a913l`)/pod(`frodobot-finetune-3`) 새로 만들어서
+  처음부터 재실행 중 — 진행상황은 `C:\Users\minso\AppData\Local\Temp\claude\full_run.log`에
+  누적됨 (이 파일은 로컬 임시폴더라 재부팅하면 사라질 수 있음, 중요 내용은 이 문서에 옮겨적을 것).
+- 이번엔 pod 생성 실패("no instances"/"ssh 영영 안 뜨는 불량 머신") 케이스도 스크립트가
+  자동으로 감지해서 삭제 후 재시도하도록 만들어둠 (최대 6회 시도).
+- **다음 세션이 확인할 것**: `full_run.log`에서 `=== FULL RUN END (status=...) ===` 줄을 찾을 것.
+  `status=done`이면 성공 (`D:\best_omnivla_edge_rides11_odom_20260906.pth`에 체크포인트 저장됨).
+  `status=error`/`stalled_or_exited`/`crashed_immediately`면 로그에서 원인 파악 후 재시도 필요.
+  pod은 끝나면(성공/실패 상관없이) 스크립트가 알아서 삭제하므로, `runpodctl pod list`가
+  비어있다면 실행이 끝났다는 뜻(로그로 성공/실패만 판단하면 됨).
+
 ## ⚠ 2026-09-07: 전부 삭제함 — 이 문서는 "재현 절차"로만 참고할 것
 
 비용 문제로 **pod(`vbfkj917vm5mkr`)와 network volume(`0yymo3grjw`) 둘 다 삭제 완료**
