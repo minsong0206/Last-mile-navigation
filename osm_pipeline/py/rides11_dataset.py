@@ -279,7 +279,11 @@ class Rides11Dataset(Dataset):
             episode_dir = self.video_root / "frames" / f"episode_{ep:04d}"
             candidates = sorted(episode_dir.glob("*.jpg")) if episode_dir.is_dir() else []
             if not candidates:
-                raise
+                # 그 episode 폴더 자체가 아카이브에 없는 경우(드묾) — 그래도 학습을
+                # 죽이지 않고 중립 회색 이미지로 대체. 신호 품질보다 완주가 우선.
+                print(f"[rides11_dataset] WARNING: no frames at all for episode {ep} "
+                      f"(fi={fi}) - using blank placeholder image")
+                return Image.new("RGB", (224, 224), (128, 128, 128))
             nearest = min(candidates, key=lambda p: abs(int(p.stem) - fi))
             return Image.open(str(nearest)).convert("RGB")
 
