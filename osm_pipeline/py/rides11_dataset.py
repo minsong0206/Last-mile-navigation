@@ -264,11 +264,23 @@ class Rides11Dataset(Dataset):
             return Image.open(str(jpeg_path)).convert("RGB")
 
         # fallback: mp4 디코딩 (frames 미추출 시)
-        row = self.global_row_map[(ep, fi)]
-        rel_path = self.vf_paths[row]
-        ts       = float(self.vf_ts[row])
-        abs_path = str(self.video_root / rel_path)
-        return self.video_reader.get_frame(abs_path, ts)
+        try:
+            row = self.global_row_map[(ep, fi)]
+            rel_path = self.vf_paths[row]
+            ts       = float(self.vf_ts[row])
+            abs_path = str(self.video_root / rel_path)
+            return self.video_reader.get_frame(abs_path, ts)
+        except (KeyError, OSError):
+            # mp4도 없는 경우(배포 환경에 원본 비디오를 안 올려둔 경우 등) — 학습
+            # 전체를 크래시시키는 대신, 같은 episode 안에서 가장 가까운 추출된
+            # JPEG로 대체한다. 드물게 결손된 프레임 하나 때문에 전체 학습이
+            # 죽는 것보다, 인접 프레임으로 근사하는 게 안전함.
+            episode_dir = self.video_root / "frames" / f"episode_{ep:04d}"
+            candidates = sorted(episode_dir.glob("*.jpg")) if episode_dir.is_dir() else []
+            if not candidates:
+                raise
+            nearest = min(candidates, key=lambda p: abs(int(p.stem) - fi))
+            return Image.open(str(nearest)).convert("RGB")
 
     def _get_waypoints(self, ep: int, fi: int) -> torch.Tensor:
         """
