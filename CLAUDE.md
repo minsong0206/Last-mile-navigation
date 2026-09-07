@@ -96,12 +96,14 @@ Step 5. 배포                    deployment/                          → Frodo
 `deployment/logs/deploy_<시각>.jsonl`(매 tick GPS/heading/예측/명령/HTTP상태/원본 텔레메트리/OSRM 경로
 전체 기록), 대시보드 지도 위 예측 궤적 오버레이(실제 축척 px/m 일치 + 스케일바).
 
-## ⚠ 2026-09-06 RunPod 파인튜닝 셋업 진행 중 (상세: `docs/0906_runpod_setup.md`) — 최우선으로 읽을 것
+## 2026-09-07: RunPod 인프라 전부 삭제함 (비용 문제) — 재개 시 `docs/0906_runpod_setup.md` 참고
 
-데이터(프레임+맵+GPS+체크포인트) RunPod network volume(`0yymo3grjw`, EU-RO-1)에 업로드
-완료, GPU pod(`vbfkj917vm5mkr`, RTX 4090) 생성 완료, 레포 clone + 패키지 설치 완료,
-tar 압축 해제 진행 중(백그라운드). **다음 세션은 압축 해제 완료 확인 → config yaml
-작성 → 학습 시작 순서로 이어갈 것.** SSH 접속 명령/재현 절차 전부 위 문서에 있음.
+9/6에 RunPod network volume + GPU pod 만들어서 데이터 업로드/압축해제까지 다 끝냈었는데,
+pod을 켜둔 채 34시간 방치해서 과금(~$25)되는 걸 발견 → pod과 volume 둘 다 삭제해서 정리함
+(현재 RunPod엔 아무 리소스도 없음, `runpodctl pod list`/`network-volume list` 확인함).
+**파인튜닝을 다시 시작하려면 volume 생성부터 처음부터 다시 해야 함** — 절차와 이번에 배운
+gotcha(파트 크기, MSYS 경로변환, pod 방치 주의 등)는 `docs/0906_runpod_setup.md`에 전부
+기록해둠.
 
 ## ⚠ 2026-09-06 진행 중 이슈 (상세: `docs/0906.md`) — 다음 세션 최우선으로 읽을 것
 
