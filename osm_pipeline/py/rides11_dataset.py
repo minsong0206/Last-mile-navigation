@@ -270,11 +270,12 @@ class Rides11Dataset(Dataset):
             ts       = float(self.vf_ts[row])
             abs_path = str(self.video_root / rel_path)
             return self.video_reader.get_frame(abs_path, ts)
-        except (KeyError, OSError):
-            # mp4도 없는 경우(배포 환경에 원본 비디오를 안 올려둔 경우 등) — 학습
-            # 전체를 크래시시키는 대신, 같은 episode 안에서 가장 가까운 추출된
-            # JPEG로 대체한다. 드물게 결손된 프레임 하나 때문에 전체 학습이
-            # 죽는 것보다, 인접 프레임으로 근사하는 게 안전함.
+        except Exception:
+            # mp4도 없거나 디코딩 실패(배포 환경에 원본 비디오를 안 올려둔 경우 등,
+            # av.error.FileNotFoundError는 builtin OSError를 상속하지 않아서 광범위하게
+            # 잡아야 함) — 학습 전체를 크래시시키는 대신, 같은 episode 안에서 가장
+            # 가까운 추출된 JPEG로 대체한다. 드물게 결손된 프레임 하나 때문에 전체
+            # 학습이 죽는 것보다, 인접 프레임으로 근사하는 게 안전함.
             episode_dir = self.video_root / "frames" / f"episode_{ep:04d}"
             candidates = sorted(episode_dir.glob("*.jpg")) if episode_dir.is_dir() else []
             if not candidates:
