@@ -42,11 +42,18 @@ def denorm(t):
     return np.clip(im, 0, 1)
 
 
-def wp_to_pixel(wp_xy_m, img_px, map_range_m):
-    px_per_m = img_px / (2 * map_range_m)
-    cx = cy = img_px / 2.0
-    px = cx - wp_xy_m[:, 1] * px_per_m
-    py = cy - wp_xy_m[:, 0] * px_per_m
+def wp_to_pixel(wp_xy_m, img_px, map_range_m, rear_ratio=0.35):
+    # NOTE: matches the asymmetric anchor used by osm_map_generator.render_frame
+    # (forward=map_range_m, rear=map_range_m*rear_ratio, isotropic scale over
+    # total_span_m) -- the old symmetric +/-map_range_m formula misaligned the
+    # overlay relative to the actual map tiles.
+    rear_m = map_range_m * rear_ratio
+    total_span_m = map_range_m + rear_m
+    px_per_m = img_px / total_span_m
+    anchor_x = img_px / 2.0
+    anchor_y = (map_range_m / total_span_m) * img_px
+    px = anchor_x - wp_xy_m[:, 1] * px_per_m
+    py = anchor_y - wp_xy_m[:, 0] * px_per_m
     return px, py
 
 
@@ -90,11 +97,13 @@ def render_frame_png(obs_img, map_img, pred_m, gt_m, map_range_m, title=""):
     map_np = denorm(map_img)
     ax.imshow(map_np)
     img_px = map_np.shape[0]
-    gpx, gpy = wp_to_pixel(gt_m, img_px, map_range_m)
-    ppx, ppy = wp_to_pixel(pred_m, img_px, map_range_m)
+    gt_m_o = np.vstack([[0.0, 0.0], gt_m])
+    pred_m_o = np.vstack([[0.0, 0.0], pred_m])
+    gpx, gpy = wp_to_pixel(gt_m_o, img_px, map_range_m)
+    ppx, ppy = wp_to_pixel(pred_m_o, img_px, map_range_m)
     ax.plot(gpx, gpy, '--', color='lime', lw=2, label='GT')
     ax.plot(ppx, ppy, '-', color='red', lw=2.5, label='Pred')
-    ax.plot(img_px / 2, img_px / 2, 'w*', ms=10)
+    ax.plot(gpx[0], gpy[0], 'w*', ms=10, markeredgecolor='black', zorder=5)
     ax.set_xticks([]); ax.set_yticks([])
     ax.set_title(f"Map Overlay (range={map_range_m:.0f}m)", fontsize=9)
     ax.legend(fontsize=7, loc="upper right")

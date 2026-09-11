@@ -787,9 +787,11 @@ def main(cfg: dict):
     model        = model.to(device)
     text_encoder = text_encoder.to(device).eval()  # text_encoder는 학습하지 않음
 
+    save_dir = Path(cfg.get("save_dir", str(SAVE_DIR)))
+    save_dir.mkdir(parents=True, exist_ok=True)
     # ── eval_only: 체크포인트 로드 후 test set 평가만 실행 ────────────────────
     if cfg.get("eval_only", False):
-        eval_ckpt = cfg.get("eval_ckpt", str(save_dir / "best.pth"))
+        eval_ckpt = cfg.get("eval_ckpt") or str(Path(cfg["save_dir"]) / "best.pth")
         print(f"[eval_only] Loading: {eval_ckpt}")
         ckpt = torch.load(eval_ckpt, map_location=device)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
@@ -820,11 +822,11 @@ def main(cfg: dict):
     nw = cfg.get("num_workers", TRAIN_CONFIG["num_workers"])
 
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
-                              num_workers=nw, drop_last=True, persistent_workers=True)
+                              num_workers=nw, drop_last=True, persistent_workers=(nw > 0))
     val_loader   = DataLoader(val_ds,   batch_size=bs, shuffle=False,
-                              num_workers=nw, drop_last=False, persistent_workers=True)
+                              num_workers=nw, drop_last=False, persistent_workers=(nw > 0))
     test_loader  = DataLoader(test_ds,  batch_size=bs, shuffle=False,
-                              num_workers=nw, drop_last=False, persistent_workers=True)
+                              num_workers=nw, drop_last=False, persistent_workers=(nw > 0))
 
     # ── eval_only: test set 평가 후 종료 ─────────────────────────────────────
     if cfg.get("eval_only", False):
