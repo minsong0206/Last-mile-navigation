@@ -65,6 +65,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "osm_pipeline" / "py"))
 from osm_map_generator import (
     osrm_port, build_canvas, render_frame, _densify_route,
+    latlon_to_pixel_global, global_to_canvas, meters_per_pixel,
     MAP_RANGE_M as TRAIN_MAP_RANGE_M, ZOOM as TRAIN_ZOOM, MAP_SIZE_PX, REAR_RATIO,
 )
 
@@ -94,7 +95,11 @@ def snap_to_nearest_road(lat, lon, port, timeout=3.0, max_snap_m=30.0):
     로봇의 "의도된"(보도 위) 위치와 맞게 시작하도록 한다.
 
     max_snap_m: 스냅 거리가 이보다 크면(=근처에 매핑된 길이 아예 없음) 원본 좌표를
-    그대로 반환 — 엉뚱하게 먼 지점으로 스냅하는 것을 방지."""
+    그대로 반환 — 엉뚱하게 먼 지점으로 스냅하는 것을 방지.
+
+    반환: (lat, lon, snap_distance_m) — 스냅 실패/너무 멀면 snap_distance_m=None
+    (2026-09-25 추가: pre-drive 대시보드에서 스냅 거리를 직접 보여주기 위해 원본
+    2-tuple 반환에서 확장함 — 값 자체나 스냅 로직은 안 바꿨음)."""
     url = f"http://localhost:{port}/nearest/v1/foot/{lon},{lat}"
     try:
         r = requests.get(url, timeout=timeout)
@@ -102,17 +107,20 @@ def snap_to_nearest_road(lat, lon, port, timeout=3.0, max_snap_m=30.0):
         wp = r.json()["waypoints"][0]
         if wp["distance"] <= max_snap_m:
             snapped_lon, snapped_lat = wp["location"]
-            return snapped_lat, snapped_lon
+            return snapped_lat, snapped_lon, float(wp["distance"])
     except Exception as e:
         print(f"[build_live_map] snap_to_nearest_road 실패({e}), 원본 좌표 사용")
-    return lat, lon
+    return lat, lon, None
 
 
 def query_osrm_route(start_lat, start_lon, goal_lat, goal_lon, port,
                       interp_step_m=1.0, timeout=3.0, max_retries=3, retry_delay=1.0):
     """출발→도착 OSRM foot 경로 쿼리. 배포 시작 시 1번만 호출됨 (osmnav의
     navigation_node.py 패턴 참고 — retry 포함). 실패 시 직선 경로로 폴백.
-    반환: (M,2) [[lat,lon], ...], interp_step_m 간격으로 densify됨."""
+    반환: (route(M,2) [[lat,lon], ...] interp_step_m 간격 densify됨, used_fallback: bool)
+    (2026-09-25: used_fallback 추가 — 이전엔 콘솔 print만 있고 호출 측에서 폴백
+    여부를 알 방법이 없었음. pre-drive 대시보드에서 "OSRM 정상/fallback"을
+    보여주려면 필요함)."""
     import time
     url = (f"http://localhost:{port}/route/v1/foot/"
            f"{start_lon},{start_lat};{goal_lon},{goal_lat}?overview=full&geometries=geojson")
@@ -124,14 +132,14 @@ def query_osrm_route(start_lat, start_lon, goal_lat, goal_lon, port,
             d = r.json()
             raw = d["routes"][0]["geometry"]["coordinates"]  # [[lon,lat], ...]
             route = np.array([[pt[1], pt[0]] for pt in raw])
-            return _densify_route(route, interp_step_m)
+            return _densify_route(route, interp_step_m), False
         except Exception as e:
             last_exc = e
             if attempt < max_retries - 1:
                 time.sleep(retry_delay * (attempt + 1))
     print(f"[build_live_map] OSRM 쿼리 {max_retries}회 실패({last_exc}), 직선 경로로 폴백")
     route = np.array([[start_lat, start_lon], [goal_lat, goal_lon]])
-    return _densify_route(route, interp_step_m)
+    return _densify_route(route, interp_step_m), True
 
 
 class LiveMapBuilder:
@@ -155,20 +163,29 @@ class LiveMapBuilder:
         ])
         self._route_latlon = None      # (M,2) [[lat,lon],...] — set_goal()에서 1회 계산
         self._canvas = None            # (canvas_bgr, gx0, gy0) — route 전체를 커버하는 캔버스
+        # 2026-09-25 추가: pre-drive 대시보드에서 "route가 정상/fallback인지",
+        # "스냅이 얼마나 멀리 일어났는지"를 보여주기 위한 최근 set_goal() 결과 캐시.
+        self.last_osrm_fallback = None
+        self.last_start_snap_m = None
+        self.last_goal_snap_m = None
 
     def set_goal(self, start_lat, start_lon, goal_lat, goal_lon):
         """경로를 1번 계산해서 캐싱. 배포 시작 시(또는 경로 이탈 재계산 시)만 호출.
         get_map_image()는 이후 이 캐싱된 경로만 사용하고 네트워크 요청을 하지 않음."""
         port = osrm_port(start_lat, start_lon)
-        snapped_start_lat, snapped_start_lon = snap_to_nearest_road(start_lat, start_lon, port)
-        snapped_goal_lat, snapped_goal_lon = snap_to_nearest_road(goal_lat, goal_lon, port)
-        self._route_latlon = query_osrm_route(snapped_start_lat, snapped_start_lon,
-                                                snapped_goal_lat, snapped_goal_lon, port)
+        snapped_start_lat, snapped_start_lon, start_snap_m = snap_to_nearest_road(start_lat, start_lon, port)
+        snapped_goal_lat, snapped_goal_lon, goal_snap_m = snap_to_nearest_road(goal_lat, goal_lon, port)
+        self._route_latlon, used_fallback = query_osrm_route(
+            snapped_start_lat, snapped_start_lon, snapped_goal_lat, snapped_goal_lon, port)
         self._canvas = build_canvas(self._route_latlon[:, 0], self._route_latlon[:, 1],
                                      self.zoom, self.session)
+        self.last_osrm_fallback = used_fallback
+        self.last_start_snap_m = start_snap_m
+        self.last_goal_snap_m = goal_snap_m
         print(f"[LiveMapBuilder] 경로 캐싱 완료: {len(self._route_latlon)}개 포인트 "
               f"(원시 출발=({start_lat:.5f},{start_lon:.5f}) → 스냅됨=({snapped_start_lat:.5f},{snapped_start_lon:.5f}), "
-              f"목표=({snapped_goal_lat:.5f},{snapped_goal_lon:.5f}))")
+              f"목표=({snapped_goal_lat:.5f},{snapped_goal_lon:.5f}), "
+              f"snap거리(시작/목표)=({start_snap_m},{goal_snap_m})m, osrm_fallback={used_fallback})")
 
     def get_route_latlon(self):
         """캐싱된 경로 전체를 (M,2) [[lat,lon],...] 리스트로 반환 (로그/분석용)."""
@@ -226,6 +243,70 @@ class LiveMapBuilder:
         if math.hypot(dlat, dlon) < 1e-6:
             return None
         return math.atan2(dlat, dlon)
+
+    def get_northup_preview_image(self, lat, lon, heading_rad=None, out_size=None):
+        """2026-09-25 추가 — North-up(heading-up 회전 전) 미리보기.
+
+        get_map_image()는 항상 render_frame()이 만든 최종(heading-up 회전 완료)
+        결과만 반환하므로, "route geometry 자체가 맞는지"(예: 경로가 보도 위에
+        정상적으로 있는지)와 "heading-up 회전이 맞는지"를 지금까지는 분리해서 볼
+        방법이 없었다. 이 메서드는 render_frame()이 warp 전에 그리는 것과 동일한
+        past(회색)/future(빨강)/goal(주황) 선을 캐싱된 캔버스에 다시 그리기만 하고,
+        **회전/리스케일/앵커 배치(진짜 heading-up 변환 수학)는 여기서 절대
+        재구현하지 않는다** — 그건 항상 get_map_image()/render_frame()에서만 계산됨.
+        heading_rad를 주면 참고용 화살표만 얹어서 그린다(디버그 전용 오버레이,
+        모델 입력 지도에는 없음).
+        """
+        if self._route_latlon is None or self._canvas is None:
+            return None
+        out_size = out_size or self.out_size
+        canvas_bgr, gx0, gy0 = self._canvas
+        img = canvas_bgr.copy()
+        idx, _ = self._closest_route_idx(lat, lon)
+        route = self._route_latlon
+        past_route, future_route = route[:idx + 1], route[idx:]
+
+        def to_canvas_pts(seg):
+            pts = []
+            for la, lo in seg:
+                gx, gy = latlon_to_pixel_global(la, lo, self.zoom)
+                pts.append(global_to_canvas(gx, gy, gx0, gy0))
+            return pts
+
+        if len(past_route) >= 2:
+            pts = to_canvas_pts(past_route)
+            for k in range(1, len(pts)):
+                cv2.line(img, pts[k - 1], pts[k], (160, 160, 160), 2, cv2.LINE_AA)
+
+        ego_gx, ego_gy = latlon_to_pixel_global(future_route[0][0], future_route[0][1], self.zoom)
+        ego_cx, ego_cy = global_to_canvas(ego_gx, ego_gy, gx0, gy0)
+        if len(future_route) >= 1:
+            pts = [(ego_cx, ego_cy)] + to_canvas_pts(future_route)
+            for k in range(1, len(pts)):
+                cv2.line(img, pts[k - 1], pts[k], (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.circle(img, pts[-1], 5, (0, 165, 255), -1, cv2.LINE_AA)
+
+        cv2.circle(img, (ego_cx, ego_cy), 6, (0, 200, 0), -1)
+        cv2.circle(img, (ego_cx, ego_cy), 6, (255, 255, 255), 2)
+        if heading_rad is not None:
+            arrow_len_px = 40
+            dx = math.cos(heading_rad) * arrow_len_px
+            dy = -math.sin(heading_rad) * arrow_len_px  # East=0,North=+90 CCW -> screen dy는 반대 부호
+            tip = (int(round(ego_cx + dx)), int(round(ego_cy + dy)))
+            cv2.arrowedLine(img, (ego_cx, ego_cy), tip, (255, 0, 255), 3, cv2.LINE_AA, tipLength=0.35)
+
+        rear_m = self.map_range_m * REAR_RATIO
+        total_span_m = self.map_range_m + rear_m
+        mpp = meters_per_pixel(lat, self.zoom)
+        half_px = max(1, int((total_span_m / mpp) * 0.75))
+        h, w = img.shape[:2]
+        x1, x2 = max(0, ego_cx - half_px), min(w, ego_cx + half_px)
+        y1, y2 = max(0, ego_cy - half_px), min(h, ego_cy + half_px)
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        crop = cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
+        return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
 
     def get_map_image(self, lat, lon, heading_rad, past_track=None):
         """

@@ -8,21 +8,36 @@ deployment/LogoNav_frodobot.py의 FrodoBot SDK 연동 패턴(REST API: /v2/front
 파인튜닝 체크포인트)으로 교체하고, 맵 입력은 build_live_map.py의 LiveMapBuilder로
 실시간 생성한다 (학습 때처럼 GT 미래 GPS가 없으므로 OSRM 실시간 라우팅으로 대체).
 
-⚠ 중요 — 처음 보는 구간/체크포인트/코드 변경 후에는 반드시:
-  1. --dry_run으로 먼저 돌려서 대시보드(GPS/heading/route bearing/예측 궤적/
-     제어값)를 몇 분 지켜보고 전부 말이 되는지 확인 (실제 로봇에는 항상 (0,0)만
-     전송됨 — 아래 "GO 게이트" 참고)
-  2. 문제없으면 --dry_run 없이 재시작 = 명시적 GO
-  3. 저속(MAX_V를 작게)으로 개활지에서 첫 테스트
-  4. e-stop 또는 SDK 긴급정지를 항상 준비해둔 상태로 진행
+⚠ 중요 — pre-drive 워크플로 (2026-09-25 재설계, 재시작 없이 같은 프로세스에서 진행):
+  0. (권장) 출발 전 로봇을 정지시킨 채 20~30초 GPS만 진단(별도 도구/수동 확인) —
+     fix_quality/누적 이동거리가 노이즈 바닥 수준인지 먼저 확인.
+  1. 프로세스 시작 → 항상 DRY_RUN 상태로 시작 (실제 명령 전송 안 함).
+  2. GPS fix 확보 → route(OSRM) 자동 생성 → **사용자가 로봇을 실제 route 방향으로
+     물리적으로 정렬**하고, 대시보드에서 "정렬 확인" 버튼으로 그 방향을
+     initial heading(route_aligned)으로 명시적으로 확정.
+  3. 대시보드에서 North-up 경로 미리보기 / 최종 heading-up 모델 입력 지도 / camera
+     context / 예측 궤적 / 계산된 control을 확인.
+  4. "ARM" → "GO LIVE"(둘 다 확인 다이얼로그) — 이 순간부터만 실제 non-zero 명령 전송.
+     frame_buffer/GPS 궤적/heading 상태는 전부 그대로 유지된 채 전환됨(재시작 없음).
+  5. 저속(MAX_V 작게)으로 개활지에서 첫 테스트, e-stop/SDK 긴급정지 항상 준비.
 
---dry_run(2026-09-25 추가) — 센서→지도→추론→궤적→제어 계산은 전부 그대로
-실행하되 실제 actuator 명령은 항상 (0,0)만 보낸다(계산된 값은 로그/대시보드에
-별도 표시). "명령을 아예 안 보낸다"가 아니라 "명시적으로 0을 보낸다" 방식을
-택한 이유: 로봇/SDK 쪽에 "일정 시간 새 명령이 없으면 자동 정지"하는 watchdog이
-있는지 earth-rovers-sdk 전체를 확인해봤지만 문서/코드 어디에도 없었음 — 이
-가정이 틀렸을 때의 위험(로봇이 마지막 non-zero 명령을 계속 유지)이 "명시적으로
-0을 계속 보내는" 쪽보다 훨씬 크므로, 확인 안 된 가정에 의존하지 않는 쪽을 택함.
+Route-aligned initial heading — GPS course heading(estimate_heading_from_track)은
+실제 이동이 있어야만 생기는데 로봇은 non-zero 명령이 있어야 이동하는 bootstrap
+deadlock이 있음. 사용자가 물리적으로 정렬한 route 방향을 "실측 GPS heading이
+확보되기 전까지"의 임시 heading으로 쓰고(map_heading_source="route_aligned"),
+_heading_ema_vec는 절대 이 값으로 시드하지 않음 — 실측이 들어오면 오염 없이
+하드셋됨(전환 이벤트는 로그/대시보드에 명시적으로 표시, 별도 스무딩 없음).
+
+--dry_run 플래그(2026-09-25 추가, 2026-09-25 의미 변경) — 지금은 "이 프로세스 전체에서
+GO LIVE를 영구 잠금"을 의미함(순수 검증 세션용, 대시보드에서 눌러도 거부됨). 플래그가
+없어도 프로세스는 항상 DRY_RUN으로 시작하고, 대시보드의 명시적 확인 절차를 거쳐야만
+LIVE로 전환됨. 센서→지도→추론→궤적→제어 계산은 DRY_RUN/ARMED에서도 전부 그대로
+실행하되 실제 actuator 명령은 항상 (0,0)만 보낸다(계산된 값은 로그/대시보드에 별도
+표시). "명령을 아예 안 보낸다"가 아니라 "명시적으로 0을 보낸다" 방식을 택한 이유:
+로봇/SDK 쪽에 "일정 시간 새 명령이 없으면 자동 정지"하는 watchdog이 있는지
+earth-rovers-sdk 전체를 확인해봤지만 문서/코드 어디에도 없었음 — 이 가정이 틀렸을
+때의 위험(로봇이 마지막 non-zero 명령을 계속 유지)이 "명시적으로 0을 계속 보내는"
+쪽보다 훨씬 크므로, 확인 안 된 가정에 의존하지 않는 쪽을 택함.
 
 deterministic replay logging(2026-09-25 추가) — predict_waypoints()에 실제로
 들어간 카메라 6프레임(dedup 저장)과 최종 지도 이미지를 tick_id로 묶어
@@ -44,15 +59,17 @@ replay_logger.py 모듈 docstring 참고 (2026-09-18 세션에서 대시보드 �
       2026-09 이후 5m-horizon(WAYPOINT_STRIDE=7)으로 재학습한 체크포인트는 0.7 사용.
 
 실행 예 (20m-20260910 체크포인트 기준, frodobot conda env):
-  # 1) 먼저 dry-run으로 대시보드 확인 (실제 명령 전송 안 됨)
-  python3 deployment/omnivla_edge_deploy.py \
-      --ckpt checkpoints/omnivla_edge_rides11_odom_20m_20260910/best.pth \
-      --map_range 20 --goal_lat 37.5010 --goal_lon 127.0010 --dry_run
-
-  # 2) 문제없으면 --dry_run 빼고 재시작 = 명시적 GO
+  # 1회만 실행 — 재시작 불필요. 항상 DRY_RUN으로 시작하고, 대시보드에서
+  # 정렬 확인 → ARM → GO LIVE를 눌러야만 실제 명령이 나감.
   python3 deployment/omnivla_edge_deploy.py \
       --ckpt checkpoints/omnivla_edge_rides11_odom_20m_20260910/best.pth \
       --map_range 20 --goal_lat 37.5010 --goal_lon 127.0010
+
+  # 순수 검증(LIVE 절대 금지) 세션이 필요하면 --dry_run 추가 — 이 프로세스는
+  # 대시보드에서 GO LIVE를 눌러도 항상 거부됨.
+  python3 deployment/omnivla_edge_deploy.py \
+      --ckpt checkpoints/omnivla_edge_rides11_odom_20m_20260910/best.pth \
+      --map_range 20 --goal_lat 37.5010 --goal_lon 127.0010 --dry_run
 """
 
 import sys
@@ -60,6 +77,7 @@ import time
 import base64
 import io
 import json
+import queue
 import argparse
 import math
 from pathlib import Path
@@ -143,6 +161,32 @@ USE_GYRO_FUSION = False
 GYRO_YAW_AXIS_SIGN = 1.0   # 부호가 반대로 나오면 -1.0으로 뒤집을 것
 GYRO_UNIT_IS_DEG = True    # frodobot_raw["gyros"] 값이 deg/s라고 가정 (rad/s면 False로)
 
+# ── Route-aligned initial heading bootstrap (2026-09-25 추가) ────────────────
+# 배경: GPS course heading(estimate_heading_from_track)은 실제 이동(누적 1.5m)이
+# 있어야만 생기는데, 로봇은 non-zero 명령을 받아야 이동한다 — 가만히 서서
+# GPS fix만 오래 기다려도 이 값은 생기지 않는 bootstrap deadlock이 있음(세션에서
+# 코드로 재확인). 이번 실험에서는 사용자가 출발 전 로봇을 실제 route 방향으로
+# 물리적으로 정렬해두고, 그 방향(OSRM route의 "현재 위치 바로 앞" tangent)을
+# 대시보드에서 명시적으로 확인한 뒤 initial heading으로 쓴다.
+#
+# 중요: 이 값은 _heading_ema_vec에 절대 섞지 않는다(seed하지 않음) — EMA는
+# "실측 GPS course heading으로만" 초기화되도록 순수하게 유지해서, 사람이 정렬을
+# 잘못했더라도 그 오차가 이후 실측 평균에 오염되어 남지 않게 한다. 대신 EMA가
+# 아직 없을 때(gps_heading 없음 + _heading_ema_vec None)의 "최후 대안"을
+# imu_fallback에서 route_aligned로 한 단계 올린다 — imu_fallback은 여전히
+# route_aligned조차 없을 때만 쓰이는 최후 폴백으로 코드에 남겨둠(제거하지 않음).
+#
+# lookahead 값 선택 근거: route는 1m 간격으로 densify됨(_densify_route). 1m(=세그먼트
+# 1개)는 OSRM 폴리라인 자체의 정점 단위 잡음에 취약하고, 기존 디버그용 5m lookahead는
+# 출발부가 바로 꺾이는 경로에서는 "지금 서야 할 방향"이 아니라 "5m 뒤 방향"을 대표해버림.
+# 2m(세그먼트 2개 평균)로 국소 잡음은 어느 정도 평균화하면서, 5m보다 훨씬 로컬한
+# tangent를 대표하도록 절충함.
+INITIAL_HEADING_LOOKAHEAD_M = 2.0
+
+# ARMED 상태에서 이 시간(초) 안에 GO LIVE를 안 누르면 자동으로 DRY_RUN으로 되돌림
+# (실수로 ARM해두고 잊어버린 채 다른 걸 하다가 뒤늦게 GO LIVE를 누르는 상황 방지).
+ARM_TIMEOUT_S = 30.0
+
 
 def estimate_yaw_delta_from_gyro(raw_data, dt_s):
     """자이로 수직축(z, gravity와 같은 축 — accels z≈1g로 확인됨) 평균 각속도로
@@ -219,6 +263,32 @@ def estimate_heading_from_track(past_track, min_disp_m=1.5):
     return math.atan2(dlat, dlon)
 
 
+def gps_heading_readiness(past_track, min_disp_m=1.5):
+    """진단 전용 — estimate_heading_from_track()과 동일한 누적 방식으로
+    accumulated path length / net displacement '숫자'만 반환(판정 없음).
+    estimate_heading_from_track() 자체의 판정 로직은 건드리지 않고, 대시보드에서
+    "왜 아직 GPS heading이 없는지"를 사람이 수치로 볼 수 있게 하려고 별도로 둠.
+    반환: (accumulated_path_m, net_displacement_m)."""
+    if len(past_track) < 2:
+        return 0.0, 0.0
+    lat_end, lon_end = past_track[-1]
+    lat_start, lon_start = past_track[-2]
+    cum_m = 0.0
+    for i in range(len(past_track) - 2, -1, -1):
+        lat_a, lon_a = past_track[i]
+        lat_b, lon_b = past_track[i + 1]
+        dlat = (lat_b - lat_a) * LAT_M
+        dlon = (lon_b - lon_a) * LAT_M * math.cos(math.radians(lat_a))
+        cum_m += math.hypot(dlat, dlon)
+        lat_start, lon_start = lat_a, lon_a
+        if cum_m >= min_disp_m:
+            break
+    dlat = (lat_end - lat_start) * LAT_M
+    dlon = (lon_end - lon_start) * LAT_M * math.cos(math.radians(lat_start))
+    net_disp_m = math.hypot(dlat, dlon)
+    return cum_m, net_disp_m
+
+
 def clip_control(linear_vel, angular_vel, maxv=MAX_V, maxw=MAX_W):
     """LogoNav_frodobot.py::policy_calc()의 클리핑 로직 재사용 —
     linear/angular 비율(rd)을 유지한 채 한계 안으로 스케일링."""
@@ -235,10 +305,20 @@ def clip_control(linear_vel, angular_vel, maxv=MAX_V, maxw=MAX_W):
 class OmniVLAEdgeDeployment:
     def __init__(self, ckpt_path, map_range_m, goal_lat, goal_lon, device=None,
                  debug_port=8080, dry_run=False):
-        self.dry_run = dry_run
+        # 2026-09-25: --dry_run의 의미가 "이 프로세스는 GO LIVE 자체를 영구히
+        # 거부하는 하드 락"으로 바뀜(순수 검증 세션용). 기본(플래그 없음)은
+        # DRY_RUN 상태로 시작하되, 대시보드에서 정렬확인→ARM→GO LIVE를 거치면
+        # "같은 프로세스 안에서" LIVE로 전환 가능 — frame_buffer/past_track/
+        # heading EMA/route가 전부 그대로 유지됨(재시작 시 전부 날아가던
+        # 이전 구조의 핵심 문제를 해결하기 위함).
+        self.dry_run_lock = dry_run
+        self.control_stage = "DRY_RUN"  # "DRY_RUN" / "ARMED" / "LIVE"
+        self._armed_ts = None
+        self._pending_commands = queue.Queue()
+
         self.state = DeploymentState()
         if debug_port:
-            start_debug_server(self.state, port=debug_port)
+            start_debug_server(self.state, self._pending_commands, port=debug_port)
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = OmniVLA_edge_odom(**MODEL_PARAMS)
@@ -284,6 +364,14 @@ class OmniVLAEdgeDeployment:
         self._last_route_bearing_rad = None
         self._last_map_replay_path = None
 
+        # 2026-09-25 추가: route-aligned initial heading bootstrap 상태.
+        # _heading_ema_vec는 절대 이 값으로 시드하지 않음(위 상수 설명 참고) —
+        # 실측 GPS course heading이 없을 때의 "최후 대안"으로만 쓰임.
+        self._route_aligned_heading_rad = None
+        self._route_aligned_confirmed_ts = None
+        self._last_lat, self._last_lon = None, None   # poll_frodobot()이 매 틱 갱신
+        self._last_map_heading_source = None            # step()이 매 틱 갱신, run()의 heading-readiness 게이트가 읽음
+
         # ── 데이터분석용 로그 (JSONL, 실행마다 날짜시간별 파일) ──
         log_dir = REPO_ROOT / "deployment" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -302,17 +390,22 @@ class OmniVLAEdgeDeployment:
         self._log_jsonl({
             "type": "run_start", "ts": time.time(), "run_id": run_id,
             "ckpt_path": str(ckpt_path), "map_range_m": map_range_m,
-            "goal_lat": goal_lat, "goal_lon": goal_lon, "dry_run": self.dry_run,
-            # 2026-09-26: 각 step 레코드의 context_frame_paths/map_replay_path를
+            "goal_lat": goal_lat, "goal_lon": goal_lon, "dry_run_lock": self.dry_run_lock,
+            "initial_heading_lookahead_m": INITIAL_HEADING_LOOKAHEAD_M,
+            # 2026-09-25: 각 step 레코드의 context_frame_paths/map_replay_path를
             # 어떻게 실제 파일로 바꾸는지 — 별도 코드를 몰라도 이 JSONL 파일 하나만
             # 보고 알 수 있도록 규칙 자체를 데이터로 남겨둔다.
             "replay_path_convention": "step 레코드의 context_frame_paths/map_replay_path는 "
                                        "이 .jsonl 파일이 들어있는 디렉토리 기준 상대경로",
         })
-        if self.dry_run:
-            print("[deploy] ⚠ --dry_run 모드 — 실제 로봇에는 항상 (0,0)만 전송합니다 "
-                  "(계산된 linear/angular는 로그/대시보드에만 표시)")
-        self.state.update(dry_run=self.dry_run)
+        if self.dry_run_lock:
+            print("[deploy] ⚠ --dry_run 잠금 모드 — 이 프로세스에서는 GO LIVE를 눌러도 "
+                  "거부되고 실제 로봇에는 항상 (0,0)만 전송됩니다 (순수 검증 세션용)")
+        else:
+            print("[deploy] DRY_RUN 상태로 시작합니다. 대시보드에서 "
+                  "'정렬 확인' → 'ARM' → 'GO LIVE' 순서로 명시적으로 진행해야 "
+                  "실제 로봇에 non-zero 명령이 전송됩니다.")
+        self.state.update(dry_run=True, control_stage=self.control_stage)
 
     def _log_jsonl(self, record: dict):
         self._log_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -328,6 +421,7 @@ class OmniVLAEdgeDeployment:
         # 로그로 먼저 진단하기로 함 — 여기서 성급하게 상수를 바꾸지 않음.
         heading_rad = -float(orientation_deg_raw) / 180.0 * math.pi
         heading_deg = math.degrees(heading_rad)
+        self._last_lat, self._last_lon = lat, lon  # 대시보드 명령(정렬 확인 등)이 최신 GPS를 읽을 수 있게
         self.state.update(camera_img=img, lat=lat, lon=lon,
                            heading_deg=heading_deg, orientation_deg_raw=orientation_deg_raw,
                            fix_quality=gps.get("fix_quality"), gps_data_ts=gps.get("timestamp"))
@@ -354,14 +448,23 @@ class OmniVLAEdgeDeployment:
             self.frame_buffer_ids.append(frame_id)
         return is_new
 
-    def build_inputs(self, lat, lon, heading_rad, tick_id=None):
-        # 경로는 배포 시작 시 1번만 계산 (osmnav 구조 참고 — 매 프레임 OSRM 재쿼리 안 함)
+    def _ensure_route_initialized(self, lat, lon):
+        """2026-09-25: build_inputs()에서 분리 — 예전엔 frame_buffer가 다 찬 뒤에야
+        (즉 predict_waypoints()가 처음 호출될 때) route가 생겼는데, 그러면 route
+        생성이 model 파이프라인 준비 상태에 우연히 종속되어서 "GPS position →
+        OSRM route 생성"을 그 자체로 독립된 초기 단계로 다룰 수 없었다(route-aligned
+        heading 확인은 route가 있어야 가능한데, frame_buffer가 찰 때까지(~1.5초)
+        기다릴 이유가 없음). 지금은 GPS fix가 유효해지는 즉시(step()에서 frame_buffer
+        조작보다 먼저) 호출됨."""
         if not self._route_initialized:
             self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
             self._route_initialized = True
             self._log_jsonl({"type": "event", "ts": time.time(), "event": "route_init",
                               "lat": lat, "lon": lon,
-                              "route_latlon": self.map_builder.get_route_latlon()})
+                              "route_latlon": self.map_builder.get_route_latlon(),
+                              "osrm_fallback": self.map_builder.last_osrm_fallback,
+                              "start_snap_m": self.map_builder.last_start_snap_m,
+                              "goal_snap_m": self.map_builder.last_goal_snap_m})
         elif (self.map_builder.is_off_route(lat, lon, threshold_m=3.0)
                 and time.time() - self._last_reroute_ts >= REROUTE_COOLDOWN_S):
             self.state.log("경로 이탈 감지 → 재라우팅")
@@ -369,8 +472,102 @@ class OmniVLAEdgeDeployment:
             self._last_reroute_ts = time.time()
             self._log_jsonl({"type": "event", "ts": time.time(), "event": "reroute",
                               "lat": lat, "lon": lon,
-                              "route_latlon": self.map_builder.get_route_latlon()})
+                              "route_latlon": self.map_builder.get_route_latlon(),
+                              "osrm_fallback": self.map_builder.last_osrm_fallback,
+                              "start_snap_m": self.map_builder.last_start_snap_m,
+                              "goal_snap_m": self.map_builder.last_goal_snap_m})
+        self.state.update(osrm_fallback=self.map_builder.last_osrm_fallback,
+                           start_snap_m=self.map_builder.last_start_snap_m,
+                           goal_snap_m=self.map_builder.last_goal_snap_m)
 
+    def _confirm_route_alignment(self):
+        """대시보드 '정렬 확인' 버튼 → 여기로 옴 (_apply_pending_commands()가 호출).
+        route의 "현재 위치 바로 앞" tangent(INITIAL_HEADING_LOOKAHEAD_M)를 계산해서
+        _route_aligned_heading_rad로 고정 — _heading_ema_vec는 절대 건드리지 않음."""
+        if not self._route_initialized:
+            self.state.log_error("정렬 확인 거부됨 — route가 아직 초기화되지 않음 "
+                                  "(유효한 GPS fix를 먼저 확보해야 함)")
+            return
+        if self._last_lat is None or self._last_lat == 1000 or self._last_lon == 1000:
+            self.state.log_error("정렬 확인 거부됨 — 유효한 GPS 위치가 없음")
+            return
+        bearing = self.map_builder.route_bearing_rad(
+            self._last_lat, self._last_lon, lookahead_m=INITIAL_HEADING_LOOKAHEAD_M)
+        if bearing is None:
+            self.state.log_error("정렬 확인 거부됨 — route_bearing_rad()가 None 반환 "
+                                  "(현재 위치가 route 끝 근처일 수 있음)")
+            return
+        self._route_aligned_heading_rad = bearing
+        self._route_aligned_confirmed_ts = time.time()
+        deg = math.degrees(bearing)
+        self.state.log(f"Route-aligned initial heading 확정: {deg:+.1f}° "
+                        f"(lookahead={INITIAL_HEADING_LOOKAHEAD_M}m)")
+        self._log_jsonl({"type": "event", "ts": time.time(), "event": "route_alignment_confirmed",
+                          "route_aligned_heading_deg": deg,
+                          "lookahead_m": INITIAL_HEADING_LOOKAHEAD_M,
+                          "lat": self._last_lat, "lon": self._last_lon})
+        self.state.update(route_aligned_heading_deg=deg)
+
+    def _handle_command(self, cmd):
+        """대시보드 버튼 → 큐에 쌓인 명령을 제어 루프 스레드에서 순차 처리
+        (모든 상태 변경이 이 스레드 하나에서만 일어나므로 락이 필요 없음)."""
+        if cmd == "confirm_alignment":
+            self._confirm_route_alignment()
+        elif cmd == "arm":
+            if self.control_stage == "DRY_RUN":
+                if self._route_aligned_heading_rad is None:
+                    self.state.log_error("ARM 거부됨 — route-aligned heading이 아직 "
+                                          "확정되지 않음 (먼저 '정렬 확인'을 누를 것)")
+                else:
+                    self.control_stage = "ARMED"
+                    self._armed_ts = time.time()
+                    self.state.log(f"ARMED — {ARM_TIMEOUT_S:.0f}초 안에 GO LIVE 필요 "
+                                    "(아직 실제 명령 전송 안 함)")
+                    self._log_jsonl({"type": "event", "ts": time.time(), "event": "armed"})
+            else:
+                self.state.log_error(f"ARM 무시됨 (현재 상태={self.control_stage})")
+        elif cmd == "go_live":
+            if self.dry_run_lock:
+                self.state.log_error("GO LIVE 거부됨 — --dry_run 잠금 모드로 실행 중 "
+                                      "(이 프로세스에서는 LIVE 전환 불가)")
+            elif self.control_stage == "ARMED":
+                self.control_stage = "LIVE"
+                self.state.log("⚠ LIVE 전환됨 — 실제 로봇에 명령 전송을 시작합니다")
+                self._log_jsonl({
+                    "type": "event", "ts": time.time(), "event": "go_live",
+                    "route_aligned_heading_deg": (math.degrees(self._route_aligned_heading_rad)
+                                                   if self._route_aligned_heading_rad is not None else None),
+                    "map_heading_source_at_go": self._last_map_heading_source,
+                })
+            else:
+                self.state.log_error(f"GO LIVE 거부됨 (ARMED 상태가 아님: {self.control_stage})")
+        elif cmd == "abort":
+            if self.control_stage != "DRY_RUN":
+                self.state.log(f"ABORT — {self.control_stage} → DRY_RUN")
+                self._log_jsonl({"type": "event", "ts": time.time(), "event": "abort",
+                                  "from_stage": self.control_stage})
+            self.control_stage = "DRY_RUN"
+            self._armed_ts = None
+        self.state.update(control_stage=self.control_stage, dry_run=(self.control_stage != "LIVE"))
+
+    def _apply_pending_commands(self):
+        while True:
+            try:
+                cmd = self._pending_commands.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_command(cmd)
+        # ARMED 상태로 너무 오래 방치되면 자동으로 DRY_RUN으로 되돌림 (실수 방지)
+        if self.control_stage == "ARMED" and self._armed_ts is not None \
+                and time.time() - self._armed_ts > ARM_TIMEOUT_S:
+            self.state.log(f"ARM 시간 초과({ARM_TIMEOUT_S:.0f}초) — 자동으로 DRY_RUN으로 복귀. "
+                            "다시 ARM해야 GO LIVE 가능")
+            self._log_jsonl({"type": "event", "ts": time.time(), "event": "arm_timeout"})
+            self.control_stage = "DRY_RUN"
+            self._armed_ts = None
+            self.state.update(control_stage=self.control_stage, dry_run=True)
+
+    def build_inputs(self, lat, lon, heading_rad, tick_id=None):
         # 대시보드/로그용 디버그 필드 (2026-09-25 추가) — 0918 replay에서 heading과
         # route bearing 차이가 ~41°였던 것과 비교할 수 있게 매 틱 계산해둠.
         self._last_route_bearing_rad = self.map_builder.route_bearing_rad(lat, lon)
@@ -439,13 +636,14 @@ class OmniVLAEdgeDeployment:
     def step(self):
         tick_id = self.replay_logger.next_tick_id()
         img, lat, lon, heading_rad, raw_data = self.poll_frodobot()
+        self._apply_pending_commands()  # 대시보드 ARM/GO LIVE/정렬확인/ABORT 처리 (2026-09-25)
         imu_deg = math.degrees(heading_rad)
         # frodobot_raw: FrodoBot Mini가 /data로 내보내는 원본 텔레메트리 그대로 보존
         # (battery, signal_level, speed, gps_signal, vibration, accels/gyros/mags/rpms 등).
         record = {"type": "step", "ts": time.time(), "tick_id": tick_id,
                   "lat": lat, "lon": lon, "imu_heading_deg": imu_deg,
-                  "frodobot_raw": raw_data}
-        self.state.update(tick_id=tick_id)
+                  "frodobot_raw": raw_data, "control_stage": self.control_stage}
+        self.state.update(tick_id=tick_id, control_stage=self.control_stage)
 
         # GPS fix 없음(sentinel 1000) — 지도 자체를 만들 수 없으므로 정지 유지
         if lat == 1000 or lon == 1000:
@@ -455,8 +653,13 @@ class OmniVLAEdgeDeployment:
             return 0.0, 0.0
         record["gps_fix_ok"] = True
 
+        # 2026-09-25: route(OSRM) 생성을 frame_buffer 준비 상태와 분리 — GPS fix가
+        # 유효해지는 즉시 route가 생겨야 대시보드에서 route-aligned 정렬 확인이
+        # frame_buffer(~1.5초)를 기다리지 않고 바로 가능함.
+        self._ensure_route_initialized(lat, lon)
+
         self.maybe_update_frame_buffer(img)
-        # 2026-09-26: context_frame_ids(정수)만으로는 파일 경로 규칙(replay_logger.py의
+        # 2026-09-25: context_frame_ids(정수)만으로는 파일 경로 규칙(replay_logger.py의
         # ctx_{id:06d}.jpg 네이밍)을 코드로 따로 알아야만 역추적이 가능했음(offline
         # smoke test로 실측 확인). context_frame_paths를 같이 저장해서 이 JSONL
         # 레코드 하나만으로(코드 몰라도) 실제 파일을 찾을 수 있게 함. map_replay_path와
@@ -478,11 +681,17 @@ class OmniVLAEdgeDeployment:
         # GPS 이동량이 부족(정지/막 시작)해서 gps_heading을 못 구할 때만 IMU로 폴백.
         gps_heading_rad = estimate_heading_from_track(list(self.past_track))
         record["gps_heading_deg"] = math.degrees(gps_heading_rad) if gps_heading_rad is not None else None
+        gps_accumulated_path_m, gps_net_displacement_m = gps_heading_readiness(list(self.past_track))
+        record["gps_accumulated_path_m"] = gps_accumulated_path_m
+        record["gps_net_displacement_m"] = gps_net_displacement_m
+        self.state.update(gps_accumulated_path_m=gps_accumulated_path_m,
+                           gps_net_displacement_m=gps_net_displacement_m)
 
         if gps_heading_rad is not None:
+            is_first_real_acquisition = self._heading_ema_vec is None  # 2026-09-25: 전환 로그용
             new_vec = complex(math.cos(gps_heading_rad), math.sin(gps_heading_rad))
             if self._heading_ema_vec is None:
-                self._heading_ema_vec = new_vec  # 첫 확보 시엔 그대로 초기화
+                self._heading_ema_vec = new_vec  # 첫 확보 시엔 그대로 초기화(route_aligned로 절대 시드 안 함)
             else:
                 self._heading_ema_vec = (1 - HEADING_EMA_ALPHA) * self._heading_ema_vec + HEADING_EMA_ALPHA * new_vec
             map_heading_rad = math.atan2(self._heading_ema_vec.imag, self._heading_ema_vec.real)
@@ -493,6 +702,20 @@ class OmniVLAEdgeDeployment:
             record["map_heading_source"] = "gps_track"
             print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°  GPS궤적={record['gps_heading_deg']:+7.1f}°  "
                   f"EMA사용={smoothed_deg:+7.1f}°  차이(EMA-IMU)={diff:+7.1f}°")
+            # 2026-09-25: route_aligned(사람이 정렬한 값) → gps_track(실측)으로
+            # 처음 전환되는 그 tick만 명시적으로 로그 — 여기서 별도 스무딩은
+            # 넣지 않음(사용자 요청대로), 대신 전환 자체가 보이게 함.
+            if is_first_real_acquisition and self._route_aligned_heading_rad is not None:
+                prev_deg = math.degrees(self._route_aligned_heading_rad)
+                transition_diff = (smoothed_deg - prev_deg + 180) % 360 - 180
+                self.state.log(f"heading source 전환: route_aligned({prev_deg:+.1f}°) → "
+                                f"gps_track({smoothed_deg:+.1f}°), 차이={transition_diff:+.1f}°")
+                self._log_jsonl({"type": "event", "ts": time.time(), "tick_id": tick_id,
+                                  "event": "heading_source_transition",
+                                  "from": "route_aligned", "to": "gps_track",
+                                  "route_aligned_heading_deg": prev_deg,
+                                  "first_gps_heading_deg": smoothed_deg,
+                                  "diff_deg": transition_diff})
         elif self._heading_ema_vec is not None:
             # GPS 이동량이 잠깐 부족해도(제자리 회전/정지) 순간 IMU로 스냅하지 않고
             # 마지막으로 안정화된 EMA heading을 유지("관성") — 2026-09-18에 틱마다
@@ -515,14 +738,36 @@ class OmniVLAEdgeDeployment:
             record["map_heading_source"] = source_label
             print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(무시)  GPS궤적=(이동량 부족)  "
                   f"EMA유지({source_label})={smoothed_deg:+7.1f}°")
+        elif self._route_aligned_heading_rad is not None:
+            # 2026-09-25 신규: 실측 GPS course heading이 아직 한 번도 확보되지
+            # 않은 초반 구간에서, IMU 폴백 대신 사용자가 확정한 route-aligned
+            # heading을 고정값으로 사용. _heading_ema_vec는 절대 건드리지 않음
+            # (다음에 실측이 들어오면 위 gps_track 분기가 오염 없이 하드셋함).
+            map_heading_rad = self._route_aligned_heading_rad
+            smoothed_deg = math.degrees(map_heading_rad)
+            record["heading_diff_deg"] = None
+            record["smoothed_heading_deg"] = smoothed_deg
+            record["map_heading_source"] = "route_aligned"
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(미사용)  "
+                  f"route-aligned 고정={smoothed_deg:+7.1f}°  GPS궤적=(이동량 부족)")
         else:
-            map_heading_rad = heading_rad  # 콜드스타트 폴백: 아직 GPS-heading을 한 번도 못 구한 초반 몇 틱만 해당
+            map_heading_rad = heading_rad  # 콜드스타트 폴백: route-aligned 확정도 안 됐고 GPS-heading도 없는 경우
             record["heading_diff_deg"] = None
             record["smoothed_heading_deg"] = None
             record["map_heading_source"] = "imu_fallback"
-            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(폴백 사용, EMA 없음)  GPS궤적=(이동량 부족, 추정불가)")
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(폴백 사용, EMA/route-align 없음)  "
+                  f"GPS궤적=(이동량 부족, 추정불가)")
 
+        self._last_map_heading_source = record["map_heading_source"]
+        self.state.update(map_heading_source=self._last_map_heading_source)
         self._prev_step_ts = record["ts"]  # USE_GYRO_FUSION dt 계산용
+
+        # North-up 미리보기 갱신 (2026-09-25) — frame_buffer 준비와 무관하게 매 틱
+        # 갱신해서, dry-run 초반부터 "route geometry 자체"를 heading-up 회전과
+        # 분리해서 볼 수 있게 함.
+        northup_img = self.map_builder.get_northup_preview_image(lat, lon, heading_rad=map_heading_rad)
+        if northup_img is not None:
+            self.state.update(map_img_northup=northup_img)
 
         if len(self.frame_buffer) < N_CTX + 1:
             self.state.log("context 채우는 중 ... 정지 유지")
@@ -589,16 +834,24 @@ class OmniVLAEdgeDeployment:
                                       "event": "step_failed", "error": repr(e)})
                     self.send_control(0.0, 0.0)
                     raise
-                # 2026-09-25 --dry_run: 실제 actuator 명령은 항상 (0,0)만 보낸다.
-                # send_control() 호출 자체는 건너뛰지 않고 그대로 유지 — SDK/로봇
-                # 쪽에 "N초 안에 새 명령 없으면 자동 정지"하는 watchdog이 있다는
-                # 문서/코드를 earth-rovers-sdk 전체에서 찾아봤지만 없었다(확인 안 된
-                # 가정에 기대는 건 위험 — 이전에 "GPS 없으면 안전할 것"이라는 확인 안
-                # 된 가정으로 실제 로봇이 움직인 적이 있어서 같은 실수를 반복하지
-                # 않기 위함). 그래서 "아무것도 안 보낸다"보다 "명시적으로 0을 보낸다"가
-                # 더 안전한 선택 — 로봇 쪽 로직이 무엇이든(마지막 명령 유지형이든
-                # watchdog형이든) 0,0을 계속 받으면 항상 정지 상태가 유지된다.
-                sent_linear, sent_angular = (0.0, 0.0) if self.dry_run else (linear, angular)
+                # send_control() 호출 자체는 항상 그대로 유지(건너뛰지 않음) — SDK/로봇
+                # 쪽에 "N초 안에 새 명령 없으면 자동 정지"하는 watchdog이 있다는 문서/코드를
+                # earth-rovers-sdk 전체에서 찾아봤지만 없었다(확인 안 된 가정에 기대는 건
+                # 위험 — 이전에 "GPS 없으면 안전할 것"이라는 확인 안 된 가정으로 실제
+                # 로봇이 움직인 적이 있어서 같은 실수를 반복하지 않기 위함). "아무것도 안
+                # 보낸다"보다 "명시적으로 0을 보낸다"가 더 안전한 선택.
+                #
+                # 2026-09-25: 두 조건을 모두 만족해야 non-zero 전송:
+                #   1. control_stage == "LIVE" (대시보드에서 정렬확인→ARM→GO LIVE를
+                #      명시적으로 거친 경우만 — 재시작 없이 같은 프로세스에서 전환됨)
+                #   2. heading이 신뢰 가능(map_heading_source != "imu_fallback") — route
+                #      정렬조차 안 된 채로 실수로 GO LIVE를 누르는 극단적 경우에 대한
+                #      마지막 방어선. 이번 실험에서는 GO 전에 반드시 route-align을 먼저
+                #      확정하므로 정상 흐름에서는 이 조건이 걸릴 일이 없어야 함 — 걸린다면
+                #      그 자체가 "정렬을 안 하고 GO LIVE를 눌렀다"는 신호.
+                heading_trustworthy = self._last_map_heading_source != "imu_fallback"
+                is_live = self.control_stage == "LIVE"
+                sent_linear, sent_angular = (linear, angular) if (is_live and heading_trustworthy) else (0.0, 0.0)
                 t_ctrl = time.time()
                 control_status = self.send_control(sent_linear, sent_angular)
                 control_latency_ms = (time.time() - t_ctrl) * 1000.0
@@ -606,16 +859,22 @@ class OmniVLAEdgeDeployment:
                                   "linear": sent_linear, "angular": sent_angular,
                                   "http_status": control_status,
                                   "latency_ms": round(control_latency_ms, 1),
-                                  "dry_run": self.dry_run,
+                                  "control_stage": self.control_stage,
+                                  "heading_trustworthy": heading_trustworthy,
+                                  "map_heading_source": self._last_map_heading_source,
+                                  "dry_run": not is_live,
                                   "computed_linear": linear, "computed_angular": angular})
+                if is_live and not heading_trustworthy:
+                    self.state.log_error("LIVE인데 heading_source=imu_fallback이라 (0,0) 강제 — "
+                                          "route-align을 안 하고 GO LIVE를 눌렀을 가능성")
                 elapsed = time.time() - t0
                 loop_hz = round(1.0 / max(elapsed, 1e-6), 2)
                 self.state.update(linear=sent_linear, angular=sent_angular, loop_hz=loop_hz,
                                    control_latency_ms=round(control_latency_ms, 1),
                                    computed_linear=linear, computed_angular=angular)
-                prefix = "[DRY RUN] " if self.dry_run else ""
+                prefix = "[LIVE] " if is_live else f"[{self.control_stage}] "
                 print(f"  {prefix}linear={sent_linear:+.3f} m/s  angular={sent_angular:+.3f} rad/s"
-                      + ("" if not self.dry_run else f"  (계산값: linear={linear:+.3f} angular={angular:+.3f})")
+                      + ("" if is_live else f"  (계산값: linear={linear:+.3f} angular={angular:+.3f})")
                       + f"  [/control {control_latency_ms:.0f}ms]")
                 time.sleep(max(0.0, DT - elapsed))
         except KeyboardInterrupt:
@@ -639,10 +898,11 @@ if __name__ == "__main__":
     p.add_argument("--debug_port", type=int, default=8080,
                    help="모니터링 웹 대시보드 포트 (0이면 비활성화)")
     p.add_argument("--dry_run", action="store_true",
-                   help="센서→지도→추론→궤적→제어 계산까지는 그대로 수행하되 "
-                        "실제 로봇에는 항상 linear=0, angular=0만 전송. 대시보드/로그에는 "
-                        "계산된 값도 같이 남음. 처음 보는 구간/체크포인트는 이걸로 먼저 "
-                        "확인한 뒤 --dry_run 없이 재시작하는 걸 권장.")
+                   help="이 프로세스 전체에서 GO LIVE를 영구히 잠금(대시보드에서 눌러도 "
+                        "거부됨) — 순수 관찰/검증 세션용. 플래그 없이 실행해도 항상 "
+                        "DRY_RUN 상태로 시작하며, 실제 로봇에 명령이 나가려면 대시보드에서 "
+                        "'정렬 확인' → 'ARM' → 'GO LIVE'를 명시적으로 눌러야 함 (재시작 불필요, "
+                        "같은 프로세스 안에서 frame_buffer/GPS 궤적/heading 상태 그대로 유지).")
     args = p.parse_args()
 
     deployer = OmniVLAEdgeDeployment(

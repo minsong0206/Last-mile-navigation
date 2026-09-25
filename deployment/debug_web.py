@@ -20,6 +20,7 @@ debug_web.py
 
 import io
 import json
+import queue
 import threading
 import time
 from collections import deque
@@ -70,6 +71,17 @@ class DeploymentState:
         self.control_latency_ms = None   # 직전 /control 왕복시간
         self.tick_id = None
         self.dry_run = False
+        # 2026-09-25 추가: route-aligned initial heading bootstrap + ARM/GO LIVE
+        # 2단계 확인 워크플로용 필드 (설계 근거는 omnivla_edge_deploy.py 참고)
+        self.control_stage = "DRY_RUN"   # "DRY_RUN" / "ARMED" / "LIVE"
+        self.map_heading_source = None   # "route_aligned" / "gps_track" / "gps_ema_hold" / "gps_ema_gyro" / "imu_fallback"
+        self.route_aligned_heading_deg = None
+        self.gps_accumulated_path_m = None
+        self.gps_net_displacement_m = None
+        self.osrm_fallback = None
+        self.start_snap_m = None
+        self.goal_snap_m = None
+        self.map_img_northup = None      # PIL.Image, heading-up 회전 전 미리보기
         self._logs = deque(maxlen=log_maxlen)
         self._errors = deque(maxlen=log_maxlen)
 
@@ -79,7 +91,11 @@ class DeploymentState:
                gps_data_ts=None, gps_heading_deg=_UNSET, route_bearing_deg=_UNSET,
                heading_route_diff_deg=_UNSET, map_rotation_deg=None,
                target_waypoint_xy=None, control_latency_ms=None, tick_id=None,
-               dry_run=None, computed_linear=None, computed_angular=None):
+               dry_run=None, computed_linear=None, computed_angular=None,
+               control_stage=None, map_heading_source=_UNSET,
+               route_aligned_heading_deg=_UNSET, gps_accumulated_path_m=None,
+               gps_net_displacement_m=None, osrm_fallback=_UNSET,
+               start_snap_m=_UNSET, goal_snap_m=_UNSET, map_img_northup=None):
         # gps_heading_deg/route_bearing_deg/heading_route_diff_deg는 "이번 틱에
         # 못 구했다"는 의미로 명시적 None이 넘어올 수 있어서, 기본값을 _UNSET으로
         # 두고 "호출에서 아예 안 건드린 경우"와 구분한다 — 그냥 None 기본값을 쓰면
@@ -108,6 +124,15 @@ class DeploymentState:
             if control_latency_ms is not None: self.control_latency_ms = control_latency_ms
             if tick_id is not None: self.tick_id = tick_id
             if dry_run is not None: self.dry_run = dry_run
+            if control_stage is not None: self.control_stage = control_stage
+            if map_heading_source is not _UNSET: self.map_heading_source = map_heading_source
+            if route_aligned_heading_deg is not _UNSET: self.route_aligned_heading_deg = route_aligned_heading_deg
+            if gps_accumulated_path_m is not None: self.gps_accumulated_path_m = gps_accumulated_path_m
+            if gps_net_displacement_m is not None: self.gps_net_displacement_m = gps_net_displacement_m
+            if osrm_fallback is not _UNSET: self.osrm_fallback = osrm_fallback
+            if start_snap_m is not _UNSET: self.start_snap_m = start_snap_m
+            if goal_snap_m is not _UNSET: self.goal_snap_m = goal_snap_m
+            if map_img_northup is not None: self.map_img_northup = map_img_northup
             self.last_update_ts = time.time()
 
     def log(self, msg):
@@ -152,6 +177,15 @@ class DeploymentState:
                 "control_latency_ms": self.control_latency_ms,
                 "tick_id": self.tick_id,
                 "dry_run": self.dry_run,
+                # 2026-09-25 추가 필드
+                "control_stage": self.control_stage,
+                "map_heading_source": self.map_heading_source,
+                "route_aligned_heading_deg": self.route_aligned_heading_deg,
+                "gps_accumulated_path_m": self.gps_accumulated_path_m,
+                "gps_net_displacement_m": self.gps_net_displacement_m,
+                "osrm_fallback": self.osrm_fallback,
+                "start_snap_m": self.start_snap_m,
+                "goal_snap_m": self.goal_snap_m,
             }
 
     def snapshot_camera_jpeg(self):
@@ -162,6 +196,11 @@ class DeploymentState:
     def snapshot_map_jpeg(self):
         with self._lock:
             img = self.map_img
+        return _to_jpeg(img)
+
+    def snapshot_map_northup_jpeg(self):
+        with self._lock:
+            img = self.map_img_northup
         return _to_jpeg(img)
 
     def snapshot_traj_jpeg(self):
@@ -229,22 +268,40 @@ def _to_jpeg(img):
 
 _PAGE_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>OmniVLA-Edge 배포 모니터</title>
-<meta http-equiv="refresh" content="1">
 <style>
 body { font-family: monospace; background:#111; color:#eee; margin:20px; }
-img { width: 320px; height: 320px; object-fit: contain; background:#000; border:1px solid #444; }
+img { width: 300px; height: 300px; object-fit: contain; background:#000; border:1px solid #444; }
 .row { display:flex; gap:20px; flex-wrap:wrap; }
 .card { background:#1c1c1c; padding:12px; border-radius:8px; }
 table { border-collapse: collapse; }
 td { padding: 2px 10px 2px 0; }
-.ok { color:#6f6; } .bad { color:#f66; }
-pre { background:#000; padding:8px; height:300px; overflow-y:auto; font-size:12px; }
+.ok { color:#6f6; } .bad { color:#f66; } .warn { color:#fa0; }
+pre { background:#000; padding:8px; height:260px; overflow-y:auto; font-size:12px; }
+button { font-family: monospace; font-size:14px; padding:8px 16px; margin:4px 6px 4px 0; border-radius:6px;
+         border:1px solid #555; cursor:pointer; }
+button:disabled { opacity:0.35; cursor:not-allowed; }
+#btnConfirm { background:#245; color:#fff; }
+#btnArm { background:#640; color:#fff; }
+#btnGoLive { background:#600; color:#fff; font-weight:bold; }
+#btnAbort { background:#333; color:#fff; }
 </style></head>
 <body>
-<h2>OmniVLA-Edge 실시간 배포 모니터 <span id="dryRunBadge"></span></h2>
+<h2>OmniVLA-Edge 실시간 배포 모니터 <span id="stageBadge"></span></h2>
+<div class="card" style="margin-bottom:16px;">
+  <b>Pre-drive 워크플로</b> — DRY RUN(관찰) → 정렬 확인 → ARM → GO LIVE(사용자 명시 확인 필요)
+  <div style="margin-top:8px;">
+    <button id="btnConfirm" onclick="doAction('/confirm_alignment', '로봇을 route 방향으로 물리적으로 정렬했습니다. 그 방향을 initial heading으로 사용합니다. 맞습니까?')">1. 정렬 확인 (route-aligned heading 확정)</button>
+    <button id="btnArm" onclick="doAction('/arm', 'ARM 하시겠습니까? (아직 실제 명령은 전송되지 않습니다)')">2. ARM</button>
+    <button id="btnGoLive" onclick="doAction('/go_live', '⚠ 정말 GO LIVE 하시겠습니까?\\n이 순간부터 실제 로봇에 non-zero 명령이 전송될 수 있습니다.')">3. GO LIVE</button>
+    <button id="btnAbort" onclick="doAction('/abort', null)">ABORT → DRY RUN으로 복귀</button>
+  </div>
+</div>
 <div class="row">
   <div class="card"><b>카메라</b><br><img src="/frame.jpg?t=__TS__"></div>
-  <div class="card"><b>실시간 생성 지도</b><br><img src="/map.jpg?t=__TS__">
+  <div class="card"><b>North-up 경로 미리보기 (회전 전)</b><br><img src="/map_northup.jpg?t=__TS__">
+    <div style="font-size:11px; margin-top:4px;">route geometry 자체(스냅/OSRM/보도 위치)가 맞는지 확인용 — 회전 로직 안 들어감</div>
+  </div>
+  <div class="card"><b>최종 heading-up 모델 입력 지도</b><br><img src="/map.jpg?t=__TS__">
     <div style="font-size:11px; margin-top:4px; line-height:1.6;">
       <span style="color:#f66;">■</span> 계획 경로(OSRM)&nbsp;
       <span style="color:#999;">■</span> 지나온 길&nbsp;
@@ -257,8 +314,12 @@ pre { background:#000; padding:8px; height:300px; overflow-y:auto; font-size:12p
     <div style="font-size:11px; margin-top:4px;">지도(40m 등)가 넓어서 실제 예측(~2m)이 안 보이는 문제 때문에 추가된 확대 패널</div>
   </div>
   <div class="card">
-    <b>상태 — Localization</b>
+    <b>상태 — Localization / Heading</b>
     <table id="statusLoc"><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <b>상태 — Route</b>
+    <table id="statusRoute"><tbody></tbody></table>
   </div>
   <div class="card">
     <b>상태 — Model / Control</b>
@@ -274,14 +335,41 @@ function fmtNum(v, digits) {
   return (v === null || v === undefined) ? '—' : Number(v).toFixed(digits);
 }
 
+async function doAction(path, confirmMsg) {
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  await fetch(path, {method: 'POST'});
+  poll();
+}
+
+const SOURCE_LABEL = {
+  route_aligned: '사용자 route-align (고정)',
+  gps_track: 'GPS 궤적 (실측, EMA)',
+  gps_ema_hold: 'GPS EMA 유지(관성)',
+  gps_ema_gyro: 'GPS EMA + 자이로 보정',
+  imu_fallback: 'IMU 폴백 (비권장)',
+};
+const SOURCE_CLASS = {
+  route_aligned: 'warn', gps_track: 'ok', gps_ema_hold: 'ok',
+  gps_ema_gyro: 'ok', imu_fallback: 'bad',
+};
+
 async function poll() {
   const r = await fetch('/status.json');
   const s = await r.json();
 
-  const badge = document.querySelector('#dryRunBadge');
-  badge.innerHTML = s.dry_run
-    ? '<span style="background:#a60; color:#fff; padding:2px 8px; border-radius:4px; font-size:14px;">DRY RUN — 실제 명령 전송 안 함</span>'
-    : '<span style="background:#600; color:#fff; padding:2px 8px; border-radius:4px; font-size:14px;">LIVE — 실제 로봇으로 명령 전송 중</span>';
+  const badge = document.querySelector('#stageBadge');
+  const stageInfo = {
+    DRY_RUN: ['#a60', 'DRY RUN — 실제 명령 전송 안 함 (관찰 중)'],
+    ARMED:   ['#960', 'ARMED — GO LIVE 대기 중 (아직 실제 명령 전송 안 함)'],
+    LIVE:    ['#600', '⚠ LIVE — 실제 로봇으로 명령 전송 중'],
+  };
+  const [bg, label] = stageInfo[s.control_stage] || stageInfo.DRY_RUN;
+  badge.innerHTML = `<span style="background:${bg}; color:#fff; padding:2px 8px; border-radius:4px; font-size:14px;">${label}</span>`;
+
+  document.querySelector('#btnConfirm').disabled = (s.control_stage !== 'DRY_RUN');
+  document.querySelector('#btnArm').disabled = (s.control_stage !== 'DRY_RUN' || s.route_aligned_heading_deg === null);
+  document.querySelector('#btnGoLive').disabled = (s.control_stage !== 'ARMED');
+  document.querySelector('#btnAbort').disabled = (s.control_stage === 'DRY_RUN');
 
   const gpsClass = s.gps_ok ? 'ok' : 'bad';
   const ageClass = (s.age_sec !== null && s.age_sec < 2.0) ? 'ok' : 'bad';
@@ -289,22 +377,33 @@ async function poll() {
   const gpsAgeClass = (s.gps_age_sec !== null && s.gps_age_sec < 1.5) ? 'ok' : 'bad';
   const routeDiffClass = (s.heading_route_diff_deg !== null && Math.abs(s.heading_route_diff_deg) < 30) ? 'ok' : 'bad';
   const latClass = (s.control_latency_ms !== null && s.control_latency_ms < 500) ? 'ok' : 'bad';
+  const srcLabel = SOURCE_LABEL[s.map_heading_source] || (s.map_heading_source || '—');
+  const srcClass = SOURCE_CLASS[s.map_heading_source] || '';
+  const readyClass = (s.gps_accumulated_path_m !== null && s.gps_accumulated_path_m >= 1.5) ? 'ok' : 'warn';
+  const osrmClass = (s.osrm_fallback === false) ? 'ok' : (s.osrm_fallback === true ? 'bad' : '');
 
   document.querySelector('#statusLoc tbody').innerHTML = `
     <tr><td>GPS</td><td class="${gpsClass}">${s.lat}, ${s.lon} ${s.gps_ok ? '' : '(FIX 없음!)'}</td></tr>
     <tr><td>fix_quality</td><td class="${fixClass}">${s.fix_quality === null ? '—' : s.fix_quality} <span style="color:#888">(NMEA GGA: 0=無, 1=SPS, 2=DGPS)</span></td></tr>
     <tr><td>GPS 데이터 나이</td><td class="${gpsAgeClass}">${fmtNum(s.gps_age_sec, 2)}s</td></tr>
-    <tr><td>IMU heading</td><td>${fmtNum(s.orientation_deg_raw, 1)}&deg; (raw)</td></tr>
+    <tr><td>IMU heading (raw)</td><td>${fmtNum(s.orientation_deg_raw, 1)}&deg;</td></tr>
     <tr><td>GPS 궤적 heading</td><td>${s.gps_heading_deg === null ? '—' : fmtNum(s.gps_heading_deg, 1) + '&deg;'}</td></tr>
-    <tr><td>최종 사용 heading</td><td>${fmtNum(s.heading_deg, 1)}&deg;</td></tr>
-    <tr><td>route bearing</td><td>${s.route_bearing_deg === null ? '—' : fmtNum(s.route_bearing_deg, 1) + '&deg;'}</td></tr>
+    <tr><td><b>heading source</b></td><td class="${srcClass}"><b>${srcLabel}</b></td></tr>
+    <tr><td>route-aligned 확정값</td><td>${s.route_aligned_heading_deg === null ? '(미확정)' : fmtNum(s.route_aligned_heading_deg, 1) + '&deg;'}</td></tr>
+    <tr><td><b>최종 사용 heading</b></td><td><b>${fmtNum(s.heading_deg, 1)}&deg;</b></td></tr>
+    <tr><td>GPS heading 준비도</td><td class="${readyClass}">누적 ${fmtNum(s.gps_accumulated_path_m, 2)}m / 순변위 ${fmtNum(s.gps_net_displacement_m, 2)}m (기준 1.5m/0.3m)</td></tr>
+  `;
+  document.querySelector('#statusRoute tbody').innerHTML = `
+    <tr><td>OSRM</td><td class="${osrmClass}">${s.osrm_fallback === null ? '(미초기화)' : (s.osrm_fallback ? 'FALLBACK(직선 경로)' : '정상')}</td></tr>
+    <tr><td>snap 거리(출발/목표)</td><td>${fmtNum(s.start_snap_m, 2)}m / ${fmtNum(s.goal_snap_m, 2)}m</td></tr>
+    <tr><td>route bearing (5m, debug)</td><td>${s.route_bearing_deg === null ? '—' : fmtNum(s.route_bearing_deg, 1) + '&deg;'}</td></tr>
     <tr><td>heading - route 차이</td><td class="${routeDiffClass}">${s.heading_route_diff_deg === null ? '—' : fmtNum(s.heading_route_diff_deg, 1) + '&deg;'}</td></tr>
     <tr><td>지도 회전각</td><td>${s.map_rotation_deg === null ? '—' : fmtNum(s.map_rotation_deg, 1) + '&deg;'}</td></tr>
   `;
   document.querySelector('#statusModel tbody').innerHTML = `
     <tr><td>target waypoint (x,y)</td><td>${s.target_waypoint_xy ? `(${fmtNum(s.target_waypoint_xy[0],3)}, ${fmtNum(s.target_waypoint_xy[1],3)}) m` : '—'}</td></tr>
     <tr><td>계산된 명령</td><td>linear=${s.computed_linear} m/s, angular=${s.computed_angular} rad/s</td></tr>
-    <tr><td>실제 전송된 명령</td><td>linear=${s.linear} m/s, angular=${s.angular} rad/s${s.dry_run ? ' <span style="color:#fa0">(DRY RUN — 항상 0)</span>' : ''}</td></tr>
+    <tr><td>실제 전송된 명령</td><td>linear=${s.linear} m/s, angular=${s.angular} rad/s${s.control_stage !== 'LIVE' ? ' <span class="warn">(전송 안 함 — ' + s.control_stage + ')</span>' : ''}</td></tr>
     <tr><td>/control 왕복시간</td><td class="${latClass}">${fmtNum(s.control_latency_ms, 0)} ms</td></tr>
     <tr><td>루프 주기</td><td>${s.loop_hz} Hz</td></tr>
     <tr><td>tick_id</td><td>${s.tick_id === null ? '—' : s.tick_id}</td></tr>
@@ -319,8 +418,17 @@ poll(); setInterval(poll, 1000);
 """
 
 
+# 2026-09-25 추가: 대시보드 버튼 → 제어 루프 스레드로 명령을 전달하는 경로.
+# HTTP 서버는 별도 스레드에서 돌므로, 제어 루프가 쓰는 복잡한 객체(map_builder,
+# route 캐시 등)를 HTTP 핸들러가 직접 건드리지 않게 하려고 단순 문자열 명령만
+# 큐에 넣는다 — 실제 상태 변경은 전부 제어 루프 스레드(step() 앞단)에서
+# _apply_pending_commands()가 큐를 비우며 순차 처리(단일 소비자라 락 불필요).
+ALLOWED_COMMANDS = {"confirm_alignment", "arm", "go_live", "abort"}
+
+
 class _Handler(BaseHTTPRequestHandler):
-    state: DeploymentState = None  # set by start_debug_server
+    state: DeploymentState = None      # set by start_debug_server
+    cmd_queue: "queue.Queue" = None    # set by start_debug_server
 
     def log_message(self, fmt, *args):
         pass  # 콘솔에 access log 안 찍히게
@@ -333,14 +441,26 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(self.state.snapshot_camera_jpeg(), "image/jpeg")
         elif self.path.startswith("/map.jpg"):
             self._send(self.state.snapshot_map_jpeg(), "image/jpeg")
+        elif self.path.startswith("/map_northup.jpg"):
+            self._send(self.state.snapshot_map_northup_jpeg(), "image/jpeg")
         elif self.path.startswith("/traj.jpg"):
             self._send(self.state.snapshot_traj_jpeg(), "image/jpeg")
         else:
             body = _PAGE_HTML.replace("__TS__", str(int(time.time() * 1000))).encode()
             self._send(body, "text/html; charset=utf-8")
 
-    def _send(self, body, content_type):
-        self.send_response(200)
+    def do_POST(self):
+        cmd = self.path.strip("/").split("?")[0]
+        if cmd in ALLOWED_COMMANDS and self.cmd_queue is not None:
+            self.cmd_queue.put(cmd)
+            self.state.log(f"[dashboard] 명령 접수: {cmd} (제어 루프에서 다음 tick에 처리)")
+            self._send(json.dumps({"ok": True, "queued": cmd}).encode(), "application/json")
+        else:
+            self._send(json.dumps({"ok": False, "error": "unknown command"}).encode(),
+                        "application/json", status=400)
+
+    def _send(self, body, content_type, status=200):
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -348,9 +468,12 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def start_debug_server(state: DeploymentState, port: int = 8080) -> ThreadingHTTPServer:
-    """백그라운드 스레드에서 대시보드 서버 시작. 서버 인스턴스 반환(필요 시 .shutdown())."""
-    handler_cls = type("BoundHandler", (_Handler,), {"state": state})
+def start_debug_server(state: DeploymentState, cmd_queue: "queue.Queue" = None,
+                        port: int = 8080) -> ThreadingHTTPServer:
+    """백그라운드 스레드에서 대시보드 서버 시작. 서버 인스턴스 반환(필요 시 .shutdown()).
+    cmd_queue: ARM/GO LIVE/정렬 확인/ABORT 버튼이 넣는 명령 큐 (제어 루프가 소비).
+    None으로 두면(예: 순수 뷰어 용도) 버튼 클릭이 전부 무시됨."""
+    handler_cls = type("BoundHandler", (_Handler,), {"state": state, "cmd_queue": cmd_queue})
     server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
