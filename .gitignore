@@ -40,3 +40,4 @@ tools/global_odom_maps/
 # ── 추가: 로컬 가상환경 / 다운로드한 대용량 아카이브 (git에 올리면 안 됨) ───────
 venv/
 *.tar.gz
+.vscode/
