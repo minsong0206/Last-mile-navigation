@@ -303,6 +303,11 @@ class OmniVLAEdgeDeployment:
             "type": "run_start", "ts": time.time(), "run_id": run_id,
             "ckpt_path": str(ckpt_path), "map_range_m": map_range_m,
             "goal_lat": goal_lat, "goal_lon": goal_lon, "dry_run": self.dry_run,
+            # 2026-09-26: 각 step 레코드의 context_frame_paths/map_replay_path를
+            # 어떻게 실제 파일로 바꾸는지 — 별도 코드를 몰라도 이 JSONL 파일 하나만
+            # 보고 알 수 있도록 규칙 자체를 데이터로 남겨둔다.
+            "replay_path_convention": "step 레코드의 context_frame_paths/map_replay_path는 "
+                                       "이 .jsonl 파일이 들어있는 디렉토리 기준 상대경로",
         })
         if self.dry_run:
             print("[deploy] ⚠ --dry_run 모드 — 실제 로봇에는 항상 (0,0)만 전송합니다 "
@@ -451,7 +456,16 @@ class OmniVLAEdgeDeployment:
         record["gps_fix_ok"] = True
 
         self.maybe_update_frame_buffer(img)
-        record["context_frame_ids"] = list(self.frame_buffer_ids)
+        # 2026-09-26: context_frame_ids(정수)만으로는 파일 경로 규칙(replay_logger.py의
+        # ctx_{id:06d}.jpg 네이밍)을 코드로 따로 알아야만 역추적이 가능했음(offline
+        # smoke test로 실측 확인). context_frame_paths를 같이 저장해서 이 JSONL
+        # 레코드 하나만으로(코드 몰라도) 실제 파일을 찾을 수 있게 함. map_replay_path와
+        # 동일한 규칙(이 .jsonl 파일이 있는 디렉토리 기준 상대경로, 즉 "frames/<run_id>/...")
+        # — repo를 통째로 옮기거나 log 폴더만 따로 복사해도 그대로 유효함.
+        context_frame_ids = list(self.frame_buffer_ids)
+        record["context_frame_ids"] = context_frame_ids
+        record["context_frame_paths"] = [self.replay_logger.context_frame_path(fid)
+                                          for fid in context_frame_ids]
         self.past_track.append((lat, lon))
 
         # heading 소스: 2026-08-25 실배포 로그 분석(docs/0825.md 2-2)에서 IMU 컴퍼스와
