@@ -45,8 +45,8 @@ build_live_map.py
   )
   # map_tensor: (1, 3, 96, 96) torch.Tensor, IMG_MEAN/IMG_STD 정규화 완료 — 모델에 바로 입력 가능
 
-  # 경로 이탈이 심하면(예: 15m 이상) 재계산:
-  if builder.is_off_route(lat, lon, threshold_m=15.0):
+  # 경로 이탈이 심하면(예: 3m 이상) 재계산:
+  if builder.is_off_route(lat, lon, threshold_m=3.0):
       builder.set_goal(lat, lon, goal_lat, goal_lon)
 """
 
@@ -80,6 +80,32 @@ def _pick_scale_bar_m(map_range_m):
     candidates = [1, 2, 5, 10, 20, 50]
     fit = [c for c in candidates if c <= map_range_m * 0.6]
     return fit[-1] if fit else candidates[0]
+
+
+def snap_to_nearest_road(lat, lon, port, timeout=3.0, max_snap_m=30.0):
+    """OSRM /nearest로 (lat,lon)을 가장 가까운 매핑된 보행로 위 지점으로 스냅.
+
+    2026-09-18: 로봇이 실제로 보도 위에 서 있어도, GPS 수신 오차(특히 건물 근처
+    멀티패스)로 원시 좌표가 매핑된 길에서 수 m 떨어져 찍히는 경우가 실측됨
+    (같은 자리에서 3.13m 오차). set_goal()이 이 원시 좌표를 그대로 경로 시작점으로
+    쓰면, 경로가 실제 로봇 위치와 계속 어긋난 채로 시작돼 미래경로선에 인위적인
+    꺾임이 생김(is_off_route 재라우팅 쿨다운으로도 이 어긋남 자체는 못 없앰).
+    그래서 경로 계산 직전에 시작/목표 좌표를 매핑된 길 위로 스냅해서, 경로가
+    로봇의 "의도된"(보도 위) 위치와 맞게 시작하도록 한다.
+
+    max_snap_m: 스냅 거리가 이보다 크면(=근처에 매핑된 길이 아예 없음) 원본 좌표를
+    그대로 반환 — 엉뚱하게 먼 지점으로 스냅하는 것을 방지."""
+    url = f"http://localhost:{port}/nearest/v1/foot/{lon},{lat}"
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        wp = r.json()["waypoints"][0]
+        if wp["distance"] <= max_snap_m:
+            snapped_lon, snapped_lat = wp["location"]
+            return snapped_lat, snapped_lon
+    except Exception as e:
+        print(f"[build_live_map] snap_to_nearest_road 실패({e}), 원본 좌표 사용")
+    return lat, lon
 
 
 def query_osrm_route(start_lat, start_lon, goal_lat, goal_lon, port,
@@ -134,11 +160,15 @@ class LiveMapBuilder:
         """경로를 1번 계산해서 캐싱. 배포 시작 시(또는 경로 이탈 재계산 시)만 호출.
         get_map_image()는 이후 이 캐싱된 경로만 사용하고 네트워크 요청을 하지 않음."""
         port = osrm_port(start_lat, start_lon)
-        self._route_latlon = query_osrm_route(start_lat, start_lon, goal_lat, goal_lon, port)
+        snapped_start_lat, snapped_start_lon = snap_to_nearest_road(start_lat, start_lon, port)
+        snapped_goal_lat, snapped_goal_lon = snap_to_nearest_road(goal_lat, goal_lon, port)
+        self._route_latlon = query_osrm_route(snapped_start_lat, snapped_start_lon,
+                                                snapped_goal_lat, snapped_goal_lon, port)
         self._canvas = build_canvas(self._route_latlon[:, 0], self._route_latlon[:, 1],
                                      self.zoom, self.session)
         print(f"[LiveMapBuilder] 경로 캐싱 완료: {len(self._route_latlon)}개 포인트 "
-              f"(출발=({start_lat:.5f},{start_lon:.5f}) → 목표=({goal_lat:.5f},{goal_lon:.5f}))")
+              f"(원시 출발=({start_lat:.5f},{start_lon:.5f}) → 스냅됨=({snapped_start_lat:.5f},{snapped_start_lon:.5f}), "
+              f"목표=({snapped_goal_lat:.5f},{snapped_goal_lon:.5f}))")
 
     def get_route_latlon(self):
         """캐싱된 경로 전체를 (M,2) [[lat,lon],...] 리스트로 반환 (로그/분석용)."""
@@ -153,9 +183,16 @@ class LiveMapBuilder:
         d = np.hypot(self._route_latlon[:, 0] - lat, self._route_latlon[:, 1] - lon)
         return int(np.argmin(d)), float(d.min())
 
-    def is_off_route(self, lat, lon, threshold_m=15.0):
+    def is_off_route(self, lat, lon, threshold_m=3.0):
         """경로에서 threshold_m 이상 벗어났는지 확인 (osmnav의 재라우팅 트리거와 동일 개념).
-        True면 호출 측(배포 루프)에서 set_goal()을 다시 불러 재계산해야 함."""
+        True면 호출 측(배포 루프)에서 set_goal()을 다시 불러 재계산해야 함.
+
+        2026-09-18: 기본값 15m→3m로 낮춤 — 로봇이 경로에서 몇 m만 벗어나도
+        get_map_image()가 "현재(벗어난) 위치→경로 위 가장 가까운 점"을 잇느라 미래
+        경로선에 인위적인 꺾임이 생기고, 그게 학습 데이터엔 없던 형태라 모델이 실제
+        회전 상황으로 오인하는 문제를 실측함(deploy_20260918_183939.jsonl — 로봇이
+        경로에서 옆으로 ~4m 벗어나 있을 때 지도에 꺾임이 그려지고 모델이 좌회전 예측).
+        15m는 "완전히 딴 길로 샜을 때"엔 맞는 값이지만 이 정도 작은 이탈까진 못 잡음."""
         if self._route_latlon is None:
             return False
         _, dist_deg = self._closest_route_idx(lat, lon)
@@ -179,11 +216,28 @@ class LiveMapBuilder:
         past_lats = past_lons = None
         if past_track:
             pt = np.array(past_track)
-            past_lats, past_lons = pt[:, 0], pt[:, 1]
+            # 2026-09-18(2차): ego와 같은 이유로 과거 궤적(회색)도 raw GPS 그대로 그리면
+            # GPS 오차/드리프트로 실제 보도가 아니라 건물 위에 겹쳐 그려짐. 과거 점들도
+            # 각각 캐싱된 경로 위 가장 가까운 점으로 스냅해서 전체 궤적(과거~현재~미래)이
+            # 하나의 매끄러운 선으로 이어지게 한다. 네트워크 요청 없이 순수 벡터 연산.
+            d = np.hypot(pt[:, [0]] - self._route_latlon[:, 0][None, :],
+                         pt[:, [1]] - self._route_latlon[:, 1][None, :])
+            snapped_past = self._route_latlon[np.argmin(d, axis=1)]
+            past_lats, past_lons = snapped_past[:, 0], snapped_past[:, 1]
+
+        # 2026-09-18: render_frame()에 raw GPS(lat,lon)를 그대로 ego 위치로 넘기면,
+        # 로봇이 경로에서 몇 m만 벗어나 있어도(GPS 오차/드리프트로 흔함) "ego(벗어난 raw
+        # 위치) → 경로 위 가장 가까운 점"을 잇는 첫 구간이 인위적으로 꺾여서 그려짐
+        # (is_off_route 재라우팅 쿨다운을 넣어도, 로봇이 계속 그 근방에 있으면 매번
+        # 똑같이 재현됨 — deploy_20260918_185324.jsonl). 대신 경로 위 가장 가까운 점
+        # (future_route[0]과 동일한 점)을 ego 렌더링 위치로 써서 시작 구간을 항상
+        # 경로와 정확히 일치시킨다. raw (lat,lon)은 is_off_route()/heading 추정 등
+        # 실제 항법 로직에는 그대로 쓰이고, 여기 시각화용으로만 스냅됨.
+        render_lat, render_lon = future_route[0]
 
         img = render_frame(
             canvas_bgr, gx0, gy0, self.zoom,
-            lat, lon, heading_rad,
+            render_lat, render_lon, heading_rad,
             future_route[:, 0], future_route[:, 1],
             past_lats, past_lons,
             out_size=self.out_size, map_range_m=self.map_range_m,

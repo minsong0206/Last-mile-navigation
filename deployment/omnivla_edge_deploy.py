@@ -85,6 +85,53 @@ MAX_V = 0.3   # m/s
 MAX_W = 0.3   # rad/s
 DT    = 1.0 / 3.0  # 제어 루프 주기 (3Hz) — waypoint_to_control()에서는 안 씀(2026-08 버그 수정, 아래 참고)
 
+# 2026-09-18: 추론 시작 전 GPS 궤적부터 확보하는 직진 웜업 단계를 넣었다가 제거함 —
+# 로봇이 그 자리에서 실제로 순이동을 못 하는 지점(장애물/노면 등)에서는 웜업이 영원히
+# 안 끝나 추론 자체가 시작조차 안 되는 문제가 실측됨(deploy_20260918_1823/1832.jsonl,
+# 8초 넘게 GPS 위치가 거의 그대로였음). 대신 아래 EMA 유지 방식으로, 추론은 즉시
+# 시작하되(초반 몇 틱은 IMU 폴백) GPS-heading이 한 번이라도 잡히면 그때부터 안정화.
+
+# 2026-09-18: GPS-heading이 imu_fallback과 번갈아 전환되면서 지도 회전이 틱마다
+# 수십~백여도씩 튀는 문제 실측 확인(cmp_imu_-214 vs cmp_gps_-147.7 렌더링 비교).
+# 그래서 GPS-heading을 "즉시 대체"가 아니라 EMA로 완만하게만 반영하고, GPS 이동량이
+# 잠깐 부족해도(제자리 회전/정지 등) 마지막 EMA 값을 그대로 유지("관성")하도록 바꿈 —
+# 순간적인 IMU 폴백으로 스냅되지 않게. ALPHA가 작을수록 더 안정적이지만 실제 방향
+# 전환에 더 느리게 반응함.
+HEADING_EMA_ALPHA = 0.3
+
+# 2026-09-18: is_off_route() 임계값을 15m→3m로 낮췄더니, OSRM이 자체적으로 요청 좌표를
+# 가장 가까운 매핑된 길(way)로 "스냅"하는 거리가 그보다 큰 지점(예: 매핑된 보행로가 없는
+# 개활지, 실측 3.38m)에서는 재라우팅을 해도 새 경로 시작점이 여전히 3m 넘게 떨어져 있어
+# is_off_route()가 계속 True → 재라우팅을 무한 반복하는 폭주가 실측됨
+# (deploy_20260918_184622.jsonl, 0.3~0.5초마다 reroute 이벤트). 원인(매핑 안 된 지점에서
+# 출발) 자체는 임계값 튜닝으로 못 고치지만, 적어도 매 틱 재쿼리하는 폭주는 쿨다운으로 막는다.
+REROUTE_COOLDOWN_S = 3.0
+
+# ── GPS/IMU 자이로 융합 (실험적, 기본 꺼짐) ──────────────────────────────────
+# GPS-heading을 못 구하는 구간(gps_ema_hold)에서 지금은 마지막 EMA 값을 그냥
+# 고정해서 쓰는데, 그 사이에 로봇이 실제로 방향을 틀면 반영이 안 됨. 대신
+# frodobot_raw["gyros"](수직축 각속도)를 적분해서 "그동안 얼마나 돌았는지"만큼
+# EMA heading을 보정하는 방식 — IMU 컴퍼스의 "절대값"은 신뢰 안 하고(자기장 간섭으로
+# 세션마다 오차가 +11°~+169°까지 들쭉날쭉했음, 고정 오프셋이 아님) "상대 회전량"만
+# 신뢰하는 접근. 축/부호/단위(deg/s 가정)를 실측으로 아직 검증 안 했으므로 기본은
+# OFF — 다음 실배포에서 켜보고 로그의 gps_ema_gyro 구간 궤적이 실제와 맞는지 확인
+# 후 계속 켤지 결정할 것.
+USE_GYRO_FUSION = False
+GYRO_YAW_AXIS_SIGN = 1.0   # 부호가 반대로 나오면 -1.0으로 뒤집을 것
+GYRO_UNIT_IS_DEG = True    # frodobot_raw["gyros"] 값이 deg/s라고 가정 (rad/s면 False로)
+
+
+def estimate_yaw_delta_from_gyro(raw_data, dt_s):
+    """자이로 수직축(z, gravity와 같은 축 — accels z≈1g로 확인됨) 평균 각속도로
+    dt_s 동안의 heading 변화량(rad)을 추정. USE_GYRO_FUSION 실험 전용, 검증 전."""
+    gyros = raw_data.get("gyros")
+    if not gyros or dt_s <= 0:
+        return 0.0
+    mean_z = sum(g[2] for g in gyros) / len(gyros)
+    if GYRO_UNIT_IS_DEG:
+        mean_z = math.radians(mean_z)
+    return GYRO_YAW_AXIS_SIGN * mean_z * dt_s
+
 # heading 변환: 원래 -orientation/180*pi 하나만 썼는데(90도 보정이 빠져있어 지도가
 # 어긋나 보일 수 있다는 가설이 있었음), 실기기 테스트 결과 "얼마나 어긋났는지"를
 # 추측으로 고치기보다 GPS 궤적 기반 heading(estimate_heading_from_track, 학습 데이터
@@ -97,6 +144,7 @@ def decode_frame(b64_str) -> Image.Image:
 
 
 LAT_M = 111320.0  # 위도 1도당 미터 (근거리 근사)
+MIN_NET_DISP_M = 0.3  # "거의 정지"만 걸러내는 순변위 하한 (min_disp_m보다 훨씬 작음)
 
 
 def estimate_heading_from_track(past_track, min_disp_m=1.5):
@@ -109,12 +157,26 @@ def estimate_heading_from_track(past_track, min_disp_m=1.5):
     heading이 순간적으로 남↔서로 튀는 문제가 실측으로 확인됨(docs/0825.md 1-1, 원래는
     시각화 스크립트에서 발견·수정된 문제). 그 수정과 동일하게, 누적 이동거리가
     min_disp_m 이상 되는 지점까지 거슬러 올라가 그 구간 전체의 변위로 추정해서
-    양자화 스텝 하나짜리 잡음을 평균화한다. 이동량이 부족하면(정지/막 시작) None."""
+    양자화 스텝 하나짜리 잡음을 평균화한다. 이동량이 부족하면(정지/막 시작) None.
+
+    2026-09-18: 0.8m로 낮췄다가 원복함 — 순이동이 작고 지그재그인 구간에서 0.8m는 노이즈를
+    못 걸러내 GPS-heading이 엉뚱한 방향(최대 169° 차이)으로 튀는 부작용이 실측 확인됨
+    (deploy_20260918_180335.jsonl). 1.5m가 더 안정적이라 원래 값으로 복귀.
+
+    2026-09-18(2차): 마지막 체크가 "시작-끝 순변위(직선거리) >= min_disp_m"였는데, 로봇이
+    완전 직진이 아니라 약간 지그재그(GPS 위경도 축별 비동기 양자화 + 실제 약간의 굴곡)로
+    움직이면 누적 경로 길이(cum_m)는 min_disp_m을 넘겨도 순변위는 계속 그보다 작게 남아
+    30초 넘게 계속 None만 반환하는 문제가 실측됨 — 그 사이 IMU가 30°+ 드리프트해서 지도가
+    계속 잘못된 방향으로 그려짐. cum_m으로 이미 "양자화 잡음 평균화" 조건(min_disp_m 이상
+    경로를 거슬러 올라감)을 충족했다면, 마지막 체크는 "순변위가 거의 0인 진짜 정지 상태"만
+    걸러내면 되므로 훨씬 작은 MIN_NET_DISP_M로 완화. cum_m이 min_disp_m에 못 미친(이력
+    자체가 부족한) 경우엔 기존처럼 min_disp_m 그대로 요구."""
     if len(past_track) < 2:
         return None
     lat_end, lon_end = past_track[-1]
     lat_start, lon_start = past_track[-2]
     cum_m = 0.0
+    reached_min_path = False
     for i in range(len(past_track) - 2, -1, -1):
         lat_a, lon_a = past_track[i]
         lat_b, lon_b = past_track[i + 1]
@@ -123,10 +185,13 @@ def estimate_heading_from_track(past_track, min_disp_m=1.5):
         cum_m += math.hypot(dlat, dlon)
         lat_start, lon_start = lat_a, lon_a
         if cum_m >= min_disp_m:
+            reached_min_path = True
             break
     dlat = (lat_end - lat_start) * LAT_M
     dlon = (lon_end - lon_start) * LAT_M * math.cos(math.radians(lat_start))
-    if math.hypot(dlat, dlon) < min_disp_m:
+    net_disp_m = math.hypot(dlat, dlon)
+    required_m = MIN_NET_DISP_M if reached_min_path else min_disp_m
+    if net_disp_m < required_m:
         return None
     return math.atan2(dlat, dlon)
 
@@ -176,6 +241,16 @@ class OmniVLAEdgeDeployment:
 
         # 로봇이 실제로 지나온 GPS 기록 (odom map의 회색 past 선용, 최근 것만 유지)
         self.past_track = deque(maxlen=200)
+
+        # GPS-heading EMA 상태 (단위원 위 복소수로 유지 — 각도는 선형평균하면 안 되고
+        # wraparound(-180/+180 경계)를 다뤄야 하므로 벡터로 평균낸 뒤 각도를 복원함)
+        self._heading_ema_vec = None
+
+        # 마지막 재라우팅 시각 (REROUTE_COOLDOWN_S 참고 — 무한 재라우팅 스팸 방지)
+        self._last_reroute_ts = 0.0
+
+        # 직전 step()의 record ts (USE_GYRO_FUSION 적분용 dt 계산)
+        self._prev_step_ts = None
 
         # ── 데이터분석용 로그 (JSONL, 실행마다 날짜시간별 파일) ──
         log_dir = REPO_ROOT / "deployment" / "logs"
@@ -231,9 +306,11 @@ class OmniVLAEdgeDeployment:
             self._log_jsonl({"type": "event", "ts": time.time(), "event": "route_init",
                               "lat": lat, "lon": lon,
                               "route_latlon": self.map_builder.get_route_latlon()})
-        elif self.map_builder.is_off_route(lat, lon, threshold_m=15.0):
+        elif (self.map_builder.is_off_route(lat, lon, threshold_m=3.0)
+                and time.time() - self._last_reroute_ts >= REROUTE_COOLDOWN_S):
             self.state.log("경로 이탈 감지 → 재라우팅")
             self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
+            self._last_reroute_ts = time.time()
             self._log_jsonl({"type": "event", "ts": time.time(), "event": "reroute",
                               "lat": lat, "lon": lon,
                               "route_latlon": self.map_builder.get_route_latlon()})
@@ -322,20 +399,52 @@ class OmniVLAEdgeDeployment:
         #   gps_heading  = 방금 지나온 GPS 두 점 사이 방향 (학습 heading과 동일 산출 방식)
         # GPS 이동량이 부족(정지/막 시작)해서 gps_heading을 못 구할 때만 IMU로 폴백.
         gps_heading_rad = estimate_heading_from_track(list(self.past_track))
+        record["gps_heading_deg"] = math.degrees(gps_heading_rad) if gps_heading_rad is not None else None
+
         if gps_heading_rad is not None:
-            map_heading_rad = gps_heading_rad
-            gps_deg = math.degrees(gps_heading_rad)
-            diff = (gps_deg - imu_deg + 180) % 360 - 180
-            record["gps_heading_deg"] = gps_deg
+            new_vec = complex(math.cos(gps_heading_rad), math.sin(gps_heading_rad))
+            if self._heading_ema_vec is None:
+                self._heading_ema_vec = new_vec  # 첫 확보 시엔 그대로 초기화
+            else:
+                self._heading_ema_vec = (1 - HEADING_EMA_ALPHA) * self._heading_ema_vec + HEADING_EMA_ALPHA * new_vec
+            map_heading_rad = math.atan2(self._heading_ema_vec.imag, self._heading_ema_vec.real)
+            smoothed_deg = math.degrees(map_heading_rad)
+            diff = (smoothed_deg - imu_deg + 180) % 360 - 180
             record["heading_diff_deg"] = diff
+            record["smoothed_heading_deg"] = smoothed_deg
             record["map_heading_source"] = "gps_track"
-            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°  GPS궤적={gps_deg:+7.1f}°(사용)  차이={diff:+7.1f}°")
-        else:
-            map_heading_rad = heading_rad  # 폴백: 이동량 부족(정지/막 시작)
-            record["gps_heading_deg"] = None
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°  GPS궤적={record['gps_heading_deg']:+7.1f}°  "
+                  f"EMA사용={smoothed_deg:+7.1f}°  차이(EMA-IMU)={diff:+7.1f}°")
+        elif self._heading_ema_vec is not None:
+            # GPS 이동량이 잠깐 부족해도(제자리 회전/정지) 순간 IMU로 스냅하지 않고
+            # 마지막으로 안정화된 EMA heading을 유지("관성") — 2026-09-18에 틱마다
+            # 최대 190°까지 튀던 회전 불안정을 직접 렌더링 비교로 확인해서 도입.
+            # USE_GYRO_FUSION=True면 그냥 고정하지 않고, 자이로 상대 회전량만큼
+            # 계속 보정한다(estimate_yaw_delta_from_gyro 참고, 실험적).
+            if USE_GYRO_FUSION and self._prev_step_ts is not None:
+                dt_s = record["ts"] - self._prev_step_ts
+                yaw_delta_rad = estimate_yaw_delta_from_gyro(raw_data, dt_s)
+                cur_rad = math.atan2(self._heading_ema_vec.imag, self._heading_ema_vec.real)
+                new_rad = cur_rad + yaw_delta_rad
+                self._heading_ema_vec = complex(math.cos(new_rad), math.sin(new_rad))
+                source_label = "gps_ema_gyro"
+            else:
+                source_label = "gps_ema_hold"
+            map_heading_rad = math.atan2(self._heading_ema_vec.imag, self._heading_ema_vec.real)
+            smoothed_deg = math.degrees(map_heading_rad)
             record["heading_diff_deg"] = None
+            record["smoothed_heading_deg"] = smoothed_deg
+            record["map_heading_source"] = source_label
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(무시)  GPS궤적=(이동량 부족)  "
+                  f"EMA유지({source_label})={smoothed_deg:+7.1f}°")
+        else:
+            map_heading_rad = heading_rad  # 콜드스타트 폴백: 아직 GPS-heading을 한 번도 못 구한 초반 몇 틱만 해당
+            record["heading_diff_deg"] = None
+            record["smoothed_heading_deg"] = None
             record["map_heading_source"] = "imu_fallback"
-            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(폴백 사용)  GPS궤적=(이동량 부족, 추정불가)")
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(폴백 사용, EMA 없음)  GPS궤적=(이동량 부족, 추정불가)")
+
+        self._prev_step_ts = record["ts"]  # USE_GYRO_FUSION dt 계산용
 
         if len(self.frame_buffer) < N_CTX + 1:
             self.state.log("context 채우는 중 ... 정지 유지")
@@ -357,6 +466,17 @@ class OmniVLAEdgeDeployment:
         # 맞으면 ReadTimeout으로 죽으므로, 루프 시작 전에 넉넉한 타임아웃으로 미리 깨워둔다.
         print("[deploy] SDK 서버 워밍업 중 (헤드리스 브라우저 초기화 대기)...")
         requests.get(f"{FRODOBOT_BASE}/data", timeout=30.0)
+        # 2026-09-18: /data(GPS/텔레메트리)는 준비됐는데 카메라 RTM 채널은 아직 join 중이라
+        # /v2/front가 404("Front frame not available")를 반환하는 경우가 실측됨 — poll_frodobot()이
+        # 이걸 그대로 .json()해서 front_frame 없는 dict를 받아 KeyError로 죽었음. 카메라도 따로
+        # 준비될 때까지 재시도.
+        for attempt in range(30):
+            r = requests.get(f"{FRODOBOT_BASE}/v2/front", timeout=5.0)
+            if r.status_code == 200 and "front_frame" in r.json():
+                break
+            time.sleep(1.0)
+        else:
+            raise RuntimeError("카메라 스트림이 30초 안에 준비되지 않음 — SDK 서버/카메라 연결 확인 필요")
         print("[deploy] 워밍업 완료")
 
         print("[deploy] 시작 — Ctrl+C로 정지")
