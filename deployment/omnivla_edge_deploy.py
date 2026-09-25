@@ -611,7 +611,8 @@ class OmniVLAEdgeDeployment:
                 elapsed = time.time() - t0
                 loop_hz = round(1.0 / max(elapsed, 1e-6), 2)
                 self.state.update(linear=sent_linear, angular=sent_angular, loop_hz=loop_hz,
-                                   control_latency_ms=round(control_latency_ms, 1))
+                                   control_latency_ms=round(control_latency_ms, 1),
+                                   computed_linear=linear, computed_angular=angular)
                 prefix = "[DRY RUN] " if self.dry_run else ""
                 print(f"  {prefix}linear={sent_linear:+.3f} m/s  angular={sent_angular:+.3f} rad/s"
                       + ("" if not self.dry_run else f"  (계산값: linear={linear:+.3f} angular={angular:+.3f})")

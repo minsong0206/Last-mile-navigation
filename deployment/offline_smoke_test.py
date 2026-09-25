@@ -21,6 +21,7 @@ import base64
 import io
 import json
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -62,9 +63,13 @@ def build_fake_requests(camera_frames, gps_sequence):
             state["cam_idx"] += 1
             return FakeResp({"front_frame": _b64_png(img), "timestamp": 0.0})
         if "/data" in url:
-            gps = gps_sequence[min(state["gps_idx"], len(gps_sequence) - 1)]
+            gps = dict(gps_sequence[min(state["gps_idx"], len(gps_sequence) - 1)])
             state["gps_idx"] += 1
-            return FakeResp(dict(gps))
+            # 실제 SDK는 항상 "방금" 시각을 timestamp로 주므로(그래야 gps_age 계산이
+            # 의미 있음), 고정값(0.0) 대신 매 호출 시점의 실제 시각을 넣는다 — 그래야
+            # 대시보드의 "GPS 데이터 나이"가 발표 캡처에서 비정상적으로 크게 안 나옴.
+            gps["timestamp"] = time.time()
+            return FakeResp(gps)
         raise AssertionError(f"unexpected GET {url}")
 
     def fake_post(url, json=None, timeout=None, **kw):

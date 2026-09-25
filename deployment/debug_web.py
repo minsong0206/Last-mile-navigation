@@ -51,8 +51,10 @@ class DeploymentState:
         self.lon = None
         self.heading_deg = None
         self.orientation_deg_raw = None
-        self.linear = 0.0
+        self.linear = 0.0           # 실제로 로봇에 전송된 값 (dry_run이면 항상 0)
         self.angular = 0.0
+        self.computed_linear = 0.0  # waypoint_to_control()이 계산한 값 (dry_run 여부와 무관)
+        self.computed_angular = 0.0
         self.pred_xy_m = None       # (8,2) numpy, 예측 웨이포인트
         self.last_update_ts = None
         self.loop_hz = None
@@ -77,7 +79,7 @@ class DeploymentState:
                gps_data_ts=None, gps_heading_deg=_UNSET, route_bearing_deg=_UNSET,
                heading_route_diff_deg=_UNSET, map_rotation_deg=None,
                target_waypoint_xy=None, control_latency_ms=None, tick_id=None,
-               dry_run=None):
+               dry_run=None, computed_linear=None, computed_angular=None):
         # gps_heading_deg/route_bearing_deg/heading_route_diff_deg는 "이번 틱에
         # 못 구했다"는 의미로 명시적 None이 넘어올 수 있어서, 기본값을 _UNSET으로
         # 두고 "호출에서 아예 안 건드린 경우"와 구분한다 — 그냥 None 기본값을 쓰면
@@ -91,6 +93,8 @@ class DeploymentState:
             if heading_deg is not None: self.heading_deg = heading_deg
             if orientation_deg_raw is not None: self.orientation_deg_raw = orientation_deg_raw
             if linear is not None: self.linear = linear
+            if computed_linear is not None: self.computed_linear = computed_linear
+            if computed_angular is not None: self.computed_angular = computed_angular
             if angular is not None: self.angular = angular
             if pred_xy_m is not None: self.pred_xy_m = pred_xy_m
             if loop_hz is not None: self.loop_hz = loop_hz
@@ -130,6 +134,7 @@ class DeploymentState:
                 "heading_deg": self.heading_deg,
                 "orientation_deg_raw": self.orientation_deg_raw,
                 "linear": self.linear, "angular": self.angular,
+                "computed_linear": self.computed_linear, "computed_angular": self.computed_angular,
                 "loop_hz": self.loop_hz,
                 "age_sec": round(age, 2) if age is not None else None,
                 "pred_xy_m": self.pred_xy_m.tolist() if self.pred_xy_m is not None else None,
@@ -298,7 +303,8 @@ async function poll() {
   `;
   document.querySelector('#statusModel tbody').innerHTML = `
     <tr><td>target waypoint (x,y)</td><td>${s.target_waypoint_xy ? `(${fmtNum(s.target_waypoint_xy[0],3)}, ${fmtNum(s.target_waypoint_xy[1],3)}) m` : '—'}</td></tr>
-    <tr><td>제어명령</td><td>linear=${s.linear} m/s, angular=${s.angular} rad/s</td></tr>
+    <tr><td>계산된 명령</td><td>linear=${s.computed_linear} m/s, angular=${s.computed_angular} rad/s</td></tr>
+    <tr><td>실제 전송된 명령</td><td>linear=${s.linear} m/s, angular=${s.angular} rad/s${s.dry_run ? ' <span style="color:#fa0">(DRY RUN — 항상 0)</span>' : ''}</td></tr>
     <tr><td>/control 왕복시간</td><td class="${latClass}">${fmtNum(s.control_latency_ms, 0)} ms</td></tr>
     <tr><td>루프 주기</td><td>${s.loop_hz} Hz</td></tr>
     <tr><td>tick_id</td><td>${s.tick_id === null ? '—' : s.tick_id}</td></tr>
