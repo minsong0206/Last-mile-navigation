@@ -8,10 +8,27 @@ deployment/LogoNav_frodobot.py의 FrodoBot SDK 연동 패턴(REST API: /v2/front
 파인튜닝 체크포인트)으로 교체하고, 맵 입력은 build_live_map.py의 LiveMapBuilder로
 실시간 생성한다 (학습 때처럼 GT 미래 GPS가 없으므로 OSRM 실시간 라우팅으로 대체).
 
-⚠ 중요 — 아직 실로봇으로 end-to-end 테스트 안 됨. 반드시:
-  1. 시뮬레이션/정지 상태에서 predicted waypoint 출력이 합리적인지 먼저 확인
-  2. 저속(MAX_V를 작게)으로 개활지에서 첫 테스트
-  3. e-stop 또는 SDK 긴급정지를 항상 준비해둔 상태로 진행
+⚠ 중요 — 처음 보는 구간/체크포인트/코드 변경 후에는 반드시:
+  1. --dry_run으로 먼저 돌려서 대시보드(GPS/heading/route bearing/예측 궤적/
+     제어값)를 몇 분 지켜보고 전부 말이 되는지 확인 (실제 로봇에는 항상 (0,0)만
+     전송됨 — 아래 "GO 게이트" 참고)
+  2. 문제없으면 --dry_run 없이 재시작 = 명시적 GO
+  3. 저속(MAX_V를 작게)으로 개활지에서 첫 테스트
+  4. e-stop 또는 SDK 긴급정지를 항상 준비해둔 상태로 진행
+
+--dry_run(2026-09-25 추가) — 센서→지도→추론→궤적→제어 계산은 전부 그대로
+실행하되 실제 actuator 명령은 항상 (0,0)만 보낸다(계산된 값은 로그/대시보드에
+별도 표시). "명령을 아예 안 보낸다"가 아니라 "명시적으로 0을 보낸다" 방식을
+택한 이유: 로봇/SDK 쪽에 "일정 시간 새 명령이 없으면 자동 정지"하는 watchdog이
+있는지 earth-rovers-sdk 전체를 확인해봤지만 문서/코드 어디에도 없었음 — 이
+가정이 틀렸을 때의 위험(로봇이 마지막 non-zero 명령을 계속 유지)이 "명시적으로
+0을 계속 보내는" 쪽보다 훨씬 크므로, 확인 안 된 가정에 의존하지 않는 쪽을 택함.
+
+deterministic replay logging(2026-09-25 추가) — predict_waypoints()에 실제로
+들어간 카메라 6프레임(dedup 저장)과 최종 지도 이미지를 tick_id로 묶어
+deployment/logs/frames/<run_id>/에 저장한다. 자세한 설계 근거는
+replay_logger.py 모듈 docstring 참고 (2026-09-18 세션에서 대시보드 카메라로
+사후 재구성했다가 실제 모델 출력과 안 맞아서 실패했던 사례 때문에 도입).
 
 학습-추론 일치 확인 필수 항목 (finetune_omnivla_edge.py::prepare_batch와 반드시 동일):
   - MAP_RANGE_M: 체크포인트를 학습시킨 맵 반경과 정확히 같은 값을 --map_range로 넘길 것.
@@ -26,11 +43,16 @@ deployment/LogoNav_frodobot.py의 FrodoBot SDK 연동 패턴(REST API: /v2/front
       위 25/12/20m 체크포인트는 전부 WAYPOINT_STRIDE=3(≈2m horizon) → 0.3으로 설정.
       2026-09 이후 5m-horizon(WAYPOINT_STRIDE=7)으로 재학습한 체크포인트는 0.7 사용.
 
-실행 예 (20m 체크포인트 기준):
-  /home/ms/uv-envs/mbra/venv/bin/python deployment/omnivla_edge_deploy.py \
-      --ckpt checkpoints/omnivla_edge_rides11_odom_20m/best.pth \
-      --map_range 20 \
-      --goal_lat 37.5010 --goal_lon 127.0010
+실행 예 (20m-20260910 체크포인트 기준, frodobot conda env):
+  # 1) 먼저 dry-run으로 대시보드 확인 (실제 명령 전송 안 됨)
+  python3 deployment/omnivla_edge_deploy.py \
+      --ckpt checkpoints/omnivla_edge_rides11_odom_20m_20260910/best.pth \
+      --map_range 20 --goal_lat 37.5010 --goal_lon 127.0010 --dry_run
+
+  # 2) 문제없으면 --dry_run 빼고 재시작 = 명시적 GO
+  python3 deployment/omnivla_edge_deploy.py \
+      --ckpt checkpoints/omnivla_edge_rides11_odom_20m_20260910/best.pth \
+      --map_range 20 --goal_lat 37.5010 --goal_lon 127.0010
 """
 
 import sys
@@ -57,6 +79,7 @@ sys.path.insert(0, str(REPO_ROOT / "deployment"))
 from model_omnivla_edge_odom import OmniVLA_edge_odom
 from build_live_map import LiveMapBuilder
 from debug_web import DeploymentState, start_debug_server
+from replay_logger import ReplayLogger
 
 FRODOBOT_BASE = "http://127.0.0.1:8000"
 
@@ -211,7 +234,8 @@ def clip_control(linear_vel, angular_vel, maxv=MAX_V, maxw=MAX_W):
 
 class OmniVLAEdgeDeployment:
     def __init__(self, ckpt_path, map_range_m, goal_lat, goal_lon, device=None,
-                 debug_port=8080):
+                 debug_port=8080, dry_run=False):
+        self.dry_run = dry_run
         self.state = DeploymentState()
         if debug_port:
             start_debug_server(self.state, port=debug_port)
@@ -237,6 +261,9 @@ class OmniVLAEdgeDeployment:
 
         # 최근 카메라 프레임 (0.3초 간격으로 채워짐, N_CTX+1개 유지)
         self.frame_buffer = deque(maxlen=N_CTX + 1)
+        # frame_buffer와 1:1로 나란히 유지되는 replay_logger frame_id (deterministic
+        # replay용 — 어느 저장된 프레임 파일들이 지금 컨텍스트를 이루는지 추적)
+        self.frame_buffer_ids = deque(maxlen=N_CTX + 1)
         self.last_frame_time = 0.0
 
         # 로봇이 실제로 지나온 GPS 기록 (odom map의 회색 past 선용, 최근 것만 유지)
@@ -252,6 +279,11 @@ class OmniVLAEdgeDeployment:
         # 직전 step()의 record ts (USE_GYRO_FUSION 적분용 dt 계산)
         self._prev_step_ts = None
 
+        # 최근 계산한 route bearing(rad) — build_inputs()가 채우고 step()이 읽어서
+        # heading_route_diff_deg를 계산(대시보드/로그 디버그 필드, 2026-09-25 추가)
+        self._last_route_bearing_rad = None
+        self._last_map_replay_path = None
+
         # ── 데이터분석용 로그 (JSONL, 실행마다 날짜시간별 파일) ──
         log_dir = REPO_ROOT / "deployment" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -259,11 +291,23 @@ class OmniVLAEdgeDeployment:
         self.log_path = log_dir / f"deploy_{run_id}.jsonl"
         self._log_fp = open(self.log_path, "a", buffering=1, encoding="utf-8")
         print(f"[deploy] 로그 저장 경로: {self.log_path}")
+
+        # ── Deterministic replay logging (2026-09-25 추가) ──
+        # 실제 predict_waypoints()에 들어간 카메라 6프레임 + 최종 지도 이미지를
+        # tick_id로 묶어서 저장 — 2026-09-18 세션에서 대시보드 카메라로 사후
+        # 재구성을 시도했다가 실제 모델 출력과 안 맞아서 실패한 사례(docs 참고) 때문에
+        # 도입. 자세한 설계 근거는 replay_logger.py 모듈 docstring 참고.
+        self.replay_logger = ReplayLogger(run_id, log_dir)
+
         self._log_jsonl({
             "type": "run_start", "ts": time.time(), "run_id": run_id,
             "ckpt_path": str(ckpt_path), "map_range_m": map_range_m,
-            "goal_lat": goal_lat, "goal_lon": goal_lon,
+            "goal_lat": goal_lat, "goal_lon": goal_lon, "dry_run": self.dry_run,
         })
+        if self.dry_run:
+            print("[deploy] ⚠ --dry_run 모드 — 실제 로봇에는 항상 (0,0)만 전송합니다 "
+                  "(계산된 linear/angular는 로그/대시보드에만 표시)")
+        self.state.update(dry_run=self.dry_run)
 
     def _log_jsonl(self, record: dict):
         self._log_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -280,7 +324,8 @@ class OmniVLAEdgeDeployment:
         heading_rad = -float(orientation_deg_raw) / 180.0 * math.pi
         heading_deg = math.degrees(heading_rad)
         self.state.update(camera_img=img, lat=lat, lon=lon,
-                           heading_deg=heading_deg, orientation_deg_raw=orientation_deg_raw)
+                           heading_deg=heading_deg, orientation_deg_raw=orientation_deg_raw,
+                           fix_quality=gps.get("fix_quality"), gps_data_ts=gps.get("timestamp"))
         return img, lat, lon, heading_rad, gps
 
     def send_control(self, linear, angular):
@@ -292,13 +337,19 @@ class OmniVLAEdgeDeployment:
 
     def maybe_update_frame_buffer(self, img):
         now = time.time()
-        if now - self.last_frame_time >= CTX_STRIDE_SEC or len(self.frame_buffer) == 0:
+        is_new = now - self.last_frame_time >= CTX_STRIDE_SEC or len(self.frame_buffer) == 0
+        if is_new:
             self.frame_buffer.append(self.obs_transform(img))
             self.last_frame_time = now
-            return True
-        return False
+        # 2026-09-25: deterministic replay logging — 새 프레임일 때만 디스크에 저장(dedup),
+        # frame_buffer_ids도 frame_buffer와 정확히 같은 시점에만 append해서 두 deque가
+        # 항상 1:1로 대응하게 유지 (frame_buffer_ids[i]가 frame_buffer[i]의 원본 파일 ID).
+        frame_id = self.replay_logger.record_context_frame(img, is_new)
+        if is_new:
+            self.frame_buffer_ids.append(frame_id)
+        return is_new
 
-    def build_inputs(self, lat, lon, heading_rad):
+    def build_inputs(self, lat, lon, heading_rad, tick_id=None):
         # 경로는 배포 시작 시 1번만 계산 (osmnav 구조 참고 — 매 프레임 OSRM 재쿼리 안 함)
         if not self._route_initialized:
             self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
@@ -315,6 +366,10 @@ class OmniVLAEdgeDeployment:
                               "lat": lat, "lon": lon,
                               "route_latlon": self.map_builder.get_route_latlon()})
 
+        # 대시보드/로그용 디버그 필드 (2026-09-25 추가) — 0918 replay에서 heading과
+        # route bearing 차이가 ~41°였던 것과 비교할 수 있게 매 틱 계산해둠.
+        self._last_route_bearing_rad = self.map_builder.route_bearing_rad(lat, lon)
+
         # obs_stack: 컨텍스트가 아직 안 찼으면 가장 오래된 프레임으로 패딩
         frames = list(self.frame_buffer)
         while len(frames) < N_CTX + 1:
@@ -330,6 +385,12 @@ class OmniVLAEdgeDeployment:
         self.state.update(map_img=map_np)
         map_tensor = self.map_builder.transform(Image.fromarray(map_np)).unsqueeze(0).to(self.device)  # (1,3,96,96)
 
+        # 2026-09-25: deterministic replay logging — transform 적용 "전"의 map_np(모델이
+        # 실제로 본 것과 동일한 224x224 RGB)를 tick_id로 저장. ego 위치/heading이 매 틱
+        # 달라서 dedup 없이 항상 저장(ReplayLogger.save_map 참고).
+        if tick_id is not None:
+            self._last_map_replay_path = self.replay_logger.save_map(map_np, tick_id)
+
         goal_pose = torch.zeros(1, 4, device=self.device)
         goal_mask = torch.zeros(1, dtype=torch.long, device=self.device)
         feat_text = torch.zeros(1, 512, device=self.device)
@@ -337,8 +398,8 @@ class OmniVLAEdgeDeployment:
 
         return obs_stack, goal_pose, map_tensor, obs_cur, goal_mask, feat_text, cur_img
 
-    def predict_waypoints(self, lat, lon, heading_rad):
-        inputs = self.build_inputs(lat, lon, heading_rad)
+    def predict_waypoints(self, lat, lon, heading_rad, tick_id=None):
+        inputs = self.build_inputs(lat, lon, heading_rad, tick_id=tick_id)
         with torch.no_grad():
             pred, _, _ = self.model(*inputs)
         pred_xy_m = pred[0, :, :2].detach().cpu().numpy() * METRIC_WAYPOINT_SPACING  # (8,2) ego x=fwd,y=left
@@ -371,13 +432,15 @@ class OmniVLAEdgeDeployment:
         return float(np.clip(linear, 0, MAX_V * 2)), float(np.clip(angular, -MAX_W * 2, MAX_W * 2))
 
     def step(self):
+        tick_id = self.replay_logger.next_tick_id()
         img, lat, lon, heading_rad, raw_data = self.poll_frodobot()
         imu_deg = math.degrees(heading_rad)
         # frodobot_raw: FrodoBot Mini가 /data로 내보내는 원본 텔레메트리 그대로 보존
         # (battery, signal_level, speed, gps_signal, vibration, accels/gyros/mags/rpms 등).
-        record = {"type": "step", "ts": time.time(),
+        record = {"type": "step", "ts": time.time(), "tick_id": tick_id,
                   "lat": lat, "lon": lon, "imu_heading_deg": imu_deg,
                   "frodobot_raw": raw_data}
+        self.state.update(tick_id=tick_id)
 
         # GPS fix 없음(sentinel 1000) — 지도 자체를 만들 수 없으므로 정지 유지
         if lat == 1000 or lon == 1000:
@@ -388,6 +451,7 @@ class OmniVLAEdgeDeployment:
         record["gps_fix_ok"] = True
 
         self.maybe_update_frame_buffer(img)
+        record["context_frame_ids"] = list(self.frame_buffer_ids)
         self.past_track.append((lat, lon))
 
         # heading 소스: 2026-08-25 실배포 로그 분석(docs/0825.md 2-2)에서 IMU 컴퍼스와
@@ -452,12 +516,30 @@ class OmniVLAEdgeDeployment:
             self._log_jsonl(record)
             return 0.0, 0.0
 
-        pred_xy_m = self.predict_waypoints(lat, lon, map_heading_rad)
+        pred_xy_m = self.predict_waypoints(lat, lon, map_heading_rad, tick_id=tick_id)
         linear, angular = self.waypoint_to_control(pred_xy_m)
         linear, angular = clip_control(linear, angular)
-        record.update(linear=linear, angular=angular,
-                       pred_xy_m=pred_xy_m.tolist())
+
+        # 2026-09-25 추가 디버그 필드: route bearing/heading 차이/지도 회전각/target
+        # waypoint — 6번(시각화)에서 합의한 "GO 누르기 전에 확인할 수치들"
+        map_rotation_deg = 90.0 - math.degrees(map_heading_rad)
+        route_bearing_deg = (math.degrees(self._last_route_bearing_rad)
+                              if self._last_route_bearing_rad is not None else None)
+        heading_route_diff_deg = None
+        if route_bearing_deg is not None:
+            heading_route_diff_deg = (math.degrees(map_heading_rad) - route_bearing_deg + 180) % 360 - 180
+        target_x, target_y = float(pred_xy_m[2][0]), float(pred_xy_m[2][1])
+
+        record.update(linear=linear, angular=angular, pred_xy_m=pred_xy_m.tolist(),
+                       map_rotation_deg=map_rotation_deg, route_bearing_deg=route_bearing_deg,
+                       heading_route_diff_deg=heading_route_diff_deg,
+                       target_waypoint_xy=[target_x, target_y],
+                       map_replay_path=self._last_map_replay_path)
         self._log_jsonl(record)
+        self.state.update(route_bearing_deg=route_bearing_deg,
+                           heading_route_diff_deg=heading_route_diff_deg,
+                           map_rotation_deg=map_rotation_deg,
+                           target_waypoint_xy=(target_x, target_y))
         return linear, angular
 
     def run(self):
@@ -493,14 +575,33 @@ class OmniVLAEdgeDeployment:
                                       "event": "step_failed", "error": repr(e)})
                     self.send_control(0.0, 0.0)
                     raise
-                control_status = self.send_control(linear, angular)
+                # 2026-09-25 --dry_run: 실제 actuator 명령은 항상 (0,0)만 보낸다.
+                # send_control() 호출 자체는 건너뛰지 않고 그대로 유지 — SDK/로봇
+                # 쪽에 "N초 안에 새 명령 없으면 자동 정지"하는 watchdog이 있다는
+                # 문서/코드를 earth-rovers-sdk 전체에서 찾아봤지만 없었다(확인 안 된
+                # 가정에 기대는 건 위험 — 이전에 "GPS 없으면 안전할 것"이라는 확인 안
+                # 된 가정으로 실제 로봇이 움직인 적이 있어서 같은 실수를 반복하지
+                # 않기 위함). 그래서 "아무것도 안 보낸다"보다 "명시적으로 0을 보낸다"가
+                # 더 안전한 선택 — 로봇 쪽 로직이 무엇이든(마지막 명령 유지형이든
+                # watchdog형이든) 0,0을 계속 받으면 항상 정지 상태가 유지된다.
+                sent_linear, sent_angular = (0.0, 0.0) if self.dry_run else (linear, angular)
+                t_ctrl = time.time()
+                control_status = self.send_control(sent_linear, sent_angular)
+                control_latency_ms = (time.time() - t_ctrl) * 1000.0
                 self._log_jsonl({"type": "control_sent", "ts": time.time(),
-                                  "linear": linear, "angular": angular,
-                                  "http_status": control_status})
+                                  "linear": sent_linear, "angular": sent_angular,
+                                  "http_status": control_status,
+                                  "latency_ms": round(control_latency_ms, 1),
+                                  "dry_run": self.dry_run,
+                                  "computed_linear": linear, "computed_angular": angular})
                 elapsed = time.time() - t0
                 loop_hz = round(1.0 / max(elapsed, 1e-6), 2)
-                self.state.update(linear=linear, angular=angular, loop_hz=loop_hz)
-                print(f"  linear={linear:+.3f} m/s  angular={angular:+.3f} rad/s")
+                self.state.update(linear=sent_linear, angular=sent_angular, loop_hz=loop_hz,
+                                   control_latency_ms=round(control_latency_ms, 1))
+                prefix = "[DRY RUN] " if self.dry_run else ""
+                print(f"  {prefix}linear={sent_linear:+.3f} m/s  angular={sent_angular:+.3f} rad/s"
+                      + ("" if not self.dry_run else f"  (계산값: linear={linear:+.3f} angular={angular:+.3f})")
+                      + f"  [/control {control_latency_ms:.0f}ms]")
                 time.sleep(max(0.0, DT - elapsed))
         except KeyboardInterrupt:
             print("\n[deploy] 정지 요청됨 — 로봇 정지 명령 전송")
@@ -522,11 +623,16 @@ if __name__ == "__main__":
     p.add_argument("--goal_lon", type=float, required=True)
     p.add_argument("--debug_port", type=int, default=8080,
                    help="모니터링 웹 대시보드 포트 (0이면 비활성화)")
+    p.add_argument("--dry_run", action="store_true",
+                   help="센서→지도→추론→궤적→제어 계산까지는 그대로 수행하되 "
+                        "실제 로봇에는 항상 linear=0, angular=0만 전송. 대시보드/로그에는 "
+                        "계산된 값도 같이 남음. 처음 보는 구간/체크포인트는 이걸로 먼저 "
+                        "확인한 뒤 --dry_run 없이 재시작하는 걸 권장.")
     args = p.parse_args()
 
     deployer = OmniVLAEdgeDeployment(
         ckpt_path=args.ckpt, map_range_m=args.map_range,
         goal_lat=args.goal_lat, goal_lon=args.goal_lon,
-        debug_port=args.debug_port,
+        debug_port=args.debug_port, dry_run=args.dry_run,
     )
     deployer.run()

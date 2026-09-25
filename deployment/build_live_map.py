@@ -199,6 +199,34 @@ class LiveMapBuilder:
         dist_m = dist_deg * LAT_M  # 위경도 차 → 대략적인 미터 환산 (근거리 근사)
         return dist_m > threshold_m
 
+    def route_bearing_rad(self, lat, lon, lookahead_m=5.0):
+        """2026-09-25: 디버그 대시보드/로깅용 — 현재 위치에서 캐싱된 경로를 따라
+        lookahead_m만큼 앞선 지점까지의 방향(진행해야 할 방향)을
+        estimate_heading_from_track()과 동일한 공식(atan2(북쪽성분, 동쪽성분))으로
+        계산한다. "heading(로봇이 향한 방향) - route_bearing(가야 할 방향)" 차이를
+        보면 heading-up 지도 회전이 실제로 경로와 정렬돼있는지 수치로 확인 가능
+        (0918 replay에서 이 차이가 ~41°였던 것과 비교하는 용도).
+        경로가 없거나 현재 위치가 경로 끝 근처라 lookahead_m를 못 채우면 None."""
+        if self._route_latlon is None:
+            return None
+        idx, _ = self._closest_route_idx(lat, lon)
+        route = self._route_latlon
+        if idx >= len(route) - 1:
+            return None
+        lat0, lon0 = route[idx]
+        cum_m = 0.0
+        j = idx
+        while j < len(route) - 1 and cum_m < lookahead_m:
+            j += 1
+            dlat = (route[j][0] - route[j - 1][0]) * LAT_M
+            dlon = (route[j][1] - route[j - 1][1]) * LAT_M * math.cos(math.radians(route[j - 1][0]))
+            cum_m += math.hypot(dlat, dlon)
+        dlat = (route[j][0] - lat0) * LAT_M
+        dlon = (route[j][1] - lon0) * LAT_M * math.cos(math.radians(lat0))
+        if math.hypot(dlat, dlon) < 1e-6:
+            return None
+        return math.atan2(dlat, dlon)
+
     def get_map_image(self, lat, lon, heading_rad, past_track=None):
         """
         set_goal()이 먼저 호출되어 있어야 함. 네트워크 요청 없이 캐싱된 경로만 사용.
