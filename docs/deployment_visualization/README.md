@@ -16,6 +16,7 @@
 | `02_debug_panel/` | 실제 `debug_web.py` 대시보드 헤드리스 캡처 (주행 전 검증 화면) | 완료 |
 | `03_heading_route/` | heading vs route bearing 정렬/불일치 비교 (실제 로그값 2건) | 완료 |
 | `04_replay_logging/` | tick_id 하나로 model input→control을 역추적하는 실제 예시 | 완료 |
+| `05_model_input_output/` | 실제 HuggingFace 주행 데이터 + 실제 checkpoint로 OSM heading-up 변환/모델 입력/예측 vs GT 궤적 재현 (straight/curve/turn 3개 시나리오) | 완료 |
 
 ## 재생성 순서 (필요시)
 
@@ -32,4 +33,7 @@ python3 docs/deployment_visualization/01_pipeline/generate_pipeline_diagram.py
 python3 docs/deployment_visualization/02_debug_panel/generate_debug_panel_capture.py
 python3 docs/deployment_visualization/03_heading_route/generate_heading_route_diagram.py
 python3 docs/deployment_visualization/04_replay_logging/generate_replay_logging_diagram.py
+
+python3 docs/deployment_visualization/05_model_input_output/scripts/run_all.py
+python3 docs/deployment_visualization/05_model_input_output/scripts/compose_figures.py
 ```
