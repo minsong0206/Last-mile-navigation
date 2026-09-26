@@ -82,6 +82,9 @@ class DeploymentState:
         self.start_snap_m = None
         self.goal_snap_m = None
         self.map_img_northup = None      # PIL.Image, heading-up 회전 전 미리보기
+        self.heading_mode = "auto"       # 2026-09-26 추가: "auto" / "route_aligned_fixed", 실행 중 안 바뀜(표시용)
+        self.dist_to_goal_m = None       # 2026-09-26 추가: goal 도착 감지
+        self.goal_reached = False
         self._logs = deque(maxlen=log_maxlen)
         self._errors = deque(maxlen=log_maxlen)
 
@@ -95,7 +98,8 @@ class DeploymentState:
                control_stage=None, map_heading_source=_UNSET,
                route_aligned_heading_deg=_UNSET, gps_accumulated_path_m=None,
                gps_net_displacement_m=None, osrm_fallback=_UNSET,
-               start_snap_m=_UNSET, goal_snap_m=_UNSET, map_img_northup=None):
+               start_snap_m=_UNSET, goal_snap_m=_UNSET, map_img_northup=None,
+               heading_mode=None, dist_to_goal_m=None, goal_reached=None):
         # gps_heading_deg/route_bearing_deg/heading_route_diff_deg는 "이번 틱에
         # 못 구했다"는 의미로 명시적 None이 넘어올 수 있어서, 기본값을 _UNSET으로
         # 두고 "호출에서 아예 안 건드린 경우"와 구분한다 — 그냥 None 기본값을 쓰면
@@ -133,6 +137,9 @@ class DeploymentState:
             if start_snap_m is not _UNSET: self.start_snap_m = start_snap_m
             if goal_snap_m is not _UNSET: self.goal_snap_m = goal_snap_m
             if map_img_northup is not None: self.map_img_northup = map_img_northup
+            if heading_mode is not None: self.heading_mode = heading_mode
+            if dist_to_goal_m is not None: self.dist_to_goal_m = dist_to_goal_m
+            if goal_reached is not None: self.goal_reached = goal_reached
             self.last_update_ts = time.time()
 
     def log(self, msg):
@@ -179,6 +186,9 @@ class DeploymentState:
                 "dry_run": self.dry_run,
                 # 2026-09-25 추가 필드
                 "control_stage": self.control_stage,
+                "heading_mode": self.heading_mode,
+                "dist_to_goal_m": self.dist_to_goal_m,
+                "goal_reached": self.goal_reached,
                 "map_heading_source": self.map_heading_source,
                 "route_aligned_heading_deg": self.route_aligned_heading_deg,
                 "gps_accumulated_path_m": self.gps_accumulated_path_m,
@@ -286,7 +296,7 @@ button:disabled { opacity:0.35; cursor:not-allowed; }
 #btnAbort { background:#333; color:#fff; }
 </style></head>
 <body>
-<h2>OmniVLA-Edge 실시간 배포 모니터 <span id="stageBadge"></span></h2>
+<h2>OmniVLA-Edge 실시간 배포 모니터 <span id="stageBadge"></span> <span id="headingModeBadge"></span></h2>
 <div class="card" style="margin-bottom:16px;">
   <b>Pre-drive 워크플로</b> — DRY RUN(관찰) → 정렬 확인 → ARM → GO LIVE(사용자 명시 확인 필요)
   <div style="margin-top:8px;">
@@ -297,11 +307,11 @@ button:disabled { opacity:0.35; cursor:not-allowed; }
   </div>
 </div>
 <div class="row">
-  <div class="card"><b>카메라</b><br><img src="/frame.jpg?t=__TS__"></div>
-  <div class="card"><b>North-up 경로 미리보기 (회전 전)</b><br><img src="/map_northup.jpg?t=__TS__">
+  <div class="card"><b>카메라</b><br><img id="imgFrame" src="/frame.jpg?t=__TS__"></div>
+  <div class="card"><b>North-up 경로 미리보기 (회전 전)</b><br><img id="imgNorthup" src="/map_northup.jpg?t=__TS__">
     <div style="font-size:11px; margin-top:4px;">route geometry 자체(스냅/OSRM/보도 위치)가 맞는지 확인용 — 회전 로직 안 들어감</div>
   </div>
-  <div class="card"><b>최종 heading-up 모델 입력 지도</b><br><img src="/map.jpg?t=__TS__">
+  <div class="card"><b>최종 heading-up 모델 입력 지도</b><br><img id="imgMap" src="/map.jpg?t=__TS__">
     <div style="font-size:11px; margin-top:4px; line-height:1.6;">
       <span style="color:#f66;">■</span> 계획 경로(OSRM)&nbsp;
       <span style="color:#999;">■</span> 지나온 길&nbsp;
@@ -310,7 +320,7 @@ button:disabled { opacity:0.35; cursor:not-allowed; }
       <span style="color:#fff;">—</span> 스케일바
     </div>
   </div>
-  <div class="card"><b>예측 궤적 확대(지도와 별개 축척)</b><br><img src="/traj.jpg?t=__TS__">
+  <div class="card"><b>예측 궤적 확대(지도와 별개 축척)</b><br><img id="imgTraj" src="/traj.jpg?t=__TS__">
     <div style="font-size:11px; margin-top:4px;">지도(40m 등)가 넓어서 실제 예측(~2m)이 안 보이는 문제 때문에 추가된 확대 패널</div>
   </div>
   <div class="card">
@@ -354,6 +364,17 @@ const SOURCE_CLASS = {
 };
 
 async function poll() {
+  // 2026-09-26: 예전엔 <meta http-equiv="refresh"> 페이지 전체 새로고침이
+  // 이미지도 매초 새로 불러왔는데, JS 폴링으로 바꾸면서 텍스트 상태만 갱신하고
+  // <img> src는 페이지 첫 로드 시점에 고정된 채 방치되던 버그(실제 배포 중
+  // "카메라가 실시간으로 안 뜬다"로 발견됨) — 매 poll마다 타임스탬프를 새로
+  // 붙여서 이미지도 강제로 다시 불러오게 함.
+  const ts = Date.now();
+  document.querySelector('#imgFrame').src = `/frame.jpg?t=${ts}`;
+  document.querySelector('#imgNorthup').src = `/map_northup.jpg?t=${ts}`;
+  document.querySelector('#imgMap').src = `/map.jpg?t=${ts}`;
+  document.querySelector('#imgTraj').src = `/traj.jpg?t=${ts}`;
+
   const r = await fetch('/status.json');
   const s = await r.json();
 
@@ -365,6 +386,11 @@ async function poll() {
   };
   const [bg, label] = stageInfo[s.control_stage] || stageInfo.DRY_RUN;
   badge.innerHTML = `<span style="background:${bg}; color:#fff; padding:2px 8px; border-radius:4px; font-size:14px;">${label}</span>`;
+
+  const hmBadge = document.querySelector('#headingModeBadge');
+  hmBadge.innerHTML = (s.heading_mode === 'route_aligned_fixed')
+    ? '<span style="background:#048; color:#fff; padding:2px 8px; border-radius:4px; font-size:13px;">heading_mode=route_aligned_fixed (정렬값 고정)</span>'
+    : '<span style="background:#333; color:#ccc; padding:2px 8px; border-radius:4px; font-size:13px;">heading_mode=auto (GPS 확보 시 자동 전환)</span>';
 
   document.querySelector('#btnConfirm').disabled = (s.control_stage !== 'DRY_RUN');
   document.querySelector('#btnArm').disabled = (s.control_stage !== 'DRY_RUN' || s.route_aligned_heading_deg === null);
@@ -393,12 +419,14 @@ async function poll() {
     <tr><td><b>최종 사용 heading</b></td><td><b>${fmtNum(s.heading_deg, 1)}&deg;</b></td></tr>
     <tr><td>GPS heading 준비도</td><td class="${readyClass}">누적 ${fmtNum(s.gps_accumulated_path_m, 2)}m / 순변위 ${fmtNum(s.gps_net_displacement_m, 2)}m (기준 1.5m/0.3m)</td></tr>
   `;
+  const goalClass = s.goal_reached ? 'ok' : (s.dist_to_goal_m !== null && s.dist_to_goal_m < 5 ? 'warn' : '');
   document.querySelector('#statusRoute tbody').innerHTML = `
     <tr><td>OSRM</td><td class="${osrmClass}">${s.osrm_fallback === null ? '(미초기화)' : (s.osrm_fallback ? 'FALLBACK(직선 경로)' : '정상')}</td></tr>
     <tr><td>snap 거리(출발/목표)</td><td>${fmtNum(s.start_snap_m, 2)}m / ${fmtNum(s.goal_snap_m, 2)}m</td></tr>
     <tr><td>route bearing (5m, debug)</td><td>${s.route_bearing_deg === null ? '—' : fmtNum(s.route_bearing_deg, 1) + '&deg;'}</td></tr>
     <tr><td>heading - route 차이</td><td class="${routeDiffClass}">${s.heading_route_diff_deg === null ? '—' : fmtNum(s.heading_route_diff_deg, 1) + '&deg;'}</td></tr>
     <tr><td>지도 회전각</td><td>${s.map_rotation_deg === null ? '—' : fmtNum(s.map_rotation_deg, 1) + '&deg;'}</td></tr>
+    <tr><td><b>목표까지 거리</b></td><td class="${goalClass}"><b>${fmtNum(s.dist_to_goal_m, 2)}m</b>${s.goal_reached ? ' <span class="ok">🏁 도착 — 영구 정지</span>' : ''}</td></tr>
   `;
   document.querySelector('#statusModel tbody').innerHTML = `
     <tr><td>target waypoint (x,y)</td><td>${s.target_waypoint_xy ? `(${fmtNum(s.target_waypoint_xy[0],3)}, ${fmtNum(s.target_waypoint_xy[1],3)}) m` : '—'}</td></tr>

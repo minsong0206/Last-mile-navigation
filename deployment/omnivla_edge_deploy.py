@@ -148,6 +148,13 @@ HEADING_EMA_ALPHA = 0.3
 # 출발) 자체는 임계값 튜닝으로 못 고치지만, 적어도 매 틱 재쿼리하는 폭주는 쿨다운으로 막는다.
 REROUTE_COOLDOWN_S = 3.0
 
+# 2026-09-26: 목표 이 거리(m) 이내에서는 재라우팅을 하지 않음 — 실제 주행에서 목표
+# ~5.5m 앞 reroute가 OSRM 보행로망을 따라 헤어핀(왔다갔다)형 새 경로를 만들어 로봇이
+# 계속 도는 것처럼 보이는 문제가 실측됨(deploy_20260926_132829.jsonl). 이 거리 안에서는
+# dist_to_goal_m 기반 도착 정지(DEFAULT_GOAL_REACH_THRESHOLD_M)가 곧 작동하므로 경로
+# 재계산이 불필요.
+REROUTE_DISABLE_NEAR_GOAL_M = 10.0
+
 # ── GPS/IMU 자이로 융합 (실험적, 기본 꺼짐) ──────────────────────────────────
 # GPS-heading을 못 구하는 구간(gps_ema_hold)에서 지금은 마지막 EMA 값을 그냥
 # 고정해서 쓰는데, 그 사이에 로봇이 실제로 방향을 틀면 반영이 안 됨. 대신
@@ -212,6 +219,15 @@ def decode_frame(b64_str) -> Image.Image:
 
 LAT_M = 111320.0  # 위도 1도당 미터 (근거리 근사)
 MIN_NET_DISP_M = 0.3  # "거의 정지"만 걸러내는 순변위 하한 (min_disp_m보다 훨씬 작음)
+DEFAULT_GOAL_REACH_THRESHOLD_M = 2.0  # 이 거리 이내면 도착으로 간주하고 영구 정지
+
+
+def latlon_distance_m(lat1, lon1, lat2, lon2):
+    """근거리 등적원통 근사 — 이 파일 전체(estimate_heading_from_track 등)와 동일한
+    LAT_M 기반 근사를 그대로 재사용(별도 haversine 등 다른 근사식을 새로 쓰지 않음)."""
+    dlat = (lat2 - lat1) * LAT_M
+    dlon = (lon2 - lon1) * LAT_M * math.cos(math.radians(lat1))
+    return math.hypot(dlat, dlon)
 
 
 def estimate_heading_from_track(past_track, min_disp_m=1.5):
@@ -304,7 +320,9 @@ def clip_control(linear_vel, angular_vel, maxv=MAX_V, maxw=MAX_W):
 
 class OmniVLAEdgeDeployment:
     def __init__(self, ckpt_path, map_range_m, goal_lat, goal_lon, device=None,
-                 debug_port=8080, dry_run=False):
+                 debug_port=8080, dry_run=False, heading_mode="auto",
+                 goal_reach_threshold_m=DEFAULT_GOAL_REACH_THRESHOLD_M,
+                 initial_heading_lookahead_m=INITIAL_HEADING_LOOKAHEAD_M):
         # 2026-09-25: --dry_run의 의미가 "이 프로세스는 GO LIVE 자체를 영구히
         # 거부하는 하드 락"으로 바뀜(순수 검증 세션용). 기본(플래그 없음)은
         # DRY_RUN 상태로 시작하되, 대시보드에서 정렬확인→ARM→GO LIVE를 거치면
@@ -315,6 +333,20 @@ class OmniVLAEdgeDeployment:
         self.control_stage = "DRY_RUN"  # "DRY_RUN" / "ARMED" / "LIVE"
         self._armed_ts = None
         self._pending_commands = queue.Queue()
+
+        # 2026-09-26 추가: heading_mode
+        #   "auto"(기본, 기존 동작) — route_aligned는 실측 GPS heading이 확보되기
+        #     전까지의 임시 부트스트랩일 뿐, 확보되는 즉시 gps_track/gps_ema_hold로
+        #     자동 전환됨.
+        #   "route_aligned_fixed" — 정렬 확인으로 고정한 값을 런 내내 그대로 사용,
+        #     실측 GPS heading이 이후 얼마나 잡히든 절대 넘기지 않음. 실외 테스트에서
+        #     저속/근거리 구간의 GPS 잡음이 gps_track을 계속 흔드는 문제(순변위가
+        #     누적경로보다 훨씬 작은 지그재그, heading 100°+ 튐)가 실측되어 대안으로
+        #     추가함 — 어느 쪽이 실제로 더 안전/안정적인지는 아직 비교 검증 전이라
+        #     기본값은 기존 동작("auto") 그대로 유지.
+        assert heading_mode in ("auto", "route_aligned_fixed"), \
+            f"알 수 없는 heading_mode: {heading_mode!r}"
+        self.heading_mode = heading_mode
 
         self.state = DeploymentState()
         if debug_port:
@@ -332,6 +364,22 @@ class OmniVLAEdgeDeployment:
         # 경로는 배포 시작 시 1번만 계산해서 캐싱 (osmnav 구조 참고 — 매 프레임 재쿼리 안 함).
         # 시작 위치를 아직 모르므로, 첫 poll_frodobot() 이후 run()에서 set_goal() 호출.
         self._route_initialized = False
+
+        # 2026-09-26 추가: goal 도착 감지 — 이전엔 목표 근처에 도달해도 계속 명령이
+        # 나갔음(실제 로그로 확인된 갭). 한 번 도착(_goal_reached=True)하면 이후
+        # 절대 다시 풀리지 않음(latched) — run()의 전송 게이트에서 heading_trustworthy와
+        # 같은 자리에서 AND 조건으로 확인.
+        self.goal_reach_threshold_m = goal_reach_threshold_m
+        self._goal_reached = False
+
+        # 2026-09-26 추가: INITIAL_HEADING_LOOKAHEAD_M을 CLI로 조절 가능하게 함 —
+        # 실제 주행에서 목표 근처(dist_to_goal≈6.9m)에서 정렬 확인을 눌렀더니,
+        # 짧은 2m lookahead가 마침 경로가 꺾이는 지점 근처를 잡아서 실제 경로 방향
+        # (route_bearing_deg)과 56~58°나 어긋난 heading이 그대로 고정되는 사고가
+        # 실측됨(deploy_20260926_135303.jsonl). 근본적인 자체 검증(cross-check) 로직은
+        # 아직 안 넣었고(다음 라운드), 우선 이 값을 늘려서(예: 5.0m 이상) 국소적인
+        # 꺾임에 덜 민감하게 만들 수 있도록 임시로 조절 가능하게만 함.
+        self.initial_heading_lookahead_m = initial_heading_lookahead_m
 
         self.obs_transform = transforms.Compose([
             transforms.Resize((96, 96)),
@@ -391,7 +439,9 @@ class OmniVLAEdgeDeployment:
             "type": "run_start", "ts": time.time(), "run_id": run_id,
             "ckpt_path": str(ckpt_path), "map_range_m": map_range_m,
             "goal_lat": goal_lat, "goal_lon": goal_lon, "dry_run_lock": self.dry_run_lock,
-            "initial_heading_lookahead_m": INITIAL_HEADING_LOOKAHEAD_M,
+            "initial_heading_lookahead_m": self.initial_heading_lookahead_m,
+            "heading_mode": self.heading_mode,
+            "goal_reach_threshold_m": self.goal_reach_threshold_m,
             # 2026-09-25: 각 step 레코드의 context_frame_paths/map_replay_path를
             # 어떻게 실제 파일로 바꾸는지 — 별도 코드를 몰라도 이 JSONL 파일 하나만
             # 보고 알 수 있도록 규칙 자체를 데이터로 남겨둔다.
@@ -405,7 +455,7 @@ class OmniVLAEdgeDeployment:
             print("[deploy] DRY_RUN 상태로 시작합니다. 대시보드에서 "
                   "'정렬 확인' → 'ARM' → 'GO LIVE' 순서로 명시적으로 진행해야 "
                   "실제 로봇에 non-zero 명령이 전송됩니다.")
-        self.state.update(dry_run=True, control_stage=self.control_stage)
+        self.state.update(dry_run=True, control_stage=self.control_stage, heading_mode=self.heading_mode)
 
     def _log_jsonl(self, record: dict):
         self._log_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -448,14 +498,23 @@ class OmniVLAEdgeDeployment:
             self.frame_buffer_ids.append(frame_id)
         return is_new
 
-    def _ensure_route_initialized(self, lat, lon):
+    def _ensure_route_initialized(self, lat, lon, dist_to_goal_m=None):
         """2026-09-25: build_inputs()에서 분리 — 예전엔 frame_buffer가 다 찬 뒤에야
         (즉 predict_waypoints()가 처음 호출될 때) route가 생겼는데, 그러면 route
         생성이 model 파이프라인 준비 상태에 우연히 종속되어서 "GPS position →
         OSRM route 생성"을 그 자체로 독립된 초기 단계로 다룰 수 없었다(route-aligned
         heading 확인은 route가 있어야 가능한데, frame_buffer가 찰 때까지(~1.5초)
         기다릴 이유가 없음). 지금은 GPS fix가 유효해지는 즉시(step()에서 frame_buffer
-        조작보다 먼저) 호출됨."""
+        조작보다 먼저) 호출됨.
+
+        2026-09-26 추가: 목표 근처(REROUTE_DISABLE_NEAR_GOAL_M 이내)에서는 재라우팅을
+        하지 않는다 — 실제 주행에서 목표 ~5.5m 앞 reroute가 OSRM 보행로망을 따라
+        헤어핀(왔다갔다) 형태의 새 경로를 만들어서, 이미 가까운데도 계획 경로상으로는
+        더 멀어지는 구간이 생겨 "도착 못 하고 계속 도는" 것처럼 보이는 문제가 실측됨
+        (deploy_20260926_132829.jsonl reroute 이벤트, route_latlon 궤적으로 직접 확인).
+        이 시점부턴 어차피 dist_to_goal_m 기반 도착 정지(goal_reach_threshold_m)가
+        곧 작동할 거리이므로, 경로를 다시 최적화할 필요가 없다 — 최초 route_init은
+        이 조건과 무관하게 항상 수행됨(그게 없으면 애초에 정렬 확인/주행 자체가 불가)."""
         if not self._route_initialized:
             self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
             self._route_initialized = True
@@ -467,15 +526,19 @@ class OmniVLAEdgeDeployment:
                               "goal_snap_m": self.map_builder.last_goal_snap_m})
         elif (self.map_builder.is_off_route(lat, lon, threshold_m=3.0)
                 and time.time() - self._last_reroute_ts >= REROUTE_COOLDOWN_S):
-            self.state.log("경로 이탈 감지 → 재라우팅")
-            self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
-            self._last_reroute_ts = time.time()
-            self._log_jsonl({"type": "event", "ts": time.time(), "event": "reroute",
-                              "lat": lat, "lon": lon,
-                              "route_latlon": self.map_builder.get_route_latlon(),
-                              "osrm_fallback": self.map_builder.last_osrm_fallback,
-                              "start_snap_m": self.map_builder.last_start_snap_m,
-                              "goal_snap_m": self.map_builder.last_goal_snap_m})
+            if dist_to_goal_m is not None and dist_to_goal_m <= REROUTE_DISABLE_NEAR_GOAL_M:
+                self.state.log(f"경로 이탈 감지했지만 목표 근처(dist={dist_to_goal_m:.1f}m ≤ "
+                                f"{REROUTE_DISABLE_NEAR_GOAL_M:.0f}m)라 재라우팅 생략")
+            else:
+                self.state.log("경로 이탈 감지 → 재라우팅")
+                self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
+                self._last_reroute_ts = time.time()
+                self._log_jsonl({"type": "event", "ts": time.time(), "event": "reroute",
+                                  "lat": lat, "lon": lon,
+                                  "route_latlon": self.map_builder.get_route_latlon(),
+                                  "osrm_fallback": self.map_builder.last_osrm_fallback,
+                                  "start_snap_m": self.map_builder.last_start_snap_m,
+                                  "goal_snap_m": self.map_builder.last_goal_snap_m})
         self.state.update(osrm_fallback=self.map_builder.last_osrm_fallback,
                            start_snap_m=self.map_builder.last_start_snap_m,
                            goal_snap_m=self.map_builder.last_goal_snap_m)
@@ -483,7 +546,20 @@ class OmniVLAEdgeDeployment:
     def _confirm_route_alignment(self):
         """대시보드 '정렬 확인' 버튼 → 여기로 옴 (_apply_pending_commands()가 호출).
         route의 "현재 위치 바로 앞" tangent(INITIAL_HEADING_LOOKAHEAD_M)를 계산해서
-        _route_aligned_heading_rad로 고정 — _heading_ema_vec는 절대 건드리지 않음."""
+        _route_aligned_heading_rad로 고정.
+
+        2026-09-26 실외 테스트 중 발견한 문제로 추가: 원래는 "_heading_ema_vec는
+        절대 안 건드림"이었는데, DRY_RUN으로 오래 관찰하는 동안 로봇이 실제로는
+        정지해 있어도 GPS 수신 잡음(drift)만으로 estimate_heading_from_track()의
+        최소 이동거리(1.5m) 임계값을 우연히 넘겨서 _heading_ema_vec가 이미
+        "실측(gps_track)"으로 오염된 채 확정돼 있는 경우가 실측 확인됨 — 이러면
+        heading 분기 우선순위(gps_track/gps_ema_hold가 route_aligned보다 항상 우선)
+        때문에 몇 번을 다시 정렬 확인해도 실제로는 절대 반영되지 않는 문제였음.
+        그래서 정렬 확인 시점에 _heading_ema_vec와 past_track을 함께 리셋한다 —
+        past_track도 같이 비워야 하는 이유: 안 비우면 다음 tick에 남아있는 그
+        "잡음 이력"으로 estimate_heading_from_track()이 즉시 다시 값을 반환해서
+        EMA가 바로 재오염됨(리셋이 사실상 무의미해짐). 확정 시점 이후의 "진짜 새"
+        이동만 다시 GPS heading을 확립할 수 있게 된다."""
         if not self._route_initialized:
             self.state.log_error("정렬 확인 거부됨 — route가 아직 초기화되지 않음 "
                                   "(유효한 GPS fix를 먼저 확보해야 함)")
@@ -492,20 +568,26 @@ class OmniVLAEdgeDeployment:
             self.state.log_error("정렬 확인 거부됨 — 유효한 GPS 위치가 없음")
             return
         bearing = self.map_builder.route_bearing_rad(
-            self._last_lat, self._last_lon, lookahead_m=INITIAL_HEADING_LOOKAHEAD_M)
+            self._last_lat, self._last_lon, lookahead_m=self.initial_heading_lookahead_m)
         if bearing is None:
             self.state.log_error("정렬 확인 거부됨 — route_bearing_rad()가 None 반환 "
                                   "(현재 위치가 route 끝 근처일 수 있음)")
             return
+        had_stale_ema = self._heading_ema_vec is not None
+        self._heading_ema_vec = None
+        self.past_track.clear()
         self._route_aligned_heading_rad = bearing
         self._route_aligned_confirmed_ts = time.time()
         deg = math.degrees(bearing)
         self.state.log(f"Route-aligned initial heading 확정: {deg:+.1f}° "
-                        f"(lookahead={INITIAL_HEADING_LOOKAHEAD_M}m)")
+                        f"(lookahead={self.initial_heading_lookahead_m}m)"
+                        + (" — 기존 GPS heading EMA/이력 초기화함(오염된 값이었을 수 있음)"
+                           if had_stale_ema else ""))
         self._log_jsonl({"type": "event", "ts": time.time(), "event": "route_alignment_confirmed",
                           "route_aligned_heading_deg": deg,
-                          "lookahead_m": INITIAL_HEADING_LOOKAHEAD_M,
-                          "lat": self._last_lat, "lon": self._last_lon})
+                          "lookahead_m": self.initial_heading_lookahead_m,
+                          "lat": self._last_lat, "lon": self._last_lon,
+                          "reset_stale_ema": had_stale_ema})
         self.state.update(route_aligned_heading_deg=deg)
 
     def _handle_command(self, cmd):
@@ -653,10 +735,27 @@ class OmniVLAEdgeDeployment:
             return 0.0, 0.0
         record["gps_fix_ok"] = True
 
+        # 2026-09-26 추가: goal 도착 감지 — route/heading/모델 계산과 무관하게
+        # GPS만으로 바로 확인 가능해서 여기서 가장 먼저 체크한다. 한 번 도착하면
+        # 절대 다시 안 풀림(latched) — 도착 후 GPS 잡음으로 threshold를 들락날락
+        # 해도 다시 움직이기 시작하지 않도록.
+        dist_to_goal_m = latlon_distance_m(lat, lon, self.goal_lat, self.goal_lon)
+        record["dist_to_goal_m"] = dist_to_goal_m
+        self.state.update(dist_to_goal_m=dist_to_goal_m)
+        if not self._goal_reached and dist_to_goal_m <= self.goal_reach_threshold_m:
+            self._goal_reached = True
+            self.state.log(f"🏁 목표 도착 감지 (거리={dist_to_goal_m:.2f}m ≤ "
+                            f"임계값={self.goal_reach_threshold_m:.2f}m) — 이후 영구 정지")
+            self._log_jsonl({"type": "event", "ts": time.time(), "tick_id": tick_id,
+                              "event": "goal_reached", "dist_to_goal_m": dist_to_goal_m,
+                              "lat": lat, "lon": lon,
+                              "goal_lat": self.goal_lat, "goal_lon": self.goal_lon})
+            self.state.update(goal_reached=True)
+
         # 2026-09-25: route(OSRM) 생성을 frame_buffer 준비 상태와 분리 — GPS fix가
         # 유효해지는 즉시 route가 생겨야 대시보드에서 route-aligned 정렬 확인이
         # frame_buffer(~1.5초)를 기다리지 않고 바로 가능함.
-        self._ensure_route_initialized(lat, lon)
+        self._ensure_route_initialized(lat, lon, dist_to_goal_m=dist_to_goal_m)
 
         self.maybe_update_frame_buffer(img)
         # 2026-09-25: context_frame_ids(정수)만으로는 파일 경로 규칙(replay_logger.py의
@@ -687,7 +786,23 @@ class OmniVLAEdgeDeployment:
         self.state.update(gps_accumulated_path_m=gps_accumulated_path_m,
                            gps_net_displacement_m=gps_net_displacement_m)
 
-        if gps_heading_rad is not None:
+        if self.heading_mode == "route_aligned_fixed" and self._route_aligned_heading_rad is not None:
+            # 2026-09-26 추가: --heading_mode route_aligned_fixed — 실외 테스트에서
+            # 정지/저속 구간의 GPS 잡음이 gps_track/gps_ema_hold를 계속 흔드는 문제가
+            # 실측됨(누적 이동거리/순변위가 어긋나는 지그재그 패턴, heading이 100°+
+            # 튐). 이 모드에서는 "정렬 확인"으로 고정한 route_aligned 값을 실측 GPS
+            # heading이 얼마나 들어오든 절대 넘겨주지 않고 런 내내 그대로 사용한다
+            # (gps_track/gps_ema_hold 분기 자체를 건너뜀 — _heading_ema_vec도 아예
+            # 안 건드려서 두 모드 상태가 서로 안 섞이게 함). gps_heading_deg는 위에서
+            # 이미 진단용으로만 로그에 남음(실제 heading에는 영향 없음).
+            map_heading_rad = self._route_aligned_heading_rad
+            smoothed_deg = math.degrees(map_heading_rad)
+            record["heading_diff_deg"] = None
+            record["smoothed_heading_deg"] = smoothed_deg
+            record["map_heading_source"] = "route_aligned"
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(미사용)  GPS궤적={record['gps_heading_deg']}"
+                  f"(참고용, 미반영)  route-aligned 고정(모드=route_aligned_fixed)={smoothed_deg:+7.1f}°")
+        elif gps_heading_rad is not None:
             is_first_real_acquisition = self._heading_ema_vec is None  # 2026-09-25: 전환 로그용
             new_vec = complex(math.cos(gps_heading_rad), math.sin(gps_heading_rad))
             if self._heading_ema_vec is None:
@@ -849,9 +964,13 @@ class OmniVLAEdgeDeployment:
                 #      마지막 방어선. 이번 실험에서는 GO 전에 반드시 route-align을 먼저
                 #      확정하므로 정상 흐름에서는 이 조건이 걸릴 일이 없어야 함 — 걸린다면
                 #      그 자체가 "정렬을 안 하고 GO LIVE를 눌렀다"는 신호.
+                #   3. (2026-09-26 추가) 아직 목표에 도착하지 않았어야 함(_goal_reached
+                #      래치) — 이전엔 목표 근처에 도달해도 계속 명령이 나가던 실제 갭.
                 heading_trustworthy = self._last_map_heading_source != "imu_fallback"
                 is_live = self.control_stage == "LIVE"
-                sent_linear, sent_angular = (linear, angular) if (is_live and heading_trustworthy) else (0.0, 0.0)
+                sent_linear, sent_angular = ((linear, angular)
+                                              if (is_live and heading_trustworthy and not self._goal_reached)
+                                              else (0.0, 0.0))
                 t_ctrl = time.time()
                 control_status = self.send_control(sent_linear, sent_angular)
                 control_latency_ms = (time.time() - t_ctrl) * 1000.0
@@ -861,6 +980,7 @@ class OmniVLAEdgeDeployment:
                                   "latency_ms": round(control_latency_ms, 1),
                                   "control_stage": self.control_stage,
                                   "heading_trustworthy": heading_trustworthy,
+                                  "goal_reached": self._goal_reached,
                                   "map_heading_source": self._last_map_heading_source,
                                   "dry_run": not is_live,
                                   "computed_linear": linear, "computed_angular": angular})
@@ -872,9 +992,10 @@ class OmniVLAEdgeDeployment:
                 self.state.update(linear=sent_linear, angular=sent_angular, loop_hz=loop_hz,
                                    control_latency_ms=round(control_latency_ms, 1),
                                    computed_linear=linear, computed_angular=angular)
-                prefix = "[LIVE] " if is_live else f"[{self.control_stage}] "
+                prefix = "[GOAL REACHED] " if self._goal_reached else ("[LIVE] " if is_live else f"[{self.control_stage}] ")
+                show_computed = not (is_live and not self._goal_reached)
                 print(f"  {prefix}linear={sent_linear:+.3f} m/s  angular={sent_angular:+.3f} rad/s"
-                      + ("" if is_live else f"  (계산값: linear={linear:+.3f} angular={angular:+.3f})")
+                      + (f"  (계산값: linear={linear:+.3f} angular={angular:+.3f})" if show_computed else "")
                       + f"  [/control {control_latency_ms:.0f}ms]")
                 time.sleep(max(0.0, DT - elapsed))
         except KeyboardInterrupt:
@@ -903,11 +1024,30 @@ if __name__ == "__main__":
                         "DRY_RUN 상태로 시작하며, 실제 로봇에 명령이 나가려면 대시보드에서 "
                         "'정렬 확인' → 'ARM' → 'GO LIVE'를 명시적으로 눌러야 함 (재시작 불필요, "
                         "같은 프로세스 안에서 frame_buffer/GPS 궤적/heading 상태 그대로 유지).")
+    p.add_argument("--heading_mode", type=str, default="auto",
+                   choices=["auto", "route_aligned_fixed"],
+                   help="auto(기본) = 정렬 확인은 실측 GPS heading이 잡히기 전까지의 "
+                        "임시값일 뿐, 실측(gps_track)이 확보되면 자동으로 전환됨(기존 동작). "
+                        "route_aligned_fixed = 정렬 확인으로 고정한 값을 런 내내 그대로 "
+                        "사용, 이후 GPS 궤적이 얼마나 잡히든 절대 안 넘어감 — 저속/근거리 "
+                        "구간에서 GPS 잡음이 gps_track을 계속 흔드는 문제의 대안.")
+    p.add_argument("--goal_reach_threshold_m", type=float, default=DEFAULT_GOAL_REACH_THRESHOLD_M,
+                   help=f"목표까지 이 거리(m) 이내로 들어오면 도착으로 간주하고 영구 정지 "
+                        f"(기본 {DEFAULT_GOAL_REACH_THRESHOLD_M}m). 한 번 도착하면 다시 안 풀림.")
+    p.add_argument("--initial_heading_lookahead_m", type=float, default=INITIAL_HEADING_LOOKAHEAD_M,
+                   help=f"'정렬 확인' 시 route tangent를 계산하는 lookahead 거리(m) "
+                        f"(기본 {INITIAL_HEADING_LOOKAHEAD_M}m). 목표 근처처럼 경로가 국소적으로 "
+                        f"꺾이는 구간에서 짧은 값이 실제 진행 방향과 크게 어긋난 heading을 "
+                        f"고정시키는 사고가 실측됨(2026-09-26) — 그런 구간에서 정렬 확인이 "
+                        f"필요하면 이 값을 5~10m로 늘려서 국소 꺾임에 덜 민감하게 만들 것.")
     args = p.parse_args()
 
     deployer = OmniVLAEdgeDeployment(
         ckpt_path=args.ckpt, map_range_m=args.map_range,
         goal_lat=args.goal_lat, goal_lon=args.goal_lon,
         debug_port=args.debug_port, dry_run=args.dry_run,
+        heading_mode=args.heading_mode,
+        goal_reach_threshold_m=args.goal_reach_threshold_m,
+        initial_heading_lookahead_m=args.initial_heading_lookahead_m,
     )
     deployer.run()

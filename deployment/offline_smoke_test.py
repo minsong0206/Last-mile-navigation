@@ -121,11 +121,16 @@ def _base_gps(lat, lon, orientation=192.0):
     )
 
 
-def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks):
+def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto",
+                   goal_lat=None, goal_lon=None, goal_reach_threshold_m=dep.DEFAULT_GOAL_REACH_THRESHOLD_M,
+                   initial_heading_lookahead_m=dep.INITIAL_HEADING_LOOKAHEAD_M):
     deployer = dep.OmniVLAEdgeDeployment(
         ckpt_path=str(CKPT_PATH), map_range_m=20.0,
-        goal_lat=GOAL_LAT, goal_lon=GOAL_LON,
-        debug_port=0, dry_run=dry_run_lock,
+        goal_lat=goal_lat if goal_lat is not None else GOAL_LAT,
+        goal_lon=goal_lon if goal_lon is not None else GOAL_LON,
+        debug_port=0, dry_run=dry_run_lock, heading_mode=heading_mode,
+        goal_reach_threshold_m=goal_reach_threshold_m,
+        initial_heading_lookahead_m=initial_heading_lookahead_m,
     )
     tick_count = [0]
     real_step = deployer.step
@@ -345,8 +350,212 @@ def test_c_arm_without_alignment():
     print("[OK] 실제 전송값 전부 (0,0)")
 
 
+# ── test D: heading_mode=route_aligned_fixed — 실측 GPS가 잡혀도 절대 안 넘어감 ──
+def test_d_route_aligned_fixed_mode():
+    print("\n========== test_d_route_aligned_fixed_mode ==========")
+    camera_frames = _load_camera_frames() * 3
+    n_ticks = 22
+
+    gps_sequence = [_base_gps(1000, 1000)] * 2
+    for _ in range(8):
+        gps_sequence.append(_base_gps(BASE_LAT, BASE_LON))
+    # test_b와 동일하게 이후 실제로 계속 이동(1.5m 임계값을 넉넉히 넘기는 시나리오)
+    for i in range(12):
+        gps_sequence.append(_base_gps(BASE_LAT - (i + 1) * 0.00001, BASE_LON - (i + 1) * 0.000005))
+
+    fake_get, fake_post, call_state = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), \
+         mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=False, n_ticks=n_ticks,
+                                  heading_mode="route_aligned_fixed")
+        real_step = deployer.step
+        tick_count = [0]
+
+        def wrapped():
+            t = tick_count[0]
+            if t == 4:
+                deployer._pending_commands.put("confirm_alignment")
+            if t == 6:
+                deployer._pending_commands.put("arm")
+            if t == 7:
+                deployer._pending_commands.put("go_live")
+            tick_count[0] += 1
+            return real_step()
+
+        deployer.step = wrapped
+        deployer.run()
+
+    logs = _read_jsonl(deployer.log_path)
+    steps = [l for l in logs if l["type"] == "step"]
+
+    align_events = [l for l in logs if l.get("event") == "route_alignment_confirmed"]
+    assert len(align_events) == 1
+    route_aligned_deg = align_events[0]["route_aligned_heading_deg"]
+    print(f"[OK] route_alignment_confirmed 1회, heading={route_aligned_deg:+.1f}°")
+
+    # 핵심 검증: route_aligned_fixed 모드에서는 실측 GPS 이동이 충분히 누적돼도
+    # (test_b와 동일한 이동 시퀀스) heading_source_transition이 절대 발생하면 안 됨,
+    # 그리고 확정 이후 모든 tick의 map_heading_source가 route_aligned로 고정돼야 함.
+    transitions = [l for l in logs if l.get("event") == "heading_source_transition"]
+    assert len(transitions) == 0, \
+        f"route_aligned_fixed 모드인데 heading_source_transition이 발생함: {transitions}"
+    print("[OK] heading_source_transition 이벤트 없음 (실측 GPS가 잡혀도 전환 안 됨)")
+
+    after_confirm_steps = [s for s in steps if s["ts"] >= align_events[0]["ts"]
+                            and s.get("map_heading_source") is not None]
+    sources = {s["map_heading_source"] for s in after_confirm_steps}
+    assert sources == {"route_aligned"}, \
+        f"정렬 확인 이후 map_heading_source가 route_aligned 외의 값을 포함함: {sources}"
+    print(f"[OK] 정렬 확인 이후 {len(after_confirm_steps)}개 tick 전부 map_heading_source=route_aligned "
+          f"(gps_heading_deg는 로그에 참고용으로 계속 기록됨: "
+          f"{[s.get('gps_heading_deg') for s in after_confirm_steps[-3:]]})")
+
+    # smoothed_heading_deg(실제 map heading)이 확정값과 정확히 동일하게 유지되는지
+    # (오염/드리프트 없이 진짜 "고정"인지)
+    smoothed_vals = {round(s["smoothed_heading_deg"], 6) for s in after_confirm_steps}
+    assert smoothed_vals == {round(route_aligned_deg, 6)}, \
+        f"고정 모드인데 smoothed_heading_deg가 흔들림: {smoothed_vals}"
+    print(f"[OK] smoothed_heading_deg가 확정값({route_aligned_deg:+.1f}°)과 전부 정확히 일치 (진짜 고정 확인)")
+
+    print(f"[OK] 로그 파일: {deployer.log_path}")
+
+
+# ── test E: goal 도착 시 영구 정지 ────────────────────────────────────────────
+def test_e_goal_reached_stop():
+    print("\n========== test_e_goal_reached_stop ==========")
+    camera_frames = _load_camera_frames() * 3
+    n_ticks = 22
+    THRESH_M = 2.0
+
+    gps_sequence = [_base_gps(1000, 1000)] * 2
+    for _ in range(8):
+        gps_sequence.append(_base_gps(BASE_LAT, BASE_LON))
+    move_points = [(BASE_LAT - (i + 1) * 0.00001, BASE_LON - (i + 1) * 0.000005) for i in range(12)]
+    for lat, lon in move_points:
+        gps_sequence.append(_base_gps(lat, lon))
+
+    # 목표를 이동 경로의 8번째 지점(정확히 그 좌표)으로 설정 -- 그 지점을
+    # 지나는 순간 임계값(2.0m) 안쪽으로 들어와야 하고, 그 이후 조금 더
+    # 이동해서(9~12번째) 계속 latched 상태인지 확인 가능.
+    goal_lat, goal_lon = move_points[7]
+
+    fake_get, fake_post, call_state = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), \
+         mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=False, n_ticks=n_ticks,
+                                  goal_lat=goal_lat, goal_lon=goal_lon,
+                                  goal_reach_threshold_m=THRESH_M)
+        real_step = deployer.step
+        tick_count = [0]
+
+        def wrapped():
+            t = tick_count[0]
+            if t == 4:
+                deployer._pending_commands.put("confirm_alignment")
+            if t == 6:
+                deployer._pending_commands.put("arm")
+            if t == 7:
+                deployer._pending_commands.put("go_live")
+            tick_count[0] += 1
+            return real_step()
+
+        deployer.step = wrapped
+        deployer.run()
+
+    logs = _read_jsonl(deployer.log_path)
+    steps = [l for l in logs if l["type"] == "step"]
+    controls = [l for l in logs if l["type"] == "control_sent"]
+
+    goal_events = [l for l in logs if l.get("event") == "goal_reached"]
+    assert len(goal_events) == 1, f"goal_reached 이벤트가 정확히 1번이어야 함: {len(goal_events)}"
+    ge = goal_events[0]
+    assert ge["dist_to_goal_m"] <= THRESH_M
+    print(f"[OK] goal_reached 이벤트 1회, tick_id={ge['tick_id']}, dist={ge['dist_to_goal_m']:.3f}m "
+          f"(임계값 {THRESH_M}m)")
+
+    reached_tick_id = ge["tick_id"]
+
+    # 도착 이전 tick들: dist_to_goal_m가 기록되고, goal_reached=False였어야 함
+    before_steps = [s for s in steps if s["tick_id"] < reached_tick_id and "dist_to_goal_m" in s]
+    assert len(before_steps) > 0
+    assert all(s["dist_to_goal_m"] > THRESH_M for s in before_steps), \
+        "도착 이전 tick인데 이미 임계값 이내로 기록된 게 있음"
+    print(f"[OK] 도착 이전 {len(before_steps)}개 tick 전부 dist_to_goal_m > {THRESH_M}m")
+
+    # 도착 이후(그 tick 포함) 전송값은 전부 (0,0)이어야 함 -- LIVE에 heading도 정상이었더라도
+    # control_sent 레코드 자체엔 tick_id가 없으므로 시간(ts)으로 매칭
+    after_ts = ge["ts"]
+    after_controls = [c for c in controls if c["ts"] >= after_ts]
+    assert len(after_controls) > 0
+    assert all(c["linear"] == 0.0 and c["angular"] == 0.0 for c in after_controls), \
+        f"goal_reached 이후인데 non-zero 명령이 전송됨: {after_controls}"
+    assert all(c.get("goal_reached") is True for c in after_controls), \
+        "control_sent 레코드의 goal_reached 플래그가 True로 안 남음"
+    print(f"[OK] goal_reached 이후 {len(after_controls)}개 tick 전부 전송값 (0,0), "
+          f"control_sent.goal_reached=True 로그 확인")
+
+    # 도착 이후에도 computed_linear/angular는 계속 계산되고 있어야 함(래치가 계산
+    # 자체를 막는 게 아니라 전송만 막는지 확인 -- 대시보드에서 계속 관찰 가능해야 함)
+    nonzero_computed_after = [c for c in after_controls if c["computed_linear"] != 0 or c["computed_angular"] != 0]
+    print(f"[OK] goal_reached 이후에도 {len(nonzero_computed_after)}/{len(after_controls)}개 tick에서 "
+          f"computed_linear/angular는 계속 계산됨(전송만 차단, 계산은 안 막음)")
+
+    status = deployer.state.snapshot_status()
+    assert status["goal_reached"] is True
+    print(f"[OK] 대시보드 상태 goal_reached=True, dist_to_goal_m={status['dist_to_goal_m']:.3f}m")
+
+    print(f"[OK] 로그 파일: {deployer.log_path}")
+
+
+# ── test F: --initial_heading_lookahead_m이 실제로 반영되는지 ────────────────
+def test_f_initial_heading_lookahead_configurable():
+    print("\n========== test_f_initial_heading_lookahead_configurable ==========")
+    camera_frames = _load_camera_frames() * 3
+    n_ticks = 6
+    gps_sequence = [_base_gps(1000, 1000)] * 2
+    gps_sequence += [_base_gps(BASE_LAT, BASE_LON)] * n_ticks
+
+    results = {}
+    for lookahead in (2.0, 8.0):
+        fake_get, fake_post, _ = build_fake_requests(camera_frames, gps_sequence)
+        with mock.patch("requests.get", side_effect=fake_get), \
+             mock.patch("requests.post", side_effect=fake_post):
+            deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=n_ticks,
+                                      initial_heading_lookahead_m=lookahead)
+            real_step = deployer.step
+            tick_count = [0]
+
+            def wrapped():
+                if tick_count[0] == 3:
+                    deployer._pending_commands.put("confirm_alignment")
+                tick_count[0] += 1
+                return real_step()
+
+            deployer.step = wrapped
+            deployer.run()
+
+        logs = _read_jsonl(deployer.log_path)
+        align_events = [l for l in logs if l.get("event") == "route_alignment_confirmed"]
+        assert len(align_events) == 1
+        assert align_events[0]["lookahead_m"] == lookahead, \
+            f"확정 이벤트에 기록된 lookahead_m({align_events[0]['lookahead_m']})이 " \
+            f"실제로 넘긴 값({lookahead})과 다름 -- 파라미터가 안 먹힘"
+        results[lookahead] = align_events[0]["route_aligned_heading_deg"]
+        print(f"[OK] lookahead={lookahead}m -> 확정된 heading={results[lookahead]:+.2f}° "
+              f"(로그에도 lookahead_m={lookahead} 그대로 기록됨)")
+
+    # 이 테스트의 route 형태(직선 GPS 경로)에선 값이 같을 수도 있지만, 최소한
+    # "요청한 lookahead 값 그대로가 실제로 route_bearing_rad()에 전달되고 로그에
+    # 남는다"는 건 위 assert로 이미 확인됨 -- 핵심은 파라미터 배관(plumbing) 검증.
+    print(f"[OK] 파라미터가 생성자 -> _confirm_route_alignment() -> route_bearing_rad()까지 "
+          f"실제로 전달됨을 확인 (2.0m: {results[2.0]:+.2f}°, 8.0m: {results[8.0]:+.2f}°)")
+
+
 if __name__ == "__main__":
     test_a_dry_run_lock()
     test_b_full_workflow()
     test_c_arm_without_alignment()
+    test_d_route_aligned_fixed_mode()
+    test_e_goal_reached_stop()
+    test_f_initial_heading_lookahead_configurable()
     print("\n모든 오프라인 스모크 테스트 통과.")
