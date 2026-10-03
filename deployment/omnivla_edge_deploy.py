@@ -98,8 +98,13 @@ from model_omnivla_edge_odom import OmniVLA_edge_odom
 from build_live_map import LiveMapBuilder
 from debug_web import DeploymentState, start_debug_server
 from replay_logger import ReplayLogger
+from dashboard_capture import DashboardRecorder
 
 FRODOBOT_BASE = "http://127.0.0.1:8000"
+
+# 2026-10-03 추가: GO LIVE 시점에 보이는 웹 대시보드를 자동으로 스크린샷해서 남기는
+# 폴더 — 발표/기록용(디버그 재현용은 아님, 그건 replay_logger.py가 이미 더 정확하게 함).
+DASHBOARD_CAPTURE_DIR = REPO_ROOT / "1003"
 
 # rides11_dataset.py와 동일한 학습 시 상수
 N_CTX = 5
@@ -139,6 +144,29 @@ DT    = 1.0 / 3.0  # 제어 루프 주기 (3Hz) — waypoint_to_control()에서�
 # 순간적인 IMU 폴백으로 스냅되지 않게. ALPHA가 작을수록 더 안정적이지만 실제 방향
 # 전환에 더 느리게 반응함.
 HEADING_EMA_ALPHA = 0.3
+
+# 2026-10-03 추가: 틱당 heading 변화량 상한(rate limit). 실측(deploy_20261003_143500.jsonl,
+# 10~20m "턴 구간")에서 route_bearing_deg는 164.83°로 고정인데 smoothed_heading_deg는
+# -133°→-111°→-158°→-114°→-175°→+172°→+141°→... 식으로 틱마다 수십 도씩 흔들리는 걸
+# 확인함 — 그 결과 지도가 매번 다른 각도로 회전되어 그려지고, 모델 예측도 따라서
+# 좌/우로 계속 튐(사용자 관찰). 로봇이 실제로 한 틱(dt) 사이에 물리적으로 돌 수 있는
+# 최대 각도는 로봇 자신의 MAX_W로 이미 정해져 있으므로, 그보다 큰 변화는 추정 잡음으로
+# 보고 EMA에 입력하기 전에 clamp한다. HEADING_RATE_LIMIT_MARGIN은 실제 물리적 동역학/
+# 센서 지연 여유분(2배) — 이 마진 적용해도 10~20m 구간에서 관측된 수십~100도대 틱당
+# 점프는 전부 걸러짐.
+HEADING_RATE_LIMIT_MARGIN = 2.0
+
+# 2026-10-03 추가: heading이 route_bearing과 지속적으로 크게 어긋나면(=GPS 추정이 계속
+# 틀린 채로 "자신있게" 주행) route_bearing 쪽으로 강제 재동기화한다. 기존엔
+# heading_route_diff_deg가 대시보드/로그용 진단 수치일 뿐 실제 heading엔 전혀 반영이
+# 안 됐음 — 그래서 한 번 틀어지면 스스로 못 돌아왔음(사용자 관찰: "틀어진 방향을
+# 직진이라 믿고 주행해서 목표에 제대로 도달 못 함"). 단발성 노이즈가 아니라 "지속적"
+# 어긋남만 보정 대상으로 삼기 위해 PERSIST_TICKS 연속으로 넘어야 발동 — 위 rate limit과
+# 합쳐서, 짧은 노이즈는 rate limit이, 오래가는 진짜 오차는 이 재동기화가 맡는 구조.
+# route_aligned_fixed 모드/부트스트랩 단계(아직 gps_track 실측 전)에는 적용 안 함 —
+# 그쪽은 의도적으로 고정/보류된 값이라 건드리면 그 모드의 존재 이유 자체가 없어짐.
+HEADING_ROUTE_CORRECTION_THRESHOLD_DEG = 45.0
+HEADING_ROUTE_CORRECTION_PERSIST_TICKS = 5
 
 # 2026-09-18: is_off_route() 임계값을 15m→3m로 낮췄더니, OSRM이 자체적으로 요청 좌표를
 # 가장 가까운 매핑된 길(way)로 "스냅"하는 거리가 그보다 큰 지점(예: 매핑된 보행로가 없는
@@ -221,6 +249,19 @@ LAT_M = 111320.0  # 위도 1도당 미터 (근거리 근사)
 MIN_NET_DISP_M = 0.3  # "거의 정지"만 걸러내는 순변위 하한 (min_disp_m보다 훨씬 작음)
 DEFAULT_GOAL_REACH_THRESHOLD_M = 2.0  # 이 거리 이내면 도착으로 간주하고 영구 정지
 
+# 2026-10-03 추가 (Harness 1의 §1-8 분석, experiment_log.md 참고): future-route가
+# 화면상 bbox_h<~25px(27m 체크포인트 기준)로 짧아지면, 실제 지도 내용(곡률 유무·
+# 방향)과 완전히 무관하게 모델이 결정론적으로 좌회전함(실측: 직선 경로 177/177,
+# 실제 우회전 경로에서도 26:2·22:2). 곡률 압축이 아니라 "짧은 future-route 선분"
+# 자체가 트리거인 OOD 현상으로 보임(근본원인은 §1-3 학습데이터 분석이 Arrow 접근
+# 풀려야 확정 — 이 상수는 재학습 전까지의 완화책).
+# 27m 체크포인트에서 bbox_h<25px가 실측 dist_to_goal_m 대략 7-8m에 대응(직접 측정,
+# bbox_h-거리 관계가 근거리에서 비선형이라 공식 환산이 아니라 실측값 사용) — 8.0m로
+# 약간 보수적으로 잡음(25-40px 구간은 아직 실제 내용을 어느 정도 반영하는 것으로
+# 측정됨, §1-8 표 참고). **다른 map_range_m/체크포인트로 바꾸면 이 값도 재측정 필요**
+# — 공식(px/m 비율)으로 자동 환산하지 않는 이유는 위와 동일(비선형).
+DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M = 8.0
+
 
 def latlon_distance_m(lat1, lon1, lat2, lon2):
     """근거리 등적원통 근사 — 이 파일 전체(estimate_heading_from_track 등)와 동일한
@@ -230,7 +271,7 @@ def latlon_distance_m(lat1, lon1, lat2, lon2):
     return math.hypot(dlat, dlon)
 
 
-def estimate_heading_from_track(past_track, min_disp_m=1.5):
+def estimate_heading_from_track(past_track, min_disp_m=1.5, fast_disp_m=0.5, fast_disagree_deg=35.0):
     """로봇이 실제로 지나온 GPS 궤적(past_track)에서 진행방향을 추정.
     osm_map_generator_rides11.py::estimate_headings()와 동일한 공식(atan2(북쪽성분, 동쪽성분),
     East=0/North=+90 CCW) — 학습 데이터의 heading이 바로 이 방식으로 만들어졌음.
@@ -253,13 +294,31 @@ def estimate_heading_from_track(past_track, min_disp_m=1.5):
     계속 잘못된 방향으로 그려짐. cum_m으로 이미 "양자화 잡음 평균화" 조건(min_disp_m 이상
     경로를 거슬러 올라감)을 충족했다면, 마지막 체크는 "순변위가 거의 0인 진짜 정지 상태"만
     걸러내면 되므로 훨씬 작은 MIN_NET_DISP_M로 완화. cum_m이 min_disp_m에 못 미친(이력
-    자체가 부족한) 경우엔 기존처럼 min_disp_m 그대로 요구."""
+    자체가 부족한) 경우엔 기존처럼 min_disp_m 그대로 요구.
+
+    2026-10-03 추가 (fast_disp_m/fast_disagree_deg): 위 1.5m 고정 창은 실제로 막
+    꺾은 직후에도 "꺾기 전" 방향을 새로 1.5m 이동이 쌓일 때까지(저속 구간에서는
+    수 초~십수 초) 계속 돌려주는 지연(lag)이 있음을 실측으로 확인
+    (deploy_20261003_135403.jsonl — GPS 자체는 깨끗한데(net==accumulated)
+    heading_route_diff_deg가 75°→105°로 29틱 연속 벌어진 구간, 직진 후 우회전
+    테스트 경로의 실제 턴 구간과 일치). 자이로 적분으로 고치려 했으나
+    SDK가 주는 자이로 버스트가 tick 간격의 16~25%만 커버해서 부호조차 IMU 델타와
+    무상관(51~58% 일치, 동전던지기 수준) — 데이터 커버리지 문제라 포기함
+    (estimate_yaw_delta_from_gyro()는 남겨두되 USE_GYRO_FUSION=False 유지).
+
+    대신 뒤로 거슬러 올라가는 같은 루프 안에서 "짧은 창"(fast_disp_m, 기본 0.5m —
+    양자화 잡음 한 스텝(~0.42m)보다는 커야 함)의 방향도 같이 계산해둔다. 긴 창
+    결과와 fast_disagree_deg(기본 35°) 이상 벌어지고, 짧은 창 자체도 순변위가
+    MIN_NET_DISP_M을 넘어 신뢰할 만하면 짧은 창 쪽(최근 방향)을 대신 채택 — 그 외
+    (방향이 일치하거나 짧은 창이 아직 불충분)에는 기존 긴 창 그대로 사용해서
+    직진 구간의 잡음 평균화 효과는 그대로 유지한다."""
     if len(past_track) < 2:
         return None
     lat_end, lon_end = past_track[-1]
     lat_start, lon_start = past_track[-2]
     cum_m = 0.0
     reached_min_path = False
+    fast_fix = None  # (lat, lon) at the point where cum_m first reaches fast_disp_m
     for i in range(len(past_track) - 2, -1, -1):
         lat_a, lon_a = past_track[i]
         lat_b, lon_b = past_track[i + 1]
@@ -267,6 +326,8 @@ def estimate_heading_from_track(past_track, min_disp_m=1.5):
         dlon = (lon_b - lon_a) * LAT_M * math.cos(math.radians(lat_a))
         cum_m += math.hypot(dlat, dlon)
         lat_start, lon_start = lat_a, lon_a
+        if fast_fix is None and cum_m >= fast_disp_m:
+            fast_fix = (lat_a, lon_a)
         if cum_m >= min_disp_m:
             reached_min_path = True
             break
@@ -276,7 +337,19 @@ def estimate_heading_from_track(past_track, min_disp_m=1.5):
     required_m = MIN_NET_DISP_M if reached_min_path else min_disp_m
     if net_disp_m < required_m:
         return None
-    return math.atan2(dlat, dlon)
+    long_heading = math.atan2(dlat, dlon)
+
+    if fast_fix is not None:
+        flat, flon = fast_fix
+        fdlat = (lat_end - flat) * LAT_M
+        fdlon = (lon_end - flon) * LAT_M * math.cos(math.radians(flat))
+        fast_net_disp_m = math.hypot(fdlat, fdlon)
+        if fast_net_disp_m >= MIN_NET_DISP_M:
+            fast_heading = math.atan2(fdlat, fdlon)
+            diff_deg = (math.degrees(fast_heading - long_heading) + 180) % 360 - 180
+            if abs(diff_deg) >= fast_disagree_deg:
+                return fast_heading
+    return long_heading
 
 
 def gps_heading_readiness(past_track, min_disp_m=1.5):
@@ -318,11 +391,26 @@ def clip_control(linear_vel, angular_vel, maxv=MAX_V, maxw=MAX_W):
     return maxw * np.sign(linear_vel) * abs(rd), maxw * np.sign(angular_vel)
 
 
+def route_bearing_to_control(route_bearing_rad, map_heading_rad, target_time_s):
+    """2026-10-03 추가(Harness 1 §1-8/§3-1 제안) — near-goal 구간(future-route가
+    화면상 너무 짧아져서 모델 raw 출력을 못 믿는 구간, DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M
+    참고)에서 waypoint_to_control()의 모델 예측 대신 쓰는 대체 조향. "route_bearing
+    방향으로 target_time_s 뒤에 도착한다"는 가상 목표를 가정하고 같은 atan2/시간분모
+    방식(waypoint_to_control()과 동일한 target_time_s, 보통 target_step=2의 2.1초)으로
+    변환 — 모델 추론 없이 route_bearing_rad()(GPS 궤적 기반 목표 방향, 이미 매 틱
+    계산됨)만으로 산출 가능."""
+    diff = (route_bearing_rad - map_heading_rad + math.pi) % (2 * math.pi) - math.pi
+    angular = diff / target_time_s
+    return float(np.clip(MAX_V, 0, MAX_V * 2)), float(np.clip(angular, -MAX_W * 2, MAX_W * 2))
+
+
 class OmniVLAEdgeDeployment:
     def __init__(self, ckpt_path, map_range_m, goal_lat, goal_lon, device=None,
                  debug_port=8080, dry_run=False, heading_mode="auto",
                  goal_reach_threshold_m=DEFAULT_GOAL_REACH_THRESHOLD_M,
-                 initial_heading_lookahead_m=INITIAL_HEADING_LOOKAHEAD_M):
+                 initial_heading_lookahead_m=INITIAL_HEADING_LOOKAHEAD_M,
+                 allow_reroute=False,
+                 near_goal_override_dist_m=DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M):
         # 2026-09-25: --dry_run의 의미가 "이 프로세스는 GO LIVE 자체를 영구히
         # 거부하는 하드 락"으로 바뀜(순수 검증 세션용). 기본(플래그 없음)은
         # DRY_RUN 상태로 시작하되, 대시보드에서 정렬확인→ARM→GO LIVE를 거치면
@@ -348,9 +436,24 @@ class OmniVLAEdgeDeployment:
             f"알 수 없는 heading_mode: {heading_mode!r}"
         self.heading_mode = heading_mode
 
+        # run_id를 여기서 미리 만들어서 JSONL 로그/ReplayLogger(아래)와 대시보드
+        # 녹화 파일(dashboard_capture.py)이 같은 이름을 공유하게 함.
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
         self.state = DeploymentState()
+        self.debug_port = debug_port
+        self._dashboard_recorder = None
         if debug_port:
             start_debug_server(self.state, self._pending_commands, port=debug_port)
+            # 2026-10-03: GO LIVE 순간 PNG 한 장 대신, 프로세스 시작(대시보드가 뜨는
+            # 즉시)부터 run() 종료(finally)까지 전체를 동영상으로 녹화 — 주행 전체
+            # 과정을 나중에 다시 볼 수 있게. 실패해도(Chrome 없음 등) best-effort라
+            # 제어 루프에 영향 없음(DashboardRecorder 자체 안전설계 참고).
+            self._dashboard_recorder = DashboardRecorder(
+                debug_port, DASHBOARD_CAPTURE_DIR, run_id,
+                on_done=lambda p, n: self.state.log(f"대시보드 녹화 저장됨: {p} ({n}프레임)"),
+                on_error=lambda e: self.state.log_error(f"대시보드 녹화 실패(무시하고 계속): {e!r}"),
+            ).start()
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = OmniVLA_edge_odom(**MODEL_PARAMS)
@@ -372,6 +475,12 @@ class OmniVLAEdgeDeployment:
         self.goal_reach_threshold_m = goal_reach_threshold_m
         self._goal_reached = False
 
+        # 2026-10-03 추가 (Harness 1 §1-8/§3-1): 이 거리 이내에서는 모델 raw 출력
+        # 대신 route_bearing_to_control()로 대체 — 위 DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M
+        # 상수 설명 참고. 0 이하로 주면 완전히 비활성화(순수 모델 출력만 사용,
+        # 기존 동작) — 비교 테스트용으로 남겨둠.
+        self.near_goal_override_dist_m = near_goal_override_dist_m
+
         # 2026-09-26 추가: INITIAL_HEADING_LOOKAHEAD_M을 CLI로 조절 가능하게 함 —
         # 실제 주행에서 목표 근처(dist_to_goal≈6.9m)에서 정렬 확인을 눌렀더니,
         # 짧은 2m lookahead가 마침 경로가 꺾이는 지점 근처를 잡아서 실제 경로 방향
@@ -380,6 +489,14 @@ class OmniVLAEdgeDeployment:
         # 아직 안 넣었고(다음 라운드), 우선 이 값을 늘려서(예: 5.0m 이상) 국소적인
         # 꺾임에 덜 민감하게 만들 수 있도록 임시로 조절 가능하게만 함.
         self.initial_heading_lookahead_m = initial_heading_lookahead_m
+
+        # 2026-09-26 추가: 재라우팅 기본 비활성화 — 목표에서 16m 넘게 떨어진 거의
+        # 정지 상태에서도 is_off_route()가 쿨다운마다 계속 True를 반환해 reroute가
+        # 9번 연속 발생하고, 그때마다 OSRM이 다른 경로를 반환해 route_bearing_deg가
+        # 요동치는 문제가 실측됨(deploy_20260926_163849.jsonl). 최초 route_init만
+        # 쓰고 런 내내 고정하는 쪽을 기본값으로 바꿈 — 상세 근거는
+        # _ensure_route_initialized() 참고.
+        self.allow_reroute = allow_reroute
 
         self.obs_transform = transforms.Compose([
             transforms.Resize((96, 96)),
@@ -401,6 +518,11 @@ class OmniVLAEdgeDeployment:
         # wraparound(-180/+180 경계)를 다뤄야 하므로 벡터로 평균낸 뒤 각도를 복원함)
         self._heading_ema_vec = None
 
+        # 2026-10-03 추가: heading_route_diff_deg가 HEADING_ROUTE_CORRECTION_THRESHOLD_DEG를
+        # 넘은 채 연속으로 몇 틱째인지 — HEADING_ROUTE_CORRECTION_PERSIST_TICKS 도달 시
+        # route_bearing으로 강제 재동기화.
+        self._heading_divergence_ticks = 0
+
         # 마지막 재라우팅 시각 (REROUTE_COOLDOWN_S 참고 — 무한 재라우팅 스팸 방지)
         self._last_reroute_ts = 0.0
 
@@ -421,9 +543,9 @@ class OmniVLAEdgeDeployment:
         self._last_map_heading_source = None            # step()이 매 틱 갱신, run()의 heading-readiness 게이트가 읽음
 
         # ── 데이터분석용 로그 (JSONL, 실행마다 날짜시간별 파일) ──
+        # run_id는 __init__ 맨 위에서 이미 만들어둠(대시보드 녹화 파일명과 공유).
         log_dir = REPO_ROOT / "deployment" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_path = log_dir / f"deploy_{run_id}.jsonl"
         self._log_fp = open(self.log_path, "a", buffering=1, encoding="utf-8")
         print(f"[deploy] 로그 저장 경로: {self.log_path}")
@@ -440,8 +562,10 @@ class OmniVLAEdgeDeployment:
             "ckpt_path": str(ckpt_path), "map_range_m": map_range_m,
             "goal_lat": goal_lat, "goal_lon": goal_lon, "dry_run_lock": self.dry_run_lock,
             "initial_heading_lookahead_m": self.initial_heading_lookahead_m,
+            "allow_reroute": self.allow_reroute,
             "heading_mode": self.heading_mode,
             "goal_reach_threshold_m": self.goal_reach_threshold_m,
+            "near_goal_override_dist_m": self.near_goal_override_dist_m,
             # 2026-09-25: 각 step 레코드의 context_frame_paths/map_replay_path를
             # 어떻게 실제 파일로 바꾸는지 — 별도 코드를 몰라도 이 JSONL 파일 하나만
             # 보고 알 수 있도록 규칙 자체를 데이터로 남겨둔다.
@@ -507,14 +631,25 @@ class OmniVLAEdgeDeployment:
         기다릴 이유가 없음). 지금은 GPS fix가 유효해지는 즉시(step()에서 frame_buffer
         조작보다 먼저) 호출됨.
 
-        2026-09-26 추가: 목표 근처(REROUTE_DISABLE_NEAR_GOAL_M 이내)에서는 재라우팅을
-        하지 않는다 — 실제 주행에서 목표 ~5.5m 앞 reroute가 OSRM 보행로망을 따라
-        헤어핀(왔다갔다) 형태의 새 경로를 만들어서, 이미 가까운데도 계획 경로상으로는
-        더 멀어지는 구간이 생겨 "도착 못 하고 계속 도는" 것처럼 보이는 문제가 실측됨
-        (deploy_20260926_132829.jsonl reroute 이벤트, route_latlon 궤적으로 직접 확인).
-        이 시점부턴 어차피 dist_to_goal_m 기반 도착 정지(goal_reach_threshold_m)가
-        곧 작동할 거리이므로, 경로를 다시 최적화할 필요가 없다 — 최초 route_init은
-        이 조건과 무관하게 항상 수행됨(그게 없으면 애초에 정렬 확인/주행 자체가 불가)."""
+        2026-09-26 추가(1차): 목표 근처(REROUTE_DISABLE_NEAR_GOAL_M 이내)에서는
+        재라우팅을 하지 않는다 — 실제 주행에서 목표 ~5.5m 앞 reroute가 OSRM
+        보행로망을 따라 헤어핀(왔다갔다) 형태의 새 경로를 만들어서, 이미 가까운데도
+        계획 경로상으로는 더 멀어지는 구간이 생겨 "도착 못 하고 계속 도는" 것처럼
+        보이는 문제가 실측됨(deploy_20260926_132829.jsonl reroute 이벤트,
+        route_latlon 궤적으로 직접 확인).
+
+        2026-09-26 추가(2차, self.allow_reroute): 목표에서 16m 넘게 떨어진, 로봇이
+        거의 정지해 있던 구간에서도 is_off_route()가 REROUTE_COOLDOWN_S(3초)마다
+        계속 True를 반환해서 reroute가 9번 연속 발생하고, 그때마다 OSRM이 서로
+        다른 경로를 반환해 route_bearing_deg가 로봇은 안 움직였는데 -14.6°→-105.3°→
+        -92.8°로 요동치는 문제가 실측됨(deploy_20260926_163849.jsonl). 즉 목표 근처만의
+        문제가 아니라 이 배포 환경에서 재라우팅 자체가 전반적으로 불안정함(2026-09-18에
+        기록된 "무한 재라우팅 폭주"와 같은 계열). 그래서 기본값을 "재라우팅 완전
+        비활성화"(최초 route_init만 사용, 런 내내 고정)로 바꾸고, 정말 필요한
+        경우에만 --allow_reroute로 기존 동작(이탈 감지 시 재계산)을 켤 수 있게 함.
+        REROUTE_DISABLE_NEAR_GOAL_M 로직은 --allow_reroute를 켠 경우에 한해 그대로
+        적용됨(목표 근처 보호는 여전히 유효). 최초 route_init은 이 옵션과 무관하게
+        항상 수행됨(그게 없으면 애초에 정렬 확인/주행 자체가 불가)."""
         if not self._route_initialized:
             self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
             self._route_initialized = True
@@ -524,7 +659,8 @@ class OmniVLAEdgeDeployment:
                               "osrm_fallback": self.map_builder.last_osrm_fallback,
                               "start_snap_m": self.map_builder.last_start_snap_m,
                               "goal_snap_m": self.map_builder.last_goal_snap_m})
-        elif (self.map_builder.is_off_route(lat, lon, threshold_m=3.0)
+        elif (self.allow_reroute
+                and self.map_builder.is_off_route(lat, lon, threshold_m=3.0)
                 and time.time() - self._last_reroute_ts >= REROUTE_COOLDOWN_S):
             if dist_to_goal_m is not None and dist_to_goal_m <= REROUTE_DISABLE_NEAR_GOAL_M:
                 self.state.log(f"경로 이탈 감지했지만 목표 근처(dist={dist_to_goal_m:.1f}m ≤ "
@@ -575,6 +711,7 @@ class OmniVLAEdgeDeployment:
             return
         had_stale_ema = self._heading_ema_vec is not None
         self._heading_ema_vec = None
+        self._heading_divergence_ticks = 0
         self.past_track.clear()
         self._route_aligned_heading_rad = bearing
         self._route_aligned_confirmed_ts = time.time()
@@ -621,6 +758,8 @@ class OmniVLAEdgeDeployment:
                                                    if self._route_aligned_heading_rad is not None else None),
                     "map_heading_source_at_go": self._last_map_heading_source,
                 })
+                # 대시보드 녹화는 __init__에서 프로세스 시작 시점부터 이미 돌고 있음
+                # (dashboard_capture.py::DashboardRecorder) — GO LIVE에서 따로 할 일 없음.
             else:
                 self.state.log_error(f"GO LIVE 거부됨 (ARMED 상태가 아님: {self.control_stage})")
         elif cmd == "abort":
@@ -786,6 +925,13 @@ class OmniVLAEdgeDeployment:
         self.state.update(gps_accumulated_path_m=gps_accumulated_path_m,
                            gps_net_displacement_m=gps_net_displacement_m)
 
+        # 2026-10-03 추가: 아래 route-bearing 재동기화에 쓰려고 미리 계산 — build_inputs()도
+        # 똑같은 걸(lookahead 기본값 5.0m) 다시 계산해서 self._last_route_bearing_rad에
+        # 저장하지만(디버그 필드용), 그건 heading 선택 이후에 호출되는 거라 여기서 따로
+        # 한 번 더 구해야 이번 tick의 heading 보정에 쓸 수 있음. route_bearing_rad() 자체는
+        # heading과 무관하게 (lat, lon)+캐싱된 route만 쓰는 순수 조회라 중복 호출 비용 작음.
+        route_bearing_rad_now = self.map_builder.route_bearing_rad(lat, lon)
+
         if self.heading_mode == "route_aligned_fixed" and self._route_aligned_heading_rad is not None:
             # 2026-09-26 추가: --heading_mode route_aligned_fixed — 실외 테스트에서
             # 정지/저속 구간의 GPS 잡음이 gps_track/gps_ema_hold를 계속 흔드는 문제가
@@ -804,6 +950,17 @@ class OmniVLAEdgeDeployment:
                   f"(참고용, 미반영)  route-aligned 고정(모드=route_aligned_fixed)={smoothed_deg:+7.1f}°")
         elif gps_heading_rad is not None:
             is_first_real_acquisition = self._heading_ema_vec is None  # 2026-09-25: 전환 로그용
+            # 2026-10-03 추가: rate limit — 첫 확보(시드)가 아니고 직전 tick 시각을 알 때만
+            # 적용(첫 확보는 "스냅"이 맞는 동작이라 제외). 로봇이 dt_s 동안 물리적으로 돌 수
+            # 있는 최대 각도(MAX_W*dt_s*마진)보다 raw 추정값이 더 크게 벌어져 있으면, 그
+            # 한계까지만 이동한 지점을 입력으로 씀 — 한 번에 안 꺾이고 몇 틱에 걸쳐 수렴.
+            if self._heading_ema_vec is not None and self._prev_step_ts is not None:
+                dt_s = record["ts"] - self._prev_step_ts
+                cur_angle = math.atan2(self._heading_ema_vec.imag, self._heading_ema_vec.real)
+                raw_diff = (gps_heading_rad - cur_angle + math.pi) % (2 * math.pi) - math.pi
+                max_dtheta = MAX_W * max(dt_s, 0.0) * HEADING_RATE_LIMIT_MARGIN
+                if abs(raw_diff) > max_dtheta:
+                    gps_heading_rad = cur_angle + math.copysign(max_dtheta, raw_diff)
             new_vec = complex(math.cos(gps_heading_rad), math.sin(gps_heading_rad))
             if self._heading_ema_vec is None:
                 self._heading_ema_vec = new_vec  # 첫 확보 시엔 그대로 초기화(route_aligned로 절대 시드 안 함)
@@ -873,6 +1030,38 @@ class OmniVLAEdgeDeployment:
             print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(폴백 사용, EMA/route-align 없음)  "
                   f"GPS궤적=(이동량 부족, 추정불가)")
 
+        # 2026-10-03 추가: route_bearing과 지속적으로 크게 어긋나면 강제 재동기화.
+        # route_aligned_fixed/부트스트랩(아직 실측 전) 단계는 제외 — 그쪽은 의도적으로
+        # 고정/보류된 값이라 건드리면 그 모드의 존재 이유가 없어짐(위 상수 설명 참고).
+        # 단발 노이즈가 아니라 "계속" 어긋나는 경우만 잡으려고 PERSIST_TICKS 연속 요구.
+        if record["map_heading_source"] in ("gps_track", "gps_ema_hold", "gps_ema_gyro") \
+                and route_bearing_rad_now is not None:
+            diff_deg = (math.degrees(map_heading_rad - route_bearing_rad_now) + 180) % 360 - 180
+            if abs(diff_deg) >= HEADING_ROUTE_CORRECTION_THRESHOLD_DEG:
+                self._heading_divergence_ticks += 1
+            else:
+                self._heading_divergence_ticks = 0
+            if self._heading_divergence_ticks >= HEADING_ROUTE_CORRECTION_PERSIST_TICKS:
+                prev_source = record["map_heading_source"]
+                prev_deg = math.degrees(map_heading_rad)
+                map_heading_rad = route_bearing_rad_now
+                self._heading_ema_vec = complex(math.cos(map_heading_rad), math.sin(map_heading_rad))
+                smoothed_deg = math.degrees(map_heading_rad)
+                record["smoothed_heading_deg"] = smoothed_deg
+                record["map_heading_source"] = "route_corrected"
+                self.state.log(f"⚠ heading이 route와 {diff_deg:+.1f}° 어긋난 채 "
+                                f"{self._heading_divergence_ticks}틱 지속 — route_bearing"
+                                f"({smoothed_deg:+.1f}°)으로 강제 재동기화 (이전: {prev_source} "
+                                f"{prev_deg:+.1f}°)")
+                self._log_jsonl({"type": "event", "ts": time.time(), "tick_id": tick_id,
+                                  "event": "heading_route_correction",
+                                  "from_source": prev_source, "from_heading_deg": prev_deg,
+                                  "to_heading_deg": smoothed_deg, "diff_deg": diff_deg,
+                                  "persist_ticks": self._heading_divergence_ticks})
+                self._heading_divergence_ticks = 0
+        else:
+            self._heading_divergence_ticks = 0
+
         self._last_map_heading_source = record["map_heading_source"]
         self.state.update(map_heading_source=self._last_map_heading_source)
         self._prev_step_ts = record["ts"]  # USE_GYRO_FUSION dt 계산용
@@ -893,6 +1082,25 @@ class OmniVLAEdgeDeployment:
         pred_xy_m = self.predict_waypoints(lat, lon, map_heading_rad, tick_id=tick_id)
         linear, angular = self.waypoint_to_control(pred_xy_m)
         linear, angular = clip_control(linear, angular)
+        linear_before_override, angular_before_override = linear, angular
+
+        # 2026-10-03 추가 (Harness 1 §1-8/§3-1): future-route가 화면상 너무 짧아지는
+        # 근거리에서는 모델 raw 출력이 실제 지도 내용과 무관하게 결정론적으로
+        # 좌회전하는 게 실측됨 — DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M 상수 설명 참고.
+        # 이 구간에서는 모델 예측을 아예 버리고 route_bearing_to_control()로 대체.
+        # near_goal_override_dist_m<=0이면 완전 비활성(비교 테스트용).
+        near_goal_override_applied = False
+        if (self.near_goal_override_dist_m > 0 and dist_to_goal_m <= self.near_goal_override_dist_m
+                and self._last_route_bearing_rad is not None):
+            target_time_s = 3 * WAYPOINT_STRIDE_SEC  # waypoint_to_control()의 target_step=2와 동일 시정수
+            linear, angular = route_bearing_to_control(
+                self._last_route_bearing_rad, map_heading_rad, target_time_s)
+            linear, angular = clip_control(linear, angular)
+            near_goal_override_applied = True
+            self.state.log(f"near-goal override 발동(dist={dist_to_goal_m:.1f}m ≤ "
+                            f"{self.near_goal_override_dist_m:.1f}m): 모델 예측 angular="
+                            f"{angular_before_override:+.3f} 대신 route_bearing 기반 "
+                            f"angular={angular:+.3f} 사용")
 
         # 2026-09-25 추가 디버그 필드: route bearing/heading 차이/지도 회전각/target
         # waypoint — 6번(시각화)에서 합의한 "GO 누르기 전에 확인할 수치들"
@@ -908,12 +1116,16 @@ class OmniVLAEdgeDeployment:
                        map_rotation_deg=map_rotation_deg, route_bearing_deg=route_bearing_deg,
                        heading_route_diff_deg=heading_route_diff_deg,
                        target_waypoint_xy=[target_x, target_y],
-                       map_replay_path=self._last_map_replay_path)
+                       map_replay_path=self._last_map_replay_path,
+                       linear_before_override=linear_before_override,
+                       angular_before_override=angular_before_override,
+                       near_goal_override_applied=near_goal_override_applied)
         self._log_jsonl(record)
         self.state.update(route_bearing_deg=route_bearing_deg,
                            heading_route_diff_deg=heading_route_diff_deg,
                            map_rotation_deg=map_rotation_deg,
-                           target_waypoint_xy=(target_x, target_y))
+                           target_waypoint_xy=(target_x, target_y),
+                           near_goal_override_applied=near_goal_override_applied)
         return linear, angular
 
     def run(self):
@@ -972,7 +1184,28 @@ class OmniVLAEdgeDeployment:
                                               if (is_live and heading_trustworthy and not self._goal_reached)
                                               else (0.0, 0.0))
                 t_ctrl = time.time()
-                control_status = self.send_control(sent_linear, sent_angular)
+                try:
+                    control_status = self.send_control(sent_linear, sent_angular)
+                except Exception as e:
+                    # 2026-10-03 추가: send_control()의 주석은 "예외가 올라가면 정지가
+                    # 강제된다"고 돼 있었지만 실제로는 그렇지 않았음 — 이 호출이
+                    # try/except 밖에 있어서 예외가 while 루프 전체를 뚫고 올라가
+                    # 아래 KeyboardInterrupt 핸들러에도 안 걸리고 정지 시도 없이
+                    # 프로세스가 바로 죽었음. unity 쪽 sibling clone의 실제 필드
+                    # 테스트(2026-09-26, 장시간 유지된 SDK 서버 세션 열화로 /control이
+                    # ReadTimeout 반복)에서 이 구멍이 실측됨 — 여기서도 동일한 구조라
+                    # 재현 가능한 위험이었음. step() 실패 때와 같은 원칙(에러를 삼키고
+                    # 계속 움직이는 건 절대 금지, 멈추고 재발생)으로 정지를 최소 1회
+                    # 재시도한 뒤 그대로 재발생시킴.
+                    self.state.log_error(f"send_control() 실패: {e!r} — 정지 재시도 후 중단")
+                    self._log_jsonl({"type": "event", "ts": time.time(),
+                                      "event": "send_control_failed", "error": repr(e),
+                                      "attempted_linear": sent_linear, "attempted_angular": sent_angular})
+                    try:
+                        self.send_control(0.0, 0.0)
+                    except Exception as e2:
+                        self.state.log_error(f"정지 재시도도 실패: {e2!r} — 그래도 프로세스 종료")
+                    raise
                 control_latency_ms = (time.time() - t_ctrl) * 1000.0
                 self._log_jsonl({"type": "control_sent", "ts": time.time(),
                                   "linear": sent_linear, "angular": sent_angular,
@@ -998,12 +1231,35 @@ class OmniVLAEdgeDeployment:
                       + (f"  (계산값: linear={linear:+.3f} angular={angular:+.3f})" if show_computed else "")
                       + f"  [/control {control_latency_ms:.0f}ms]")
                 time.sleep(max(0.0, DT - elapsed))
+                # 2026-10-03 추가: 이전엔 _goal_reached 래치가 명령만 (0,0)으로 묶어두고
+                # 프로세스 자체는 안 끝나서 매번 직접 Ctrl+C로 꺼야 했음("주행 완료"라고
+                # 부르기 애매한 상태) — 도착 즉시(정지 명령을 최소 한 번 보낸 이번 tick
+                # 다음) 루프를 빠져나가 깔끔하게 종료.
+                if self._goal_reached:
+                    print("[deploy] 목표 도착 완료 — 자동 종료")
+                    self._log_jsonl({"type": "event", "ts": time.time(), "event": "run_end",
+                                      "reason": "goal_reached"})
+                    break
         except KeyboardInterrupt:
             print("\n[deploy] 정지 요청됨 — 로봇 정지 명령 전송")
             self.send_control(0.0, 0.0)
             self._log_jsonl({"type": "event", "ts": time.time(), "event": "run_end",
                               "reason": "keyboard_interrupt"})
         finally:
+            if self._dashboard_recorder is not None:
+                print("[deploy] 대시보드 녹화 마무리 중 (최대 10초)...")
+                self._dashboard_recorder.stop()
+            # 2026-10-03 추가: logs/frames/<run_id>/의 ctx_*.jpg(카메라)/map_*.png(모델
+            # 입력 지도) 시퀀스를 각각 mp4로 컴파일 — 개별 파일 수백 장 대신 영상으로
+            # 훑어볼 수 있게. 제어 루프가 이미 끝난 뒤의 post-processing이라 안전하게
+            # 동기 호출(최대 각 60초, ReplayLogger.compile_videos() 자체 타임아웃).
+            print("[deploy] frames 영상 컴파일 중...")
+            video_results = self.replay_logger.compile_videos()
+            for label, (ok, info) in video_results.items():
+                if ok:
+                    print(f"[deploy]   {label}: {info}")
+                else:
+                    print(f"[deploy]   {label} 생략/실패: {info}")
             print(f"[deploy] 로그 저장 완료: {self.log_path}")
             self._log_fp.close()
 
@@ -1034,12 +1290,24 @@ if __name__ == "__main__":
     p.add_argument("--goal_reach_threshold_m", type=float, default=DEFAULT_GOAL_REACH_THRESHOLD_M,
                    help=f"목표까지 이 거리(m) 이내로 들어오면 도착으로 간주하고 영구 정지 "
                         f"(기본 {DEFAULT_GOAL_REACH_THRESHOLD_M}m). 한 번 도착하면 다시 안 풀림.")
+    p.add_argument("--near_goal_override_dist_m", type=float, default=DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M,
+                   help=f"목표까지 이 거리(m) 이내에서는 모델 raw 예측 대신 route_bearing 기반 "
+                        f"조향으로 대체 (기본 {DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M}m — 27m 체크포인트 "
+                        f"기준 실측 보정값, 다른 체크포인트/map_range면 재측정 필요, "
+                        f"docs/experiment_log.md §1-8 참고). 0 이하로 주면 비활성화(비교 테스트용).")
     p.add_argument("--initial_heading_lookahead_m", type=float, default=INITIAL_HEADING_LOOKAHEAD_M,
                    help=f"'정렬 확인' 시 route tangent를 계산하는 lookahead 거리(m) "
                         f"(기본 {INITIAL_HEADING_LOOKAHEAD_M}m). 목표 근처처럼 경로가 국소적으로 "
                         f"꺾이는 구간에서 짧은 값이 실제 진행 방향과 크게 어긋난 heading을 "
                         f"고정시키는 사고가 실측됨(2026-09-26) — 그런 구간에서 정렬 확인이 "
                         f"필요하면 이 값을 5~10m로 늘려서 국소 꺾임에 덜 민감하게 만들 것.")
+    p.add_argument("--allow_reroute", action="store_true",
+                   help="기본은 재라우팅 완전 비활성화(최초 route_init 경로만 런 내내 그대로 "
+                        "사용). 목표에서 멀리 떨어진 거의 정지 상태에서도 is_off_route()가 "
+                        "쿨다운마다 계속 True를 반환해 reroute가 반복 발생하고, 그때마다 OSRM이 "
+                        "다른 경로를 반환해 계획 경로 방향이 요동치는 문제가 실측됨(2026-09-26, "
+                        "2026-09-18에도 유사 현상 기록). 이 플래그를 주면 기존 동작(경로 이탈 "
+                        "감지 시 재계산, REROUTE_DISABLE_NEAR_GOAL_M 보호 포함)으로 되돌림.")
     args = p.parse_args()
 
     deployer = OmniVLAEdgeDeployment(
@@ -1049,5 +1317,7 @@ if __name__ == "__main__":
         heading_mode=args.heading_mode,
         goal_reach_threshold_m=args.goal_reach_threshold_m,
         initial_heading_lookahead_m=args.initial_heading_lookahead_m,
+        allow_reroute=args.allow_reroute,
+        near_goal_override_dist_m=args.near_goal_override_dist_m,
     )
     deployer.run()

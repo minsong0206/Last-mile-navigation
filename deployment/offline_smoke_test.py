@@ -123,7 +123,13 @@ def _base_gps(lat, lon, orientation=192.0):
 
 def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto",
                    goal_lat=None, goal_lon=None, goal_reach_threshold_m=dep.DEFAULT_GOAL_REACH_THRESHOLD_M,
-                   initial_heading_lookahead_m=dep.INITIAL_HEADING_LOOKAHEAD_M):
+                   initial_heading_lookahead_m=dep.INITIAL_HEADING_LOOKAHEAD_M,
+                   allow_reroute=False, near_goal_override_dist_m=0.0):
+    # near_goal_override_dist_m 기본값을 0(비활성)으로 둠 -- 대부분의 기존 테스트는
+    # 이 기능과 무관한 걸 검증하는 거라, 운영 기본값(8.0m)을 그대로 쓰면 goal 근처
+    # GPS 시퀀스를 쓰는 테스트들의 angular/linear가 모델 예측이 아니라 route_bearing
+    # 기반으로 바뀌어서 기존 검증 의도와 어긋날 수 있음. 이 기능 자체를 검증하는
+    # 테스트에서만 명시적으로 켬.
     deployer = dep.OmniVLAEdgeDeployment(
         ckpt_path=str(CKPT_PATH), map_range_m=20.0,
         goal_lat=goal_lat if goal_lat is not None else GOAL_LAT,
@@ -131,6 +137,8 @@ def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto
         debug_port=0, dry_run=dry_run_lock, heading_mode=heading_mode,
         goal_reach_threshold_m=goal_reach_threshold_m,
         initial_heading_lookahead_m=initial_heading_lookahead_m,
+        allow_reroute=allow_reroute,
+        near_goal_override_dist_m=near_goal_override_dist_m,
     )
     tick_count = [0]
     real_step = deployer.step
@@ -482,23 +490,30 @@ def test_e_goal_reached_stop():
         "도착 이전 tick인데 이미 임계값 이내로 기록된 게 있음"
     print(f"[OK] 도착 이전 {len(before_steps)}개 tick 전부 dist_to_goal_m > {THRESH_M}m")
 
-    # 도착 이후(그 tick 포함) 전송값은 전부 (0,0)이어야 함 -- LIVE에 heading도 정상이었더라도
-    # control_sent 레코드 자체엔 tick_id가 없으므로 시간(ts)으로 매칭
+    # 2026-10-03: goal_reached 즉시 run()이 자동 종료되도록 바뀜(이전엔 명령만
+    # (0,0)으로 묶이고 프로세스는 계속 돌아서 매번 수동으로 꺼야 했음) -- 그래서
+    # "도착 이후 여러 틱에 걸쳐 계속 0인지"가 아니라 "도착한 그 틱만 0으로 보내고
+    # 바로 깔끔하게 종료됐는지"를 확인한다.
     after_ts = ge["ts"]
     after_controls = [c for c in controls if c["ts"] >= after_ts]
-    assert len(after_controls) > 0
+    assert len(after_controls) == 1, \
+        f"goal_reached 이후 자동 종료라 control_sent가 정확히 1개(도착한 그 틱)여야 함: {len(after_controls)}"
     assert all(c["linear"] == 0.0 and c["angular"] == 0.0 for c in after_controls), \
         f"goal_reached 이후인데 non-zero 명령이 전송됨: {after_controls}"
     assert all(c.get("goal_reached") is True for c in after_controls), \
         "control_sent 레코드의 goal_reached 플래그가 True로 안 남음"
-    print(f"[OK] goal_reached 이후 {len(after_controls)}개 tick 전부 전송값 (0,0), "
-          f"control_sent.goal_reached=True 로그 확인")
+    print(f"[OK] goal_reached 틱에서 전송값 (0,0), control_sent.goal_reached=True 로그 확인")
 
-    # 도착 이후에도 computed_linear/angular는 계속 계산되고 있어야 함(래치가 계산
-    # 자체를 막는 게 아니라 전송만 막는지 확인 -- 대시보드에서 계속 관찰 가능해야 함)
-    nonzero_computed_after = [c for c in after_controls if c["computed_linear"] != 0 or c["computed_angular"] != 0]
-    print(f"[OK] goal_reached 이후에도 {len(nonzero_computed_after)}/{len(after_controls)}개 tick에서 "
-          f"computed_linear/angular는 계속 계산됨(전송만 차단, 계산은 안 막음)")
+    run_end_events = [l for l in logs if l.get("event") == "run_end"]
+    assert len(run_end_events) == 1 and run_end_events[0]["reason"] == "goal_reached", \
+        f"run_end 이벤트가 goal_reached 사유로 정확히 1번 남아야 함: {run_end_events}"
+    print(f"[OK] run_end 이벤트 reason=goal_reached (자동 종료 확인)")
+
+    last_tick_id = max(s["tick_id"] for s in steps)
+    assert last_tick_id < n_ticks - 1, \
+        (f"goal_reached 후에도 n_ticks({n_ticks})까지 계속 돌아간 것으로 보임 "
+         f"(마지막 tick_id={last_tick_id}) -- 자동 종료가 실제로 안 된 것일 수 있음")
+    print(f"[OK] 목표 도달 직후(tick_id={last_tick_id}) 자동 종료 -- n_ticks({n_ticks})까지 안 돌아감")
 
     status = deployer.state.snapshot_status()
     assert status["goal_reached"] is True
@@ -551,6 +566,39 @@ def test_f_initial_heading_lookahead_configurable():
           f"실제로 전달됨을 확인 (2.0m: {results[2.0]:+.2f}°, 8.0m: {results[8.0]:+.2f}°)")
 
 
+# ── test G: allow_reroute 기본값 검증 (경로 이탈해도 기본은 재라우팅 안 함) ──
+def test_g_reroute_disabled_by_default():
+    print("\n========== test_g_reroute_disabled_by_default ==========")
+    camera_frames = _load_camera_frames() * 3
+    n_ticks = 26  # 3Hz 기준 실제 8초 이상 경과 -> REROUTE_COOLDOWN_S(3s)를 2회 이상 넘김
+
+    gps_sequence = [_base_gps(1000, 1000)] * 2
+    # 목표(GOAL_LAT,GOAL_LON)는 BASE보다 남서쪽 -- 로봇을 반대로(북쪽) 계속 이동시켜서
+    # 캐싱된(직선 폴백) 경로에서 매 tick 점점 더 멀어지게(3m is_off_route 임계값을
+    # 금방, 계속 넘도록) 만든다.
+    for i in range(n_ticks):
+        gps_sequence.append(_base_gps(BASE_LAT + (i + 1) * 0.00003, BASE_LON))
+
+    for allow_reroute in (False, True):
+        fake_get, fake_post, _ = build_fake_requests(camera_frames, gps_sequence)
+        with mock.patch("requests.get", side_effect=fake_get), \
+             mock.patch("requests.post", side_effect=fake_post):
+            deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=n_ticks,
+                                      allow_reroute=allow_reroute)
+            deployer.run()
+
+        logs = _read_jsonl(deployer.log_path)
+        reroute_events = [l for l in logs if l.get("event") == "reroute"]
+        if allow_reroute:
+            assert len(reroute_events) > 0, \
+                "allow_reroute=True인데 경로를 크게 벗어났는데도 reroute가 한 번도 안 일어남"
+            print(f"[OK] allow_reroute=True: 경로 이탈 시 reroute {len(reroute_events)}회 발생 (기존 동작 유지)")
+        else:
+            assert len(reroute_events) == 0, \
+                f"allow_reroute=False(기본값)인데 reroute가 {len(reroute_events)}회 발생함 -- 기본 비활성화 안 됨"
+            print(f"[OK] allow_reroute=False(기본값): 경로를 크게 벗어나도 reroute 0회 (최초 route만 유지)")
+
+
 if __name__ == "__main__":
     test_a_dry_run_lock()
     test_b_full_workflow()
@@ -558,4 +606,5 @@ if __name__ == "__main__":
     test_d_route_aligned_fixed_mode()
     test_e_goal_reached_stop()
     test_f_initial_heading_lookahead_configurable()
+    test_g_reroute_disabled_by_default()
     print("\n모든 오프라인 스모크 테스트 통과.")

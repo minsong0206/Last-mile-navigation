@@ -2,6 +2,7 @@ train/wandb
 train/logs
 deployment/logs
 deployment/model_weights
+/1003/
 __pycache__/
 *.pyc
 dataset

@@ -74,7 +74,7 @@ class DeploymentState:
         # 2026-09-25 추가: route-aligned initial heading bootstrap + ARM/GO LIVE
         # 2단계 확인 워크플로용 필드 (설계 근거는 omnivla_edge_deploy.py 참고)
         self.control_stage = "DRY_RUN"   # "DRY_RUN" / "ARMED" / "LIVE"
-        self.map_heading_source = None   # "route_aligned" / "gps_track" / "gps_ema_hold" / "gps_ema_gyro" / "imu_fallback"
+        self.map_heading_source = None   # "route_aligned" / "gps_track" / "gps_ema_hold" / "gps_ema_gyro" / "route_corrected" / "imu_fallback"
         self.route_aligned_heading_deg = None
         self.gps_accumulated_path_m = None
         self.gps_net_displacement_m = None
@@ -85,6 +85,7 @@ class DeploymentState:
         self.heading_mode = "auto"       # 2026-09-26 추가: "auto" / "route_aligned_fixed", 실행 중 안 바뀜(표시용)
         self.dist_to_goal_m = None       # 2026-09-26 추가: goal 도착 감지
         self.goal_reached = False
+        self.near_goal_override_applied = False  # 2026-10-03 추가: route_bearing 강제 조향 중인지
         self._logs = deque(maxlen=log_maxlen)
         self._errors = deque(maxlen=log_maxlen)
 
@@ -99,7 +100,8 @@ class DeploymentState:
                route_aligned_heading_deg=_UNSET, gps_accumulated_path_m=None,
                gps_net_displacement_m=None, osrm_fallback=_UNSET,
                start_snap_m=_UNSET, goal_snap_m=_UNSET, map_img_northup=None,
-               heading_mode=None, dist_to_goal_m=None, goal_reached=None):
+               heading_mode=None, dist_to_goal_m=None, goal_reached=None,
+               near_goal_override_applied=None):
         # gps_heading_deg/route_bearing_deg/heading_route_diff_deg는 "이번 틱에
         # 못 구했다"는 의미로 명시적 None이 넘어올 수 있어서, 기본값을 _UNSET으로
         # 두고 "호출에서 아예 안 건드린 경우"와 구분한다 — 그냥 None 기본값을 쓰면
@@ -140,6 +142,7 @@ class DeploymentState:
             if heading_mode is not None: self.heading_mode = heading_mode
             if dist_to_goal_m is not None: self.dist_to_goal_m = dist_to_goal_m
             if goal_reached is not None: self.goal_reached = goal_reached
+            if near_goal_override_applied is not None: self.near_goal_override_applied = near_goal_override_applied
             self.last_update_ts = time.time()
 
     def log(self, msg):
@@ -189,6 +192,7 @@ class DeploymentState:
                 "heading_mode": self.heading_mode,
                 "dist_to_goal_m": self.dist_to_goal_m,
                 "goal_reached": self.goal_reached,
+                "near_goal_override_applied": self.near_goal_override_applied,
                 "map_heading_source": self.map_heading_source,
                 "route_aligned_heading_deg": self.route_aligned_heading_deg,
                 "gps_accumulated_path_m": self.gps_accumulated_path_m,
@@ -356,11 +360,12 @@ const SOURCE_LABEL = {
   gps_track: 'GPS 궤적 (실측, EMA)',
   gps_ema_hold: 'GPS EMA 유지(관성)',
   gps_ema_gyro: 'GPS EMA + 자이로 보정',
+  route_corrected: 'route로 강제 재동기화됨',
   imu_fallback: 'IMU 폴백 (비권장)',
 };
 const SOURCE_CLASS = {
   route_aligned: 'warn', gps_track: 'ok', gps_ema_hold: 'ok',
-  gps_ema_gyro: 'ok', imu_fallback: 'bad',
+  gps_ema_gyro: 'ok', route_corrected: 'warn', imu_fallback: 'bad',
 };
 
 async function poll() {
@@ -427,6 +432,7 @@ async function poll() {
     <tr><td>heading - route 차이</td><td class="${routeDiffClass}">${s.heading_route_diff_deg === null ? '—' : fmtNum(s.heading_route_diff_deg, 1) + '&deg;'}</td></tr>
     <tr><td>지도 회전각</td><td>${s.map_rotation_deg === null ? '—' : fmtNum(s.map_rotation_deg, 1) + '&deg;'}</td></tr>
     <tr><td><b>목표까지 거리</b></td><td class="${goalClass}"><b>${fmtNum(s.dist_to_goal_m, 2)}m</b>${s.goal_reached ? ' <span class="ok">🏁 도착 — 영구 정지</span>' : ''}</td></tr>
+    <tr><td>near-goal override</td><td class="${s.near_goal_override_applied ? 'warn' : ''}">${s.near_goal_override_applied ? '⚠ 발동 중 — route_bearing 기반 조향 사용' : '비활성'}</td></tr>
   `;
   document.querySelector('#statusModel tbody').innerHTML = `
     <tr><td>target waypoint (x,y)</td><td>${s.target_waypoint_xy ? `(${fmtNum(s.target_waypoint_xy[0],3)}, ${fmtNum(s.target_waypoint_xy[1],3)}) m` : '—'}</td></tr>
@@ -488,12 +494,22 @@ class _Handler(BaseHTTPRequestHandler):
                         "application/json", status=400)
 
     def _send(self, body, content_type, status=200):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        # 2026-10-03: 브라우저가 응답 다 받기 전에 연결을 끊는 경우(탭 새로고침,
+        # 1초 자동 폴링이 이전 요청 끝나기 전에 새 요청을 보내는 경우 등)
+        # BrokenPipeError/ConnectionResetError가 콘솔에 트레이스백으로 찍혀서
+        # 꼭 서버가 고장난 것처럼 보였음 — ThreadingHTTPServer라 이 요청 스레드
+        # 하나만 죽고 서버/제어 루프엔 실제로 영향 없었지만(디버깅 세션에서
+        # 실측 확인), 매번 겁나는 로그가 남는 건 그 자체로 문제라 조용히 무시하도록
+        # 바꿈. 클라이언트가 이미 사라졌으니 재시도할 대상도 없음.
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def start_debug_server(state: DeploymentState, cmd_queue: "queue.Queue" = None,

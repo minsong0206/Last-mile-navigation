@@ -36,7 +36,21 @@ base64 길이 기준 원본 프레임이 이보다 훨씬 클 수 있음, 대략
 놓칠 위험이 더 크다고 판단함(정확히 5번 replay 실패의 원인이 "그 순간 데이터가
 없어서"였음). 대신
 event_flag는 메타데이터 필드로만 남겨서 나중에 필터링을 쉽게 한다.
+
+2026-10-03 추가: run 종료 시 저장된 ctx_*.jpg/map_*.png 시퀀스를 각각 하나의
+동영상(context_video.mp4/map_video.mp4)으로도 컴파일한다(compile_videos()) —
+개별 PNG/JPG 수백 장을 하나하나 넘겨보는 대신 재생해서 훑어볼 수 있게. 인코딩은
+dashboard_capture.py와 동일한 이유로 ffmpeg+libx264+yuv420p+faststart를 직접
+서브프로세스로 호출(이 환경의 cv2 ffmpeg 빌드엔 H.264 인코더가 없어서
+cv2.VideoWriter는 Notion 등에서 재생이 안 됨 — 2026-10-03 실측). 이미 디스크에
+저장된 파일 시퀀스를 읽는 것뿐이라(실시간 캡처가 아님) ffmpeg의 image2 시퀀스
+디먹서를 그대로 씀 — dashboard_capture.py처럼 프레임을 stdin으로 파이프할 필요
+없음. run() 종료(finally) 시점에 한 번만 호출되는 post-processing이라 제어
+루프와 타이밍이 겹치지 않음 — 그래도 혹시 모를 실패/지연에 대비해 timeout과
+try/except로 감싸서 절대 예외를 올리지 않음(호출 측에서 결과 dict만 확인).
 """
+import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +65,15 @@ class ReplayLogger:
         self._next_frame_id = 0
         self._last_frame_id = None  # 가장 최근에 저장(또는 재사용)한 컨텍스트 frame_id
         self._next_tick_id = 0
+        # compile_videos()가 실제 경과시간 기준으로 fps를 역산할 수 있게 최초/최근
+        # 저장 시각을 추적 (카메라 ~1.8Hz 실측, 루프 목표 3Hz — 둘 다 설계값이 아니라
+        # 실측값으로 fps를 잡기 위함).
+        self._ctx_first_ts = None
+        self._ctx_last_ts = None
+        self._ctx_saved_count = 0
+        self._map_first_ts = None
+        self._map_last_ts = None
+        self._map_saved_count = 0
 
     def next_tick_id(self) -> int:
         """step() 시작 시 1번 호출 — JSONL 레코드와 저장 파일을 잇는 공통 키."""
@@ -72,6 +95,11 @@ class ReplayLogger:
             path = self.frames_dir / f"ctx_{frame_id:06d}.jpg"
             pil_img.convert("RGB").save(path, format="JPEG", quality=90)
             self._last_frame_id = frame_id
+            now = time.time()
+            if self._ctx_first_ts is None:
+                self._ctx_first_ts = now
+            self._ctx_last_ts = now
+            self._ctx_saved_count += 1
         return self._last_frame_id
 
     def save_map(self, map_np: np.ndarray, tick_id: int) -> str:
@@ -80,7 +108,61 @@ class ReplayLogger:
         상대경로를 반환해서 JSONL에 그대로 남기기 쉽게 한다."""
         rel_path = f"map_{tick_id:06d}.png"
         Image.fromarray(map_np).save(self.frames_dir / rel_path)
+        now = time.time()
+        if self._map_first_ts is None:
+            self._map_first_ts = now
+        self._map_last_ts = now
+        self._map_saved_count += 1
         return f"frames/{self.run_id}/{rel_path}"
 
     def context_frame_path(self, frame_id: int) -> str:
         return f"frames/{self.run_id}/ctx_{frame_id:06d}.jpg"
+
+    def _compile_one(self, pattern, start_number, n_frames, first_ts, last_ts,
+                      out_name, fps_min=1.0, fps_max=10.0, timeout_s=60):
+        """저장된 파일 시퀀스 하나(ctx_* 또는 map_*)를 ffmpeg로 mp4(H.264)로 컴파일.
+        성공 시 (True, out_path), 실패/대상없음 시 (False, 이유 문자열)."""
+        if n_frames < 2:
+            return False, "프레임 2개 미만이라 영상 생략"
+        elapsed = (last_ts - first_ts) if (first_ts is not None and last_ts is not None) else 0.0
+        fps = (n_frames - 1) / elapsed if elapsed > 0 else 2.0
+        fps = max(fps_min, min(fps_max, fps))  # 극단값(멈칫거림/순간폭주) 방지
+        out_path = self.frames_dir / out_name
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-start_number", str(start_number), "-framerate", f"{fps:.3f}",
+                 "-i", str(self.frames_dir / pattern),
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                 str(out_path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout_s,
+            )
+            if proc.returncode != 0 or not out_path.exists():
+                return False, f"ffmpeg 실패(code={proc.returncode}): {proc.stderr.decode(errors='replace')[-500:]}"
+            return True, str(out_path)
+        except FileNotFoundError:
+            return False, "ffmpeg 바이너리를 찾을 수 없음 (which ffmpeg로 설치 확인 필요)"
+        except subprocess.TimeoutExpired:
+            return False, f"ffmpeg {timeout_s}초 타임아웃"
+        except Exception as e:
+            return False, repr(e)
+
+    def compile_videos(self):
+        """run 종료 시 1회 호출 — ctx_*.jpg -> context_video.mp4, map_*.png ->
+        map_video.mp4 로 각각 컴파일. 둘 다 best-effort(실패해도 raise 안 함,
+        결과 dict만 반환) — 호출 측(omnivla_edge_deploy.py)이 state.log()로 보고."""
+        results = {}
+        # ctx_*.jpg는 dedup만 할 뿐 번호가 0부터 빈틈없이 매겨짐(record_context_frame
+        # 참고) -> start_number=0 고정.
+        results["context_video"] = self._compile_one(
+            "ctx_%06d.jpg", start_number=0, n_frames=self._ctx_saved_count,
+            first_ts=self._ctx_first_ts, last_ts=self._ctx_last_ts, out_name="context_video.mp4")
+        # map_*.png는 context 채우는 초반 몇 틱(build_inputs() 호출 전) 동안은 저장이
+        # 아예 안 되므로 tick_id가 0부터 시작하지 않을 수 있음 -> 실제 첫 파일 번호를
+        # 찾아서 start_number로 써야 ffmpeg image2 디먹서가 "첫 틱부터 없다"고 보고
+        # 바로 실패하지 않음.
+        map_files = sorted(self.frames_dir.glob("map_*.png"))
+        map_start = int(map_files[0].stem.split("_")[1]) if map_files else 0
+        results["map_video"] = self._compile_one(
+            "map_%06d.png", start_number=map_start, n_frames=self._map_saved_count,
+            first_ts=self._map_first_ts, last_ts=self._map_last_ts, out_name="map_video.mp4")
+        return results
