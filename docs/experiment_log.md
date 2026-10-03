@@ -8,6 +8,16 @@
 
 마지막 갱신: 2026-10-03
 
+**세션 종료 시점 상태(2026-10-03 저녁, 로봇 배터리 방전으로 중단)**: §1-8/§3-1의
+근거로 near-goal override(`--near_goal_override_dist_m`, 기본 8.0m)와 heading
+안정화(rate-limit + route_bearing 재동기화, §2 이전 Harness 2 작업)를 전부
+구현·오프라인 테스트 완료, **커밋/푸시도 끝냄(`afde77f`)** — 하지만 **실기기 검증은
+아직 0회**. 다음 세션 최우선: (1) override 끄고(`--near_goal_override_dist_m 0`)
+heading 안정화 3가지(rate-limit/재동기화/goal 자동종료)부터 깨끗하게 검증, (2) 그 다음
+override 켜고 별도 검증. 부가로 `deployment/dashboard_capture.py`가 비정상 종료 시
+헤드리스 Chrome을 못 지우는 버그 발견(오늘 89개 누적되어 SDK 서버 hang의 직접 원인이
+됐음) — 아직 미수정, 다음 세션에서 고칠 것.
+
 ---
 
 ## 0. 역할 분담 (충돌 방지)

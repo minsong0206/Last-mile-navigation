@@ -43,7 +43,38 @@ Step 5. 배포                    deployment/                          → Frodo
   확인할 것. 체크포인트(`*.pth`)와 대용량 데이터는 git이 아니라 Hugging Face에 올림
   (계정 `minsonganingee`, private repo).
 
-## 알려진 이슈 / 아직 안 풀린 문제
+## ⚠ 2026-10-03 세션 요약 — 다음 세션 최우선으로 읽을 것
+
+**좌편향 조사가 크게 진전됨 — 메커니즘을 구체적으로 규명하고 완화책까지 구현했으나 아직 실기기 미검증.**
+상세는 반드시 `docs/experiment_log.md` 먼저 읽을 것(이 섹션은 요약만).
+
+- **다른 터미널의 별도 Claude Code 세션("Harness 1", 학습/모델 분석 전담)과 이 세션("Harness 2",
+  실배포/로봇 담당)을 동시에 띄워서 작업하는 방식을 도입함** — `docs/experiment_log.md`가 둘이
+  공유하는 실험 로그/역할분담 문서. 다음 세션도 이 구조를 이어가려면 그 문서 §0 역할분담부터 볼 것.
+- **좌편향의 진짜 트리거를 규명함**: "goal까지 실제 거리"가 아니라 **"화면에 그려진 future-route
+  빨간 선분의 픽셀 길이(bbox_h)"**였음 — 완전 직선 경로(177틱, 곡률 0)에서도 bbox_h가 줄면 좌편향이
+  정비례해서 커짐. 27m 체크포인트 기준 bbox_h<25px(≈dist_to_goal 7-8m) 이하면 실제 경로 방향과
+  무관하게 결정론적으로 좌회전(직선 경로 177/177, 실제 우회전 경로에서도 26:2·22:2). map_range_m을
+  줄이면 같은 실제 거리에서 bbox_h가 커져서(트리거 구간에 늦게 도달) 편향이 약해 보였던 것 —
+  "곡률을 더 잘 보여줘서"가 아니었음. 상세 수치: `docs/experiment_log.md` §1-8.
+- **완화책 구현 완료, 실기기 미검증**: `omnivla_edge_deploy.py --near_goal_override_dist_m`(기본
+  8.0m) — 이 거리 이내에서는 모델 raw 예측 대신 `route_bearing_rad()` 기반 조향으로 강제 대체.
+- **별개로 발견·수정한 문제(heading 추정 불안정성)**: `auto` 모드의 GPS-track heading이 실제 턴
+  구간에서 GPS 자체는 깨끗한데도 틱마다 수십~100도씩 흔들림 확인(지도 회전이 매 틱 달라져서 예측도
+  덩달아 불안정) → 틱당 변화량 rate-limit + route_bearing과 45°+ 어긋난 채 5틱 이상 지속되면
+  강제 재동기화(`map_heading_source="route_corrected"`) 추가.
+- **그 외 추가**: goal 도착 시 프로세스 자동 종료(이전엔 매번 수동 Ctrl+C 필요했음), 대시보드/
+  frames 녹화를 영상(mp4)으로 저장하되 Notion에서 안 열리던 `cv2.VideoWriter`(mp4v) 대신
+  ffmpeg+libx264 직접 호출로 교체.
+- **실기기 테스트는 로봇 배터리 방전으로 중단됨** — 충전 후 재개 필요. 커밋 `afde77f`에 전부
+  들어있고 push 완료함.
+- **다음 세션에 할 일(우선순위 순)**: (1) `--near_goal_override_dist_m 0`으로 override 끄고
+  heading rate-limit/route_bearing 재동기화/goal 자동종료 3가지부터 깨끗하게 검증, (2) 그다음
+  override 켜고(기본값 8.0m) 별도로 검증, (3) `deployment/dashboard_capture.py`가 비정상 종료 시
+  헤드리스 Chrome 프로세스를 못 지우고 좀비로 남기는 버그 발견함(오늘 89개 누적되어 SDK 서버
+  행(hang)의 원인이 됨, `pgrep -f pyppeteer`로 확인 가능) — 아직 안 고침, 다음 세션에서 수정 필요.
+
+## 알려진 이슈 / 아직 안 풀린 문제 (과거 기록 — 위 2026-10-03 요약이 최신 상태, 아래는 그 이전 경과)
 
 **"map-zero(직진 상황)에서 우회전을 예측하는" 편향**을 지도교수 피드백으로 조사 중 (오프라인 평가 기준).
 - 좌표축/회전 공식, OSM 배경-GPS 정렬, 입력 무관 고정 편향 — **전부 검증 결과 문제없음**.
@@ -155,4 +186,7 @@ python3 scripts/omnivla/make_test_video.py --ckpt checkpoints/omnivla_edge_rides
 
 # 실배포 (README_omnivla_edge.md 참고)
 python3 deployment/omnivla_edge_deploy.py --ckpt checkpoints/omnivla_edge_rides11_odom_12m/best.pth --map_range 12 --goal_lat <위도> --goal_lon <경도>
+
+# 2026-10-03 추가 옵션(좌편향 완화책) 끄고 테스트하려면: --near_goal_override_dist_m 0
+# (기본 8.0m는 27m 체크포인트 기준 실측 보정값 -- 다른 체크포인트면 docs/experiment_log.md §1-8 참고해 재측정)
 ```
