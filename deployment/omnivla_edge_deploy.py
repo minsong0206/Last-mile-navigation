@@ -179,6 +179,27 @@ HEADING_ROUTE_CORRECTION_PERSIST_TICKS = 5
 DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG = 20.0
 DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS = 5
 
+# 2026-10-04 추가 (실측 사고 deploy_20261004_133317.jsonl): "지속적으로 어긋남 →
+# gps_track을 믿는다"는 pull 조건의 맹점 — gps_track 추정값이 양자화 격자각도(예:
+# -90.0°)에 고정된 채 그대로 유지되면, 그 자체가 "오래 지속되는 반박"처럼 보여서
+# 오히려 더 신뢰받아버림(진짜 드리프트와 구분 불가). 이번 run에서 위치는 계속
+# 바뀌는데(§1-14의 위치-동결 가드로는 안 잡힘) gps_heading_rad 값만 -90.0°에
+# 60초+(수십 틱) 고정된 채 route_bearing(실제로는 178.6°까지 진행)과 계속
+# "지속 반박" 조건을 만족시켜서 끝까지 pull된 채 안 풀리는 사고가 실측됨. 추정값
+# 자체가 이 틱수 이상 거의 안 바뀌면(진짜 이동 중이라면 GPS 노이즈로 자연스럽게
+# 조금씩은 바뀌어야 함) "고장난 추정"으로 보고 pull을 보류한다.
+DEFAULT_GPS_HEADING_FREEZE_PERSIST_TICKS = 10
+GPS_HEADING_FREEZE_EPS_RAD = math.radians(0.5)
+
+# 2026-10-04 추가 (실측 사고 deploy_20261004_143423.jsonl): GO LIVE 직후처럼
+# past_track 누적이 적을 때 estimate_heading_from_track()의 "짧은 창"(fast_disp_m)
+# 경로가 매 tick 다른 양자화 격자각도를 내놓을 수 있음(147.7°→162.5°→-162.5°→180°→
+# -147.7° 식으로, 같은 값에 고정되는 게 아니라 계속 "다른 값으로 틀림" —
+# DEFAULT_GPS_HEADING_FREEZE_PERSIST_TICKS 체크로는 못 잡는 변종). gps_heading_readiness()
+# 의 기본 min_disp_m(아래)과 동일한 값 이상 누적돼야(=긴 창 평균화가 실제로 적용되는
+# 지점) pull을 허용 — 그 전엔 route_bearing_anchor를 유지.
+DEFAULT_HEADING_ANCHOR_PULL_MIN_ACCUM_PATH_M = 1.5
+
 # 2026-10-04 추가: is_off_route() 기반 상시 이탈 감지(안전망) 관련 상수.
 # 기존엔 is_off_route() 호출 자체가 allow_reroute(기본 False) 뒤에 숨어있어서
 # "감지"와 "재라우팅 실행"이 같이 꺼져 있었음 — 그래서 heading_mode=route_bearing
@@ -223,6 +244,17 @@ DEFAULT_ENABLE_GPS_FREEZE_GUARD = True
 DEFAULT_GPS_FREEZE_MIN_DISP_M = 0.03
 DEFAULT_GPS_FREEZE_PERSIST_TICKS = 10
 DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS = 0.15
+
+# 2026-10-04 추가: SDK 서버 쪽 헤드리스 브라우저가 1~2초 내로 저절로 회복되는 일시적
+# hiccup(ReadTimeout, 빈 JSON 응답)을 오늘 여러 번 실측(deploy_20261004_123354/
+# 125728/131744.jsonl 등) — 지금까진 이런 일시적 실패도 전체 프로세스를 바로
+# 죽였음(poll_frodobot()/send_control()이 try/except 없이 바로 예외를 올림).
+# 짧게 재시도해서 이런 hiccup을 흡수하되, 재시도까지 다 실패하면(=진짜 통신 불능)
+# 여전히 예외를 그대로 올려서 run()의 "정지 시도 후 프로세스 종료" 안전 원칙은
+# 그대로 유지한다 — 여기서 에러를 삼키고 계속 진행하는 일은 절대 없음(2026-09-26
+# 주석의 안전 원칙과 동일).
+NETWORK_RETRY_COUNT = 2
+NETWORK_RETRY_BACKOFF_S = 0.3
 
 # 2026-09-18: is_off_route() 임계값을 15m→3m로 낮췄더니, OSRM이 자체적으로 요청 좌표를
 # 가장 가까운 매핑된 길(way)로 "스냅"하는 거리가 그보다 큰 지점(예: 매핑된 보행로가 없는
@@ -584,6 +616,7 @@ class OmniVLAEdgeDeployment:
         self.gps_freeze_speed_threshold_mps = gps_freeze_speed_threshold_mps
         self._gps_freeze_ticks = 0
         self._gps_freeze_last_latlon = None
+        self._gps_freeze_any_speed_seen = False
         self._gps_frozen_now = False
 
         # 2026-09-26 추가: INITIAL_HEADING_LOOKAHEAD_M을 CLI로 조절 가능하게 함 —
@@ -634,6 +667,14 @@ class OmniVLAEdgeDeployment:
         # gps_track 쪽을 신뢰(위 _heading_divergence_ticks와 반대 방향 로직 — 기본은
         # route_bearing, gps_track은 지속적 반증이 쌓여야만 예외적으로 끌어당김).
         self._heading_anchor_pull_ticks = 0
+
+        # 2026-10-04 추가 (실측 사고 deploy_20261004_133317.jsonl): gps_track 추정값
+        # 자체가 양자화 격자각도에 고정된 채 수십 틱 유지되는 현상 감지용 — 위
+        # _heading_anchor_pull_ticks(위치는 바뀌는데 heading 추정만 고장난 경우, 아래
+        # DEFAULT_GPS_HEADING_FREEZE_PERSIST_TICKS 설명 참고)의 "진짜 반박 vs 고장난
+        # 추정" 구분을 보완.
+        self._gps_heading_freeze_ticks = 0
+        self._gps_heading_freeze_last_rad = None
 
         # 마지막 재라우팅 시각 (REROUTE_COOLDOWN_S 참고 — 무한 재라우팅 스팸 방지)
         self._last_reroute_ts = 0.0
@@ -709,9 +750,29 @@ class OmniVLAEdgeDeployment:
     def _log_jsonl(self, record: dict):
         self._log_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def _request_with_retry(self, request_fn, retries=NETWORK_RETRY_COUNT,
+                             backoff_s=NETWORK_RETRY_BACKOFF_S):
+        # 위 NETWORK_RETRY_COUNT 설명 참고 — request_fn은 "요청 전송 + 바로 필요한
+        # 파싱까지"(예: .json() 호출) 전부 포함해서 넘겨야 함, 그래야 빈 응답으로
+        # 인한 JSONDecodeError도 재시도 대상이 됨. 재시도를 다 썼는데도 실패하면
+        # 마지막 예외를 그대로 올림 — 호출부가 그 예외로 "정지 시도 후 종료"하는
+        # 기존 안전 경로를 그대로 타게 함.
+        last_exc = None
+        for attempt in range(retries + 1):
+            try:
+                return request_fn()
+            except Exception as e:
+                last_exc = e
+                if attempt < retries:
+                    self.state.log(f"⚠ 네트워크 요청 일시 실패(재시도 {attempt + 1}/{retries}): {e!r}")
+                    time.sleep(backoff_s)
+        raise last_exc
+
     def poll_frodobot(self):
-        cam = requests.get(f"{FRODOBOT_BASE}/v2/front", timeout=5.0).json()
-        gps = requests.get(f"{FRODOBOT_BASE}/data", timeout=5.0).json()
+        cam = self._request_with_retry(
+            lambda: requests.get(f"{FRODOBOT_BASE}/v2/front", timeout=5.0).json())
+        gps = self._request_with_retry(
+            lambda: requests.get(f"{FRODOBOT_BASE}/data", timeout=5.0).json())
         img = decode_frame(cam["front_frame"])
         lat, lon = gps["latitude"], gps["longitude"]
         orientation_deg_raw = float(gps["orientation"])
@@ -727,10 +788,14 @@ class OmniVLAEdgeDeployment:
         return img, lat, lon, heading_rad, gps
 
     def send_control(self, linear, angular):
-        # 전송 실패 시 예외를 그대로 올려서 run()의 루프가 멈추고 정지 명령이 강제되도록 함
-        # (에러를 삼키고 계속 움직이는 건 안전상 절대 금지 — step()과 동일한 원칙).
-        r = requests.post(f"{FRODOBOT_BASE}/control",
-                           json={"command": {"linear": linear, "angular": angular}}, timeout=5.0)
+        # 2026-10-04: 짧은 재시도(_request_with_retry)로 1~2초 내 회복되는 일시적
+        # hiccup은 흡수함 — 그래도 실패하면 예외를 그대로 올려서 run()의 루프가
+        # 멈추고 정지 명령이 강제되도록 함(에러를 삼키고 계속 움직이는 건 안전상
+        # 절대 금지 — step()과 동일한 원칙). linear/angular는 절대 속도 명령이라
+        # 재시도로 같은 값이 중복 전송돼도 안전함(상대/누적 명령이 아님).
+        r = self._request_with_retry(lambda: requests.post(
+            f"{FRODOBOT_BASE}/control",
+            json={"command": {"linear": linear, "angular": angular}}, timeout=5.0))
         return r.status_code
 
     def maybe_update_frame_buffer(self, img):
@@ -848,6 +913,8 @@ class OmniVLAEdgeDeployment:
         self._heading_ema_vec = None
         self._heading_divergence_ticks = 0
         self._heading_anchor_pull_ticks = 0
+        self._gps_heading_freeze_ticks = 0
+        self._gps_heading_freeze_last_rad = None
         self.past_track.clear()
         self._route_aligned_heading_rad = bearing
         self._route_aligned_confirmed_ts = time.time()
@@ -1045,24 +1112,39 @@ class OmniVLAEdgeDeployment:
                                           for fid in context_frame_ids]
         self.past_track.append((lat, lon))
 
-        # 2026-10-04 추가 (실측 사고, deploy_20261004_123749.jsonl): GPS 동결 감지 —
-        # 위치가 gps_freeze_min_disp_m 이상 못 움직인 채 gps_freeze_persist_ticks 이상
-        # 지속되고, 그동안 로봇 자신이 보고하는 speed가 gps_freeze_speed_threshold_mps보다
-        # 크면(=움직이고 있다고 자기보고하는데 위치만 안 바뀜) "동결"로 판정한다.
+        # 2026-10-04 추가 (실측 사고, deploy_20261004_123749.jsonl, 2026-10-04 Harness 1
+        # 재분석으로 143423.jsonl에서 세분화): GPS 동결 감지 — 위치가 gps_freeze_min_disp_m
+        # 이상 못 움직인 채 지속되고, 그 구간 안에서 speed가 gps_freeze_speed_threshold_mps를
+        # 한 번이라도 넘은 적 있으면(=로봇이 실제로 움직인 증거가 있는데 위치만 안 바뀜)
+        # gps_freeze_persist_ticks 이상 지속 시 "동결"로 판정한다.
+        # ⚠ 143423.jsonl에서 발견된 버그: 원래는 "매 틱 speed>=threshold"를 AND 조건으로
+        # 요구해서, 같은 동결 구간 안에서도 speed가 순간적으로 threshold 밑으로 떨어지면
+        # 카운터가 0으로 리셋되고 플래그가 False→True를 반복(10틱마다 재무장) — 하나의
+        # 긴 동결(tick82~145, 20~40초+)인데도 "멈췄다 주행 반복"이 생기고, 그 False인
+        # 틈마다 override/모델예측이 "정상"이라 믿고 계속 명령을 냄. 위치가 실제로
+        # 바뀌기 전까지는 리셋 안 하고(freeze_ticks는 위치 변화만으로 리셋), speed 조건은
+        # "이 동결 구간 안에서 한 번이라도 움직인 적 있었는지"(OR, 위치 변화 시 재시작)로
+        # 바꿔서 한 번 동결로 확정되면 실제로 위치가 바뀔 때까지 계속 True로 유지되게 함.
         # past_track과 별개로 독립 추적 — 정렬확인/route_corrected가 past_track을
         # clear해도 이 감지는 끊기지 않아야 함.
         speed_mps = float((raw_data or {}).get("speed") or 0.0)
-        if (self._gps_freeze_last_latlon is not None
-                and latlon_distance_m(lat, lon, *self._gps_freeze_last_latlon) < self.gps_freeze_min_disp_m
-                and speed_mps >= self.gps_freeze_speed_threshold_mps):
+        position_unchanged = (self._gps_freeze_last_latlon is not None
+                               and latlon_distance_m(lat, lon, *self._gps_freeze_last_latlon)
+                               < self.gps_freeze_min_disp_m)
+        if position_unchanged:
             self._gps_freeze_ticks += 1
+            if speed_mps >= self.gps_freeze_speed_threshold_mps:
+                self._gps_freeze_any_speed_seen = True
         else:
             self._gps_freeze_ticks = 0
+            self._gps_freeze_any_speed_seen = speed_mps >= self.gps_freeze_speed_threshold_mps
         self._gps_freeze_last_latlon = (lat, lon)
+        was_frozen = self._gps_frozen_now
         self._gps_frozen_now = (self.enable_gps_freeze_guard
-                                 and self._gps_freeze_ticks >= self.gps_freeze_persist_ticks)
+                                 and self._gps_freeze_ticks >= self.gps_freeze_persist_ticks
+                                 and self._gps_freeze_any_speed_seen)
         record["gps_frozen"] = self._gps_frozen_now
-        if self._gps_frozen_now and self._gps_freeze_ticks == self.gps_freeze_persist_ticks:
+        if self._gps_frozen_now and not was_frozen:
             self.state.log(f"⚠ GPS 위치 동결 감지(speed={speed_mps:.2f}m/s인데 위치가 "
                             f"{self.gps_freeze_persist_ticks}틱 이상 {self.gps_freeze_min_disp_m}m "
                             f"이상 안 움직임) — 정지 + heading anchor pull 보류")
@@ -1102,6 +1184,20 @@ class OmniVLAEdgeDeployment:
             map_heading_rad = route_bearing_rad_now
             source_label = "route_bearing_anchor"
             if gps_heading_rad is not None:
+                # 2026-10-04 추가 (실측 사고 deploy_20261004_133317.jsonl, 위
+                # DEFAULT_GPS_HEADING_FREEZE_PERSIST_TICKS 설명 참고): gps_heading_rad
+                # 값 자체가 거의 안 바뀐 채 여러 틱 유지되는지 추적 — 위치 동결과는
+                # 독립적으로, "추정값이 고장나서 고정된 것"을 잡기 위함.
+                if (self._gps_heading_freeze_last_rad is not None
+                        and abs((gps_heading_rad - self._gps_heading_freeze_last_rad + math.pi)
+                                % (2 * math.pi) - math.pi) < GPS_HEADING_FREEZE_EPS_RAD):
+                    self._gps_heading_freeze_ticks += 1
+                else:
+                    self._gps_heading_freeze_ticks = 0
+                self._gps_heading_freeze_last_rad = gps_heading_rad
+                gps_heading_value_frozen = (self._gps_heading_freeze_ticks
+                                             >= DEFAULT_GPS_HEADING_FREEZE_PERSIST_TICKS)
+
                 pull_diff_deg = (math.degrees(gps_heading_rad - route_bearing_rad_now) + 180) % 360 - 180
                 if abs(pull_diff_deg) >= self.heading_anchor_pull_threshold_deg:
                     self._heading_anchor_pull_ticks += 1
@@ -1113,12 +1209,27 @@ class OmniVLAEdgeDeployment:
                 # (진짜 반박과 구분 불가) 끝까지 안 풀리는 버그가 있었음 — 동결 중에는
                 # pull 자체를 보류하고 route_bearing_anchor를 유지(아래 override 체인에서
                 # gps_freeze_safety가 최우선으로 정지시킴, 여기선 지도 내용만 안전하게 유지).
+                # gps_heading_value_frozen도 같은 이유로 보류(133317 사고: 위치는 계속
+                # 바뀌어서 _gps_frozen_now는 안 걸렸는데 추정값만 -90.0°에 60초+ 고정).
+                # 2026-10-04 추가 (실측 사고 deploy_20261004_143423.jsonl, Harness 1 교차분석):
+                # GO LIVE 직후처럼 past_track 누적이 적으면 estimate_heading_from_track()의
+                # "짧은 창"(fast_disp_m) 경로가 양자화 잡음 섞인 값을 매 tick 다른 격자각도로
+                # 내놓을 수 있음(같은 값에 고정되는 게 아니라 계속 "다른 값으로 틀림" —
+                # gps_heading_value_frozen 체크로는 못 잡는 변종). gps_accumulated_path_m이
+                # DEFAULT_HEADING_ANCHOR_PULL_MIN_ACCUM_PATH_M(긴 창 평균화가 실제로 적용되는
+                # 기준, gps_heading_readiness()의 기본 min_disp_m과 동일) 이상 쌓이기 전에는
+                # pull 자체를 보류 — 짧은 창 기반의 덜 평균화된 추정을 신뢰하지 않음.
+                gps_track_ready = gps_accumulated_path_m >= DEFAULT_HEADING_ANCHOR_PULL_MIN_ACCUM_PATH_M
                 if (self._heading_anchor_pull_ticks >= self.heading_anchor_pull_persist_ticks
-                        and not self._gps_frozen_now):
+                        and not self._gps_frozen_now
+                        and not gps_heading_value_frozen
+                        and gps_track_ready):
                     map_heading_rad = gps_heading_rad
                     source_label = "gps_track_pull"
             else:
                 self._heading_anchor_pull_ticks = 0
+                self._gps_heading_freeze_ticks = 0
+                self._gps_heading_freeze_last_rad = None
             smoothed_deg = math.degrees(map_heading_rad)
             record["heading_diff_deg"] = None
             record["smoothed_heading_deg"] = smoothed_deg
@@ -1331,8 +1442,15 @@ class OmniVLAEdgeDeployment:
                 self.state.log(f"⚠ 경로 이탈 감지(안전망, {self.off_route_safety_threshold_m:.1f}m 초과) — 정지")
             elif self._last_route_bearing_rad is not None:
                 target_time_s = 3 * WAYPOINT_STRIDE_SEC
+                # 2026-10-04 추가 (실측 사고 deploy_20261004_133317.jsonl): map_heading_rad는
+                # route_bearing_anchored의 pull로 이 tick만 gps_track 노이즈(양자화 격자각도
+                # 등)에 오염돼 있을 수 있음 — override는 "모델/노이즈 입력 무시하고 route
+                # 지오메트리로만 조향"이 목적이라, 기준 heading도 이 tick에 새로 구한
+                # route_bearing_rad_now(오염 없음)를 써야 일관됨. None이면(route 끝 근처 등)
+                # map_heading_rad로 폴백.
+                ref_heading_rad = route_bearing_rad_now if route_bearing_rad_now is not None else map_heading_rad
                 linear, angular = route_bearing_to_control(
-                    self._last_route_bearing_rad, map_heading_rad, target_time_s)
+                    self._last_route_bearing_rad, ref_heading_rad, target_time_s)
                 linear, angular = clip_control(linear, angular)
                 self.state.log(f"⚠ 경로 이탈 감지(안전망, {self.off_route_safety_threshold_m:.1f}m 초과) — "
                                 f"route_bearing 기반 조향으로 전환")
@@ -1344,8 +1462,11 @@ class OmniVLAEdgeDeployment:
             # 근거리에서는 모델 raw 출력이 실제 지도 내용과 무관하게 결정론적으로
             # 좌회전하는 게 실측됨 — DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M 상수 설명 참고.
             target_time_s = 3 * WAYPOINT_STRIDE_SEC  # waypoint_to_control()의 target_step=2와 동일 시정수
+            # 2026-10-04 추가: 아래 straight_segment와 동일 이유로 map_heading_rad(오염
+            # 가능) 대신 route_bearing_rad_now를 기준으로 씀.
+            ref_heading_rad = route_bearing_rad_now if route_bearing_rad_now is not None else map_heading_rad
             linear, angular = route_bearing_to_control(
-                self._last_route_bearing_rad, map_heading_rad, target_time_s)
+                self._last_route_bearing_rad, ref_heading_rad, target_time_s)
             linear, angular = clip_control(linear, angular)
             near_goal_override_applied = True
             override_reason = "near_goal"
@@ -1368,7 +1489,14 @@ class OmniVLAEdgeDeployment:
                 straight_diff_deg = abs((math.degrees(far_b - near_b) + 180) % 360 - 180)
                 if straight_diff_deg <= self.straight_angle_threshold_deg:
                     target_time_s = 3 * WAYPOINT_STRIDE_SEC
-                    linear, angular = route_bearing_to_control(near_b, map_heading_rad, target_time_s)
+                    # 2026-10-04 추가 (실측 사고 deploy_20261004_133317.jsonl, tick40-42):
+                    # map_heading_rad가 route_bearing_anchored의 pull로 이 tick만
+                    # gps_track 노이즈(양자화 격자각도)에 오염돼 있으면, 직진 구간인데도
+                    # 그 noise를 "현재 방향"으로 오인해서 순간적으로 풀 강도(MAX_W) 조향을
+                    # 냈던 버그 — near_b/far_b처럼 이 tick에 새로 구한 오염 없는
+                    # route_bearing_rad_now를 기준으로 써서 노이즈에 면역되게 함.
+                    ref_heading_rad = route_bearing_rad_now if route_bearing_rad_now is not None else map_heading_rad
+                    linear, angular = route_bearing_to_control(near_b, ref_heading_rad, target_time_s)
                     linear, angular = clip_control(linear, angular)
                     straight_segment_override_applied = True
                     override_reason = "straight_segment"

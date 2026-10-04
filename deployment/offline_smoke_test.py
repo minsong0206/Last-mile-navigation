@@ -745,6 +745,49 @@ def test_i_gps_freeze_guard():
           f"(실제 값: {sources_during_freeze}) -- route_bearing_anchored의 pull 버그 수정 확인")
 
 
+# ── test J: 2026-10-04 네트워크 요청 재시도(_request_with_retry) ──────────────────
+def test_j_network_retry():
+    print("\n========== test_j_network_retry ==========")
+    camera_frames = _load_camera_frames() * 3
+    gps_sequence = [_base_gps(BASE_LAT, BASE_LON)] * 5
+    fake_get, fake_post, _ = build_fake_requests(camera_frames, gps_sequence)
+
+    with mock.patch("requests.get", side_effect=fake_get), mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=1)
+
+    # 1) NETWORK_RETRY_COUNT(2)회 안에서 회복되면 예외 없이 성공해야 함
+    calls = {"n": 0}
+
+    def flaky_then_ok():
+        calls["n"] += 1
+        if calls["n"] <= dep.NETWORK_RETRY_COUNT:
+            raise TimeoutError("일시적 실패(테스트)")
+        return "ok"
+
+    result = deployer._request_with_retry(flaky_then_ok)
+    assert result == "ok"
+    assert calls["n"] == dep.NETWORK_RETRY_COUNT + 1
+    print(f"[OK] {dep.NETWORK_RETRY_COUNT}번 실패 후 회복 -- 예외 없이 성공 "
+          f"(총 시도 {calls['n']}회)")
+
+    # 2) 재시도를 다 써도 계속 실패하면 여전히 예외가 그대로 올라와야 함(안전 원칙 유지)
+    calls2 = {"n": 0}
+
+    def always_fail():
+        calls2["n"] += 1
+        raise TimeoutError("영구 실패(테스트)")
+
+    try:
+        deployer._request_with_retry(always_fail)
+        raised = False
+    except TimeoutError:
+        raised = True
+    assert raised, "재시도를 다 썼는데도 예외가 안 올라옴 -- 안전 원칙(통신 불능시 반드시 실패) 깨짐"
+    assert calls2["n"] == dep.NETWORK_RETRY_COUNT + 1
+    print(f"[OK] 재시도({dep.NETWORK_RETRY_COUNT}회)를 다 써도 계속 실패하면 예외가 그대로 올라옴 "
+          f"(총 시도 {calls2['n']}회) -- '통신 불능이면 멈춘다' 안전 원칙 유지 확인")
+
+
 if __name__ == "__main__":
     test_a_dry_run_lock()
     test_b_full_workflow()
@@ -755,4 +798,5 @@ if __name__ == "__main__":
     test_g_reroute_disabled_by_default()
     test_h_new_mechanisms_2026_10_04()
     test_i_gps_freeze_guard()
+    test_j_network_retry()
     print("\n모든 오프라인 스모크 테스트 통과.")
