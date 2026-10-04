@@ -467,6 +467,283 @@ future-route 선분의 픽셀 길이(bbox_h)"가 좌편향의 진짜 설명변�
 
 ---
 
+### 1-9. 2026-10-04 아침 fresh run(`20261004_104301`, override 끈 비교용 baseline) 직접 분석
+— **오늘 보인 큰 좌/우 급변은 §1-8과 다른 메커니즘(heading 드리프트)이 주원인**
+
+**계기**: 사용자가 "방금 json log 보고 Harness 2와 투트랙으로, OSM map trajectory는
+직진인데 model 예측이 왜 좌회전으로 나오는지 분석해달라"고 요청(코드 수정 없이
+분석만). `deployment/logs/deploy_20261004_104301.jsonl`(가장 최근 run, `auto` 모드,
+27m 체크포인트, `near_goal_override_dist_m=0.0`=완전 비활성 — 비교용 baseline,
+`dist_to_goal_m` 19.9→17.0m 구간만 포함, goal은 §2-1과 동일한 "직진 후 우회전"
+실제 경로)을 직접 열어서 `map_replay_path` PNG들을 하나씩 눈으로 확인함.
+
+**중요한 선행 확인**: 이 경로는 애초에 "직진"이 아니라 **실제로 L자형(직진 후
+우회전) 경로**임 — `map_000025.png` 등 `heading_route_diff_deg≈0`(올바르게 정렬된
+순간)의 지도를 보면, ego에서 위로 뻗은 빨간 선이 중간에서 **우측으로 꺾여** goal로
+이어짐. 그래서 "map은 직진인데 모델이 좌회전"이 아니라, 더 정확히는 "지도가 L자형
+그대로 보일 때는 모델도 대체로 작은 값(+0.02~0.03, 약한 좌편향 — §1-8의 작은 잔차와
+일치)을 내는데, **지도가 갑자기 ±40~50° 돌아간 것처럼 보이는 구간에서 모델이
+그 (왜곡된) 지도에 맞춰 ±0.1~0.23까지 크게 흔들린다**"는 게 실제로 일어난 일.
+
+**근거 (tick별 실측, `map_heading_source`/`heading_route_diff_deg`/실제 지도 그림 대조)**:
+
+| tick | dist | `map_heading_source` | `heading_route_diff_deg` | angular | 지도 모양(직접 확인) |
+|---|---|---|---|---|---|
+| 25 | 19.87m | route_aligned | ≈0 | +0.025 | L자(직진→우회전) 정상 |
+| 46 | 18.63m | gps_ema_hold | 0.0 | +0.023 | L자 정상, 코너 더 가까움 |
+| **74** | 16.92m | **gps_track** | **-41.4°** | **+0.164**(강한 좌) | L자가 **45° 가까이 회전**돼서 대각선으로 보임 — 모델은 **그 왜곡된 그림에 맞는** 반응을 한 것 |
+| 95 | 16.61m | gps_ema_hold | 0.0 | +0.027 | 보정 후 L자 정상 복귀 |
+| **101** | 16.88m | **gps_track** | **+13.9°** | **-0.160**(강한 우) | 반대 방향으로 돌아가서 코너가 거의 바로 앞처럼 보임 — 역시 **그림에 맞는** 반응 |
+
+(이미지는 `deployment/logs/frames/20261004_104301/map_000025.png`,`_046`,`_074`,
+`_095`,`_101.png` 참고 — 전부 직접 열어서 확인함.)
+
+**왜 heading이 ±40~50°씩 틀어지나 — GPS 양자화(§2-1에서 이미 발견한 이슈)로 직접
+설명됨**: tick 44-56 구간에서 `lat`은 `37.631046`→`37.631042`→`37.631039`로 **단
+3번만, 아주 미세하게(약 0.3~0.6m 상당)** 바뀌고 그 사이 여러 tick 동안 완전히
+고정돼 있음 — 로봇은 실제로 계속 움직이고 있는데(§2-1에서 이미 확인된 패턴)
+GPS 업데이트가 그보다 훨씬 느려서, `gps_track`(최근 GPS 변화량으로 heading을
+추정하는 방식)이 **이 양자화 노이즈 수준의 미세한 변위**로부터 heading을
+계산하려다 완전히 엉뚱한 방향(-147.7°, -136.6°, -147.7°, -162.5°로 왔다갔다)을
+뽑아냄. `smoothed_heading_deg`(EMA)가 일부 완화하긴 하지만 그래도 -105.7°(기준)→
+-158.9°까지 drift됨.
+
+**이미 있는 안전장치가 작동은 하지만 늦게 작동함**: 이 run에서
+`heading_route_correction` 이벤트가 3번 발생(tick~37, ~88, ~118 부근, "rate-limit +
+route_bearing 재동기화" 메커니즘 — 2026-10-03 밤 세션에서 §1-8/§3-1 근거로 이미
+구현됨, 문서 맨 위 "세션 종료 시점 상태" 참고)해서 `route_corrected`→
+`gps_ema_hold`로 heading을 정상 복귀시킴. 하지만 교정 사이사이에 **drift가 -53°,
++49°까지 쌓이도록 방치된 채로 수십 tick(≈10초+) 동안 잘못된 명령이 실제로 로봇에
+나감** — 안전장치의 "트리거 타이밍/민감도"가 다음 튜닝 대상으로 보임.
+
+**결론 — §1-8과 분리해서 볼 것**:
+- §1-8("future-route 선분이 짧으면 내용 무관하게 좌회전")은 **이 run에서는 거의
+  관측되지 않음** — dist가 16.6-19.9m로 계속 머물러서 §1-8이 식별한 "위험구간"
+  (27m 체크포인트 기준 대략 7-8m 이내)에 아예 안 들어갔고, `near_goal_override_dist_m=0`
+  으로 그 완화책도 꺼져있던 run이라 애초에 테스트 대상이 아니었음(의도된
+  baseline).
+- 오늘 눈에 띄는 **큰(±0.1~0.23) 좌/우 급변은 전부 `gps_track` 구간에서만
+  발생**했고, 전부 "그 순간 지도가 실제로 어떻게 왜곡돼 보였는지"로 설명됨 — 즉
+  **모델이 콘텐츠를 무시한 게 아니라, GPS 양자화 → heading 추정 오류 → 지도 회전
+  왜곡이라는 입력 쪽 문제**. 이건 §2-1에서 이미 "GPS 프리징이 생각보다 심함"으로
+  발견했던 이슈의 **직접적인 다운스트림 결과**라는 게 이번에 처음으로 그림으로
+  확인됨.
+- **이게 의미하는 것**: near-goal override(§3-1)는 §1-8 문제엔 맞는 해법이지만,
+  이 run처럼 goal에서 아직 먼데도 heading 추정이 불안정해서 생기는 큰 swing은
+  **별개 문제**라서 override로는 안 잡힘 — heading rate-limit/재동기화 쪽
+  튜닝(드리프트가 쌓이기 전에 더 빨리/더 작은 threshold로 교정)이 이 증상엔 더
+  직접적인 해법으로 보임. 두 메커니즘을 혼동하지 말 것.
+
+---
+
+### 1-10. 2026-10-04 `route_bearing` 실험 run(`20261004_105158`) — §1-9와 같은 메커니즘,
+더 길고 극단적으로 재현 + "좌회전 후 우회전이 상쇄돼 결과적으로 직진처럼 됨"까지 확인
+
+**계기**: 사용자가 방금 `route_bearing` 관련 실험을 했는데(`near_goal_override_dist_m=8.0`
+로 활성 상태, `auto` 모드, 27m 체크포인트, 같은 "직진후우회전" goal), "OSM map
+trajectory는 여전히 직진인데 모델은 좌회전을 말해서 로봇이 좌회전했고, 그다음
+우회전을 했지만 **이미 좌회전으로 꺾인 헤딩에서 우회전을 하다보니 실제 주행은
+우회전이 아니라 직진처럼 됐다**"고 보고 — 코드 수정 없이 원인만 분석 요청.
+`deploy_20261004_105158.jsonl`(97 LIVE tick)과 해당 `map_replay_path` PNG들을
+직접 열어서 확인함(`context_video.mp4`/`map_video.mp4`가 이제 run 종료 시 자동
+생성됨 — 직접 보진 않고 같은 소스인 PNG 프레임을 개별로 확인).
+
+**결론 먼저: §1-9와 똑같은 메커니즘(GPS 양자화→`gps_track` heading 추정 오류→
+지도 회전 왜곡)이 이번엔 훨씬 길고 두 번 연속으로 반대 방향으로 재현됨.** 이
+run은 `near_goal_override_dist_m=8.0`(활성)이었지만 `dist_to_goal_m`이 16.1-18.6m
+구간에 머물러서 override 임계값(8m) 안에 들어간 적이 없음 — 즉 **이번 일도
+override/§1-8과는 무관**, 순수하게 heading 추정 문제.
+
+**tick별 실측 요약** (`hrd`=`heading_route_diff_deg`, 양수=좌 angular):
+
+| tick 구간 | `map_heading_source` | hrd 변화 | angular 변화 | 실제 지도(직접 확인) |
+|---|---|---|---|---|
+| 27-31 | route_aligned | ≈0 | +0.024 (약한 좌, §1-8 잔차 수준) | 정상 L자(직진→우회전) |
+| 32-35 | gps_track | **+73.4°→+56.4°** | -0.031~-0.061(우) | — |
+| 36 | route_corrected | →0 | +0.019 복귀 | — |
+| 37-47 | gps_ema_hold | 0 | +0.02~0.023 (정상) | 정상 L자 |
+| **48-90** | gps_track | **-2.9°→-21.5°(유지)** | **+0.01→+0.093로 상승, 40+ tick 동안 지속적 좌편향** | tick63: 즉시-앞 red 선분이 살짝 좌로 기운 대각선(아래 그림) — 모델이 **그 모양을 그대로 따라감** |
+| **93-109** | gps_track | **+3.1°→+54.4°** | **-0.01→-0.26로 급격히 강해짐(우), 17 tick 지속** | tick108: 즉시-앞 red 선분이 ego 바로 옆에서 거의 수평(우측)으로 꺾여 보임(아래 그림) — 역시 **그 모양을 그대로 따라감** |
+| 110 | route_corrected | →0 | +0.004 복귀 | — (단, 복귀된 `smoothed_heading_deg`가 -105.7°→**-162.2°로 베이스라인 자체가 바뀜**, 아래 참고) |
+| 111-123 | gps_ema_hold→gps_track | 0→+42까지 재drift 시작 | +0.001~+0.014 | (run 종료) |
+
+(이미지: `deployment/logs/frames/20261004_105158/map_000028.png`(정상 L자),
+`_063.png`(hrd=-21.5, angular=+0.093 — ego 바로 앞 선분이 왼쪽으로 기움),
+`_108.png`(hrd=+52.0, angular=-0.26 — ego 바로 앞 선분이 거의 수평으로 꺾여
+보임) 직접 열어서 확인함.)
+
+**핵심 해석**:
+1. **모델은 여전히 "눈에 보이는 것"을 비교적 충실히 따라감** — §1-9와 동일 결론
+   재확인. 특히 모델의 예측 horizon이 짧아서(약 2m), ego 바로 옆의 "즉시 다음
+   방향"이 지도 회전 왜곡으로 어느 쪽을 가리키든 그쪽을 따라감 — 멀리 있는
+   실제 코너(우회전 지점)의 진짜 방향과는 무관.
+2. **"좌회전 후 우회전이 상쇄돼 직진처럼 됐다"는 사용자 관찰과 정확히 일치하는
+   정량적 근거**: tick48-90(약 40틱≈15초+) 동안 `linear=0.3`을 유지한 채 실제로
+   좌회전 명령이 나갔고(+0.01→+0.093), 곧바로 tick93-109(약 17틱≈6초+) 동안
+   반대로 강한 우회전 명령(-0.01→-0.26)이 나감 — **둘 다 "진짜 교정"이 아니라
+   둘 다 gps_track이 순간순간 잘못 추정한 heading에 대한 반응**이었으므로, 두
+   번째(우회전) 구간이 "첫 번째(좌회전) 구간에서 실제로 틀어진 헤딩을 의도치
+   않게 되돌리는" 효과를 낸 것으로 보임 — 결과적으로 두 개의 "오답"이 서로
+   상쇄돼 순real-world 헤딩 변화가 작아 보이는(직진처럼 보이는) 효과.
+3. **안전장치(`route_corrected`)는 두 번 다 작동했지만, 두 번째 복귀 시
+   베이스라인 자체가 -105.7°→-162.2°로 바뀜** — 이건 로봇이 그 사이 실제로
+   (왜곡된 명령을 따라) 이동해서 `_closest_route_idx`가 route 위의 다른(실제로
+   bearing이 다른) 지점으로 스냅했기 때문일 가능성이 높음 — 즉 **"틀린 명령이
+   실제 위치를 바꿔놔서, 다음 '정상' 기준점 자체도 같이 틀어지는" 피드백 루프**가
+   있다는 뜅. 이 부분은 추가 확인 필요(이번 세션에서는 분석만, 코드는 안 건드림).
+4. §1-9/§1-10 둘 다 종합하면: **heading 추정(`gps_track`) 불안정 → 이 전체 사고의
+   단일 근본원인**으로 거의 확정적으로 보임. `near_goal_override`나 §1-8 메커니즘과는
+   계속 분리해서 볼 것 — 이번 두 run 다 override 임계값(8m) 안에 들어간 적이
+   없는데도 똑같이 발생함.
+
+### 1-11. 2026-10-04 구현: route_bearing_anchored + off-route 안전망(감지/액션 분리) + 직진 구간 override — 전부 config/CLI로 분리
+
+**배경**: §1-9/§1-10 + `deploy_20261004_111807.jsonl`(heading_mode=`route_bearing`)
+직접 분석을 종합해서, 좌회전 편향의 원인을 3갈래로 최종 정리함:
+- **A. GPS 양자화 노이즈** → `gps_track` heading 추정이 흔들림 → 지도가 실제로
+  잘못 그려짐 → 모델은 (잘못된) 지도를 정직하게 따름. `past_track.clear()` 추가로
+  부분 완화(재발 간격 15-16틱→51틱), 완전 해결은 아님.
+- **B. 모델 자체의 미세한 좌측 bias** — 지도가 완벽히 정확해도 존재함
+  (`heading_route_diff_deg=0.0`인 tick에서도 `angular=+0.0228` 관측, 지도 PNG로도
+  직진 확인됨). §1-8 bbox_h 메커니즘의 연장선. **재학습/데이터 리밸런싱(§1-3, 아직
+  blocked) 없이는 배포 쪽에서 완전히 못 고침** — 가장 근본적인 문제로 판단.
+- **C. `heading_mode=route_bearing`처럼 gps_track을 완전히 끊으면 실제 경로 이탈을
+  못 알아챔** — `deploy_20261004_111807.jsonl`에서 실측: 실제 이동 거리 4.851m(순
+  변위 4.455m, 꽤 직선으로 이동)인데 `dist_to_goal_m`은 겨우 0.378m만 줄어듦 =
+  목표 방향에서 약 85° 벗어난 채로 이동했는데 감지 자체가 안 됨.
+
+사용자가 명시적으로 "장애물 회피는 필요 없는 vanilla 환경"이라고 범위를 좁혀줘서,
+모델의 "판단"보다 결정론적 경로추종을 우선하는 트레이드오프가 허용됨. Harness 1과
+교차검증 후 Harness 1이 제안한 "지도 렌더링용 heading과 이탈 감지를 분리"하는
+설계(위 A/C를 각각 다른 메커니즘으로 완화)에 사용자가 요청한 "직진 구간이면 실제로
+직진하게" 4번째 메커니즘을 더해서 `deployment/omnivla_edge_deploy.py`에 구현함 —
+전부 기본값 꺼짐 상태로 추가, CLI 플래그 또는 `--config <yaml>`로만 켜짐(실험 분리 목적):
+
+1. **`heading_mode=route_bearing_anchored`**: 기본은 `route_bearing`(노이즈 없음)을
+   지도 렌더링 heading으로 사용. `gps_track`이 `heading_anchor_pull_threshold_deg`
+   (기본 20°) 이상 차이나는 상태가 `heading_anchor_pull_persist_ticks`(기본 5틱)
+   이상 "지속"돼야만 `gps_track`으로 끌려감 — 1틱짜리 순간 노이즈(A)에는 안 끌려감.
+2. **`enable_off_route_safety`**: `is_off_route()` 감지를 `allow_reroute`와 완전히
+   분리(기존엔 `allow_reroute=False`가 감지 자체까지 꺼버리던 버그였음 — 재라우팅
+   폭주 버그 수정 때 같이 묶여서 꺼진 것으로 추정). 감지는 항상 평가되고,
+   `off_route_safety_threshold_m`(기본 3m) 이상 이탈 시 `off_route_safety_action`
+   (`"stop"` 또는 `"steer"` — steer는 비싼 OSRM 재라우팅 대신 `route_bearing_to_control()`
+   기반 경량 조향)으로 대응. `allow_reroute`는 그대로 둘 수 있어서, "감지는 항상,
+   재라우팅은 여전히 신중하게"가 구조적으로 보장됨(C 완화).
+3. **`enable_straight_segment_override`**: 근거리(`straight_near_lookahead_m`, 기본
+   2m)/원거리(`straight_far_lookahead_m`, 기본 12m) `route_bearing_rad()` 차이가
+   `straight_angle_threshold_deg`(기본 20°) 이내면 "앞으로 직진 구간"으로 판단해서
+   모델 예측을 무시하고 `route_bearing_to_control()`로 직접 조향. 차이가 크면(실제
+   턴 구간) 기존처럼 모델 예측을 그대로 사용. **B를 모델 재학습 없이 구조적으로
+   우회하는 유일한 방법** — 직진 구간에서는 모델의 좌측 bias가 섞여들 여지가
+   원천적으로 없어짐.
+4. **override 우선순위**(동시에 조건 겹치면): `off_route_safety` > `near_goal_override`
+   > `straight_segment` (코드상 if/elif 순서 그대로).
+5. **`--config <yaml>`**: 최소 argparse 서브파서로 `--config`만 먼저 뽑아 YAML을
+   `set_defaults()`로 적용(명시적 CLI 플래그가 항상 우선), 알 수 없는 키는 즉시
+   에러. `--ckpt`/`--map_range`/`--goal_lat`/`--goal_lon`은 `argparse`의
+   `required=True`가 `set_defaults()`를 무시하는 걸 발견해서 `default=None` +
+   수동 post-parse 검증으로 바꿈(기존의 "값 없으면 무조건 에러" 안전성은 그대로 유지).
+   예시 config: `deployment/configs/route_bearing_anchored_safety.yaml` (위 4개
+   메커니즘을 전부 켠 조합, goal_lat/lon은 배포 장소에 맞게 CLI에서 덮어쓰기).
+
+**검증 상태**: `deployment/offline_smoke_test.py`에 `test_h_new_mechanisms_2026_10_04`
+추가, 전체 8개 테스트(기존 7개 + 신규 1개) 전부 통과 확인(2026-10-04). `debug_web.py`
+대시보드도 새 heading source 라벨(`route_bearing_anchor`/`gps_track_pull`)과
+`is_off_route`/적용 중인 override 표시 행 추가. **⚠ 아직 실기기 검증 전** — 이
+세션 작성 시점 로봇 배터리가 critically low(5-16% 왕복)라 실주행 테스트 못 함.
+다음 충전 후 `route_bearing_anchored_safety.yaml`로 짧은 구간부터 재검증 필요.
+
+---
+
+### 1-12. §1-11 첫 실기기 검증(`deploy_20261004_123749.jsonl`) — **새 버그 발견: GPS 프리징 + `route_bearing_anchored`의 pull 로직이 영구 lock에 빠짐**
+
+**명령**: `--heading_mode route_bearing_anchored --near_goal_override_dist_m 0`(B/근거리
+메커니즘은 끄고 A 대응책만 단독 검증). 사용자 보고: "좌편향은 여전히 존재하고,
+우회전하려는데 map heading이 갑자기 변하면서 우회전만 계속하게 됨(원래 우회전 후
+직진이어야 함)".
+
+**분석 결과 — 추측 아니라 로그 수치로 확정**:
+- tick165부터 run 종료(tick219, ~20초+)까지 **`lat`/`lon`이 완전히 동일값
+  (`37.630974, 127.076065`)에 고정** — `gps_accumulated_path_m`/`gps_net_displacement_m`도
+  소수점까지 완전히 똑같이(`1.6986083984375`) 멈춤. 그 와중에 `frodobot_raw.speed`는
+  계속 0.7~1.14(로봇은 실제로 계속 움직이고 있었음), `gps_fix_ok=True`로 에러 표시도
+  없음 — §2-1에서 이미 기록한 "GPS 프리징" 그대로 재현(이번엔 결과가 훨씬 심각함).
+- GPS가 멈추기 직전 `gps_track` 추정값이 `-90.0°`(양자화 격자각도)에서 고정되고,
+  `route_bearing`은 그 위치 기준 `-162.0°`(실제 경로가 요구하는 진짜 우회전 방향,
+  멈춘 위치에서는 그대로 고정)로 유지 — 72° 차이가 `heading_anchor_pull_threshold_deg`
+  (20°)를 영구히 초과해서 `map_heading_source="gps_track_pull"`로 전환된 뒤
+  **다시는 안 풀림**(tick165~219 내내 `gps_track_pull` 고정).
+- 결과: 지도가 `-90°`로 고정 렌더링된 채 모델이 (§1-8/1-9/1-10에서 이미 확인한
+  대로 지도 내용에 충실하게) 계속 강한 우회전(`angular` -0.11~-0.21)을 명령 —
+  그런데 GPS가 안 바뀌니 "충분히 돌았다"는 피드백이 전혀 없어서 **끝까지 우회전만
+  반복**. 사용자가 보고한 증상과 정확히 일치.
+
+**근본 원인(새로운 버그, §1-9/1-10의 "GPS noise→heading 왜곡"과는 다른 레이어)**:
+기존 `route_corrected`(§1-9/1-10 당시 구조)는 "오래 어긋나면 **route_bearing**(안정적
+쪽)으로 되돌린다"였는데, `route_bearing_anchored`는 의도적으로 방향을 반대로
+설계함("오래 어긋나면 **gps_track**을 믿는다", §1-11 참고 — Harness 1이 제안한
+설계 자체). **"지속적으로 어긋남"만으로 신뢰를 넘기는 판정 기준이, "진짜 움직여서
+반박하는 것"과 "GPS가 멈춰서 생기는 가짜 반박"을 구분 못 함** — frozen GPS는
+`gps_track` 추정치 자체가 다시는 안 바뀌므로 "지속 반박"처럼 보이는 조건을 영원히
+만족시켜버림. 설계 자체(지도 heading 안정화 vs 이탈 감지 분리)는 맞는 방향이었지만,
+**pull 조건에 "실제로 GPS가 최근에 움직였는가"(freshness) 체크가 빠져있던 게
+직접적인 버그**로 확정.
+
+**좌편향(B) 관련**: 사용자가 "좌편향도 여전함"이라고 보고했는데, 이 run의 정상
+구간(tick34-130, `route_bearing_anchor` 소스, dist 16-20m)에서 angular는 +0.01~+0.03
+수준 — §1-2/1-9에서 이 거리대에 이미 측정했던 작은 잔차 좌편향과 일치하는 크기라,
+**새로운 악화가 아니라 기존에 이미 특정된(§1-3 blocked) 잔차가 그대로 재확인된
+것**으로 보임(이 run은 `near_goal_override_dist_m=0`으로 B의 주 완화책도 꺼둔
+상태였다는 점 고려).
+
+**제안(코드는 안 건드림, Harness 2 검토용)**: pull 조건에 freshness 체크 추가 필요
+— 예: 직전 `heading_anchor_pull_persist_ticks`개 tick 동안 `gps_accumulated_path_m`
+또는 `gps_net_displacement_m`가 일정량(예: MIN_NET_DISP_M 수준) 이상 **실제로
+증가했는지**도 같이 확인하고, 증가가 없으면(=GPS 프리징 중) pull 자체를 보류하고
+기존 anchor(route_bearing) 유지. 더 근본적으로는, 이 freezing 문제가 heading_mode와
+무관하게 반복적으로 실패를 일으키고 있어서(§2-1, §1-9, 이번 §1-12까지 3번째) —
+GPS 프리징 자체를 감지해서(예: N틱 연속 `gps_accumulated_path_m` 무변화인데
+`speed`>0이면) 별도로 로그/알림하는 진단 장치를 추가하는 것도 고려할 만함.
+
+### 1-13. §1-12 수정 구현 완료: GPS 동결 감지 안전장치 추가 + `route_bearing_anchored`의 pull 버그 수정
+
+Harness 1의 제안(위 §1-12 제안)과 사용자가 직접 선택한 "GPS 동결 감지 안전장치"를
+**같은 감지기 하나로** 구현해서 두 문제를 동시에 고침:
+
+- **감지 로직**(`past_track`과 독립적으로 추적 — 정렬확인/route_corrected가
+  `past_track`을 clear해도 끊기지 않음): 위치가 `gps_freeze_min_disp_m`(기본
+  0.03m) 이상 못 움직인 채 `gps_freeze_persist_ticks`(기본 10틱, ~3.3초)
+  이상 지속되고, 그동안 `frodobot_raw.speed`가 `gps_freeze_speed_threshold_mps`
+  (기본 0.15m/s) 이상이면(=움직이고 있다고 자기보고하는데 위치만 안 바뀜)
+  `gps_frozen=True`로 판정.
+- **용도 1 (사용자가 선택한 안전장치)**: override 체인 최우선 순위(off_route_safety/
+  near_goal/straight_segment보다 위)로 추가 — `gps_frozen`이면 무조건
+  `linear=angular=0.0`, `override_reason="gps_freeze_safety"`. 위치 입력 자체가
+  신뢰 불가능하면 나머지 override들의 거리/route_bearing 계산도 같이 못 믿기 때문에
+  가장 먼저 걸림.
+- **용도 2 (Harness 1의 pull 버그 직접 수정)**: `route_bearing_anchored`의 pull
+  조건에 `and not self._gps_frozen_now` 가드 추가 — 동결 중에는 아무리
+  `heading_anchor_pull_ticks`가 임계값을 넘어도 `gps_track_pull`로 전환되지 않고
+  `route_bearing_anchor`를 유지(§1-12에서 확정된 버그를 해당 틱 자체가 아예 못
+  일어나게 원천 차단).
+- 다른 2026-10-04 신규 메커니즘들과 달리 **이건 순수 안전장치라 트레이드오프가
+  없어서 기본 ON**(옵트아웃 방식, `--disable_gps_freeze_guard`로만 끌 수 있음) —
+  `near_goal_override_dist_m`(기본 8.0, 0으로 끄는 방식)과 동일한 선례를 따름.
+- 대시보드(`debug_web.py`)에도 `gps_frozen` 행과 `override_reason=gps_freeze_safety`
+  라벨(`🛑 GPS 동결 안전장치`) 추가.
+- **검증**: `deployment/offline_smoke_test.py`에 `test_i_gps_freeze_guard` 추가 —
+  §1-12 실측 패턴을 합성 재현(실제 이동 15틱 → speed>0인데 위치 동결 15틱),
+  `heading_anchor_pull_threshold_deg=0`/`persist_ticks=1`(가드 없으면 즉시 pull될
+  가장 불리한 조건)에서도 동결 구간 내내 `gps_track_pull`로 전환 안 되는 것과
+  `override_reason=gps_freeze_safety`/명령 (0,0) 고정을 직접 확인. 기존 7개 + 신규
+  2개(§1-11 3종 + 이번) = 전체 9개 오프라인 테스트 통과(2026-10-04).
+- **⚠ 아직 실기기 미검증** — 다음 실주행에서 §1-12와 동일한 장소/상황(또는 GPS
+  프리징이 재현되는 다른 구간)에서 실제로 정지하고 `gps_track_pull`에 안 빠지는지
+  확인 필요.
+
+---
+
 ## 2. 다음 실험 (Harness 2, 우선순위 순 — 2026-10-03 §1-4/§1-5 반영해서 재정렬함)
 
 **예전 "2순위"(절대거리 vs 세그먼트 비율)는 뺌** — §1-4 map_range_m 분리 실험이
@@ -577,5 +854,6 @@ run의 `deploy_<run_id>.jsonl`과 (GO LIVE 시점부터 자동 저장되는)
   `checkpoints/omnivla_edge_rides11_odom_20m_hf_20260808/best.pth`
 - `deployment/replay_logger.py` — 매 tick 카메라 6장+지도 PNG를 `deployment/logs/frames/<run_id>/`에 결정론적으로 저장 (JSONL의 `context_frame_paths`/`map_replay_path`로 역추적)
 - `deployment/dashboard_capture.py` — GO LIVE 순간 대시보드 자동 스크린샷 → `1003/` (2026-10-03 추가)
-- `deployment/offline_smoke_test.py` — 로봇/SDK 연결 없이 배포 코드 전체 워크플로 검증 (7개 테스트, 전부 통과 상태 유지해야 함)
+- `deployment/offline_smoke_test.py` — 로봇/SDK 연결 없이 배포 코드 전체 워크플로 검증 (8개 테스트, 전부 통과 상태 유지해야 함)
+- `deployment/configs/route_bearing_anchored_safety.yaml` — §1-11에서 구현한 4개 메커니즘(route_bearing_anchored/off-route 안전망/직진구간 override/near_goal_override) 조합 예시 config, `--config` 플래그로 로드
 - 체크포인트: `checkpoints/omnivla_edge_rides11_odom_20m_20260910/best.pth` — 이름은 20m이지만 **실제 학습값은 27m**(사용자 확인, `run_start` 로그로도 확인됨)

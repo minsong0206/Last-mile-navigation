@@ -86,6 +86,14 @@ class DeploymentState:
         self.dist_to_goal_m = None       # 2026-09-26 추가: goal 도착 감지
         self.goal_reached = False
         self.near_goal_override_applied = False  # 2026-10-03 추가: route_bearing 강제 조향 중인지
+        # 2026-10-04 추가: straight-segment/off-route-safety override + 이탈 감지(allow_reroute와 무관하게 항상 평가됨)
+        self.straight_segment_override_applied = False
+        self.off_route_safety_applied = False
+        self.override_reason = None
+        self.is_off_route = False
+        # 2026-10-04 추가 (실측 사고, deploy_20261004_123749.jsonl): GPS 위치 동결 감지
+        self.gps_freeze_safety_applied = False
+        self.gps_frozen = False
         self._logs = deque(maxlen=log_maxlen)
         self._errors = deque(maxlen=log_maxlen)
 
@@ -101,7 +109,9 @@ class DeploymentState:
                gps_net_displacement_m=None, osrm_fallback=_UNSET,
                start_snap_m=_UNSET, goal_snap_m=_UNSET, map_img_northup=None,
                heading_mode=None, dist_to_goal_m=None, goal_reached=None,
-               near_goal_override_applied=None):
+               near_goal_override_applied=None, straight_segment_override_applied=None,
+               off_route_safety_applied=None, override_reason=_UNSET, is_off_route=None,
+               gps_freeze_safety_applied=None, gps_frozen=None):
         # gps_heading_deg/route_bearing_deg/heading_route_diff_deg는 "이번 틱에
         # 못 구했다"는 의미로 명시적 None이 넘어올 수 있어서, 기본값을 _UNSET으로
         # 두고 "호출에서 아예 안 건드린 경우"와 구분한다 — 그냥 None 기본값을 쓰면
@@ -143,6 +153,12 @@ class DeploymentState:
             if dist_to_goal_m is not None: self.dist_to_goal_m = dist_to_goal_m
             if goal_reached is not None: self.goal_reached = goal_reached
             if near_goal_override_applied is not None: self.near_goal_override_applied = near_goal_override_applied
+            if straight_segment_override_applied is not None: self.straight_segment_override_applied = straight_segment_override_applied
+            if off_route_safety_applied is not None: self.off_route_safety_applied = off_route_safety_applied
+            if override_reason is not _UNSET: self.override_reason = override_reason
+            if is_off_route is not None: self.is_off_route = is_off_route
+            if gps_freeze_safety_applied is not None: self.gps_freeze_safety_applied = gps_freeze_safety_applied
+            if gps_frozen is not None: self.gps_frozen = gps_frozen
             self.last_update_ts = time.time()
 
     def log(self, msg):
@@ -193,6 +209,12 @@ class DeploymentState:
                 "dist_to_goal_m": self.dist_to_goal_m,
                 "goal_reached": self.goal_reached,
                 "near_goal_override_applied": self.near_goal_override_applied,
+                "straight_segment_override_applied": self.straight_segment_override_applied,
+                "off_route_safety_applied": self.off_route_safety_applied,
+                "override_reason": self.override_reason,
+                "is_off_route": self.is_off_route,
+                "gps_freeze_safety_applied": self.gps_freeze_safety_applied,
+                "gps_frozen": self.gps_frozen,
                 "map_heading_source": self.map_heading_source,
                 "route_aligned_heading_deg": self.route_aligned_heading_deg,
                 "gps_accumulated_path_m": self.gps_accumulated_path_m,
@@ -361,11 +383,21 @@ const SOURCE_LABEL = {
   gps_ema_hold: 'GPS EMA 유지(관성)',
   gps_ema_gyro: 'GPS EMA + 자이로 보정',
   route_corrected: 'route로 강제 재동기화됨',
+  route_bearing: 'route_bearing 직접 사용(매 tick)',
+  route_bearing_anchor: 'route_bearing 앵커(기본값)',
+  gps_track_pull: 'GPS 궤적이 앵커를 끌어당김(지속 불일치)',
   imu_fallback: 'IMU 폴백 (비권장)',
 };
 const SOURCE_CLASS = {
   route_aligned: 'warn', gps_track: 'ok', gps_ema_hold: 'ok',
-  gps_ema_gyro: 'ok', route_corrected: 'warn', imu_fallback: 'bad',
+  gps_ema_gyro: 'ok', route_corrected: 'warn', route_bearing: 'ok',
+  route_bearing_anchor: 'ok', gps_track_pull: 'warn', imu_fallback: 'bad',
+};
+const OVERRIDE_REASON_LABEL = {
+  gps_freeze_safety: '🛑 GPS 동결 안전장치',
+  off_route_safety: '⚠ 경로 이탈 안전망',
+  near_goal: '목표 근접 override',
+  straight_segment: '직진 구간 override',
 };
 
 async function poll() {
@@ -423,6 +455,7 @@ async function poll() {
     <tr><td>route-aligned 확정값</td><td>${s.route_aligned_heading_deg === null ? '(미확정)' : fmtNum(s.route_aligned_heading_deg, 1) + '&deg;'}</td></tr>
     <tr><td><b>최종 사용 heading</b></td><td><b>${fmtNum(s.heading_deg, 1)}&deg;</b></td></tr>
     <tr><td>GPS heading 준비도</td><td class="${readyClass}">누적 ${fmtNum(s.gps_accumulated_path_m, 2)}m / 순변위 ${fmtNum(s.gps_net_displacement_m, 2)}m (기준 1.5m/0.3m)</td></tr>
+    <tr><td>GPS 동결(gps_frozen)</td><td class="${s.gps_frozen ? 'bad' : 'ok'}">${s.gps_frozen ? '🛑 동결 감지됨 — 위치 입력 신뢰 불가' : '정상(계속 갱신 중)'}</td></tr>
   `;
   const goalClass = s.goal_reached ? 'ok' : (s.dist_to_goal_m !== null && s.dist_to_goal_m < 5 ? 'warn' : '');
   document.querySelector('#statusRoute tbody').innerHTML = `
@@ -432,7 +465,8 @@ async function poll() {
     <tr><td>heading - route 차이</td><td class="${routeDiffClass}">${s.heading_route_diff_deg === null ? '—' : fmtNum(s.heading_route_diff_deg, 1) + '&deg;'}</td></tr>
     <tr><td>지도 회전각</td><td>${s.map_rotation_deg === null ? '—' : fmtNum(s.map_rotation_deg, 1) + '&deg;'}</td></tr>
     <tr><td><b>목표까지 거리</b></td><td class="${goalClass}"><b>${fmtNum(s.dist_to_goal_m, 2)}m</b>${s.goal_reached ? ' <span class="ok">🏁 도착 — 영구 정지</span>' : ''}</td></tr>
-    <tr><td>near-goal override</td><td class="${s.near_goal_override_applied ? 'warn' : ''}">${s.near_goal_override_applied ? '⚠ 발동 중 — route_bearing 기반 조향 사용' : '비활성'}</td></tr>
+    <tr><td>경로 이탈 여부(is_off_route)</td><td class="${s.is_off_route ? 'bad' : 'ok'}">${s.is_off_route ? '⚠ 이탈 감지됨' : '정상 범위'}</td></tr>
+    <tr><td>적용 중인 override</td><td class="${s.override_reason ? 'warn' : ''}">${s.override_reason ? (OVERRIDE_REASON_LABEL[s.override_reason] || s.override_reason) : '비활성(모델 예측 그대로 사용)'}</td></tr>
   `;
   document.querySelector('#statusModel tbody').innerHTML = `
     <tr><td>target waypoint (x,y)</td><td>${s.target_waypoint_xy ? `(${fmtNum(s.target_waypoint_xy[0],3)}, ${fmtNum(s.target_waypoint_xy[1],3)}) m` : '—'}</td></tr>

@@ -1,0 +1,16 @@
+# 2026-10-04 — "OSM map heading-up을 route_bearing으로 안정적으로 넣으면
+# 직진 구간에서 더 이상 좌회전 안 하나?" 실험.
+#
+# heading_mode=route_bearing: gps_track/EMA 완전히 안 쓰고 매 tick route_bearing_rad()를
+# 그대로 heading으로 사용 — GPS 양자화 노이즈 영향 없음, 실제 턴도 route 지오메트리로
+# 자연스럽게 따라감. 단 로봇이 실제로 경로 이탈해도 못 알아챔 — 짧고 통제된 테스트
+# 구간이라 사용자가 위험 감수하기로 결정함(docs/experiment_log.md 참고).
+#
+# override는 이 실험에서 변수를 하나만 바꾸려고 꺼둠(heading_mode 효과만 보려고).
+ckpt: checkpoints/omnivla_edge_rides11_odom_20m_20260910/best.pth
+map_range: 27
+goal_lat: 37.63106492192498
+goal_lon: 127.07587033693103
+heading_mode: route_bearing
+near_goal_override_dist_m: 0
+allow_reroute: false

@@ -1,0 +1,57 @@
+# 2026-10-04 — user + Harness 1과 합의한 4개 메커니즘을 조합한 실험 config.
+#
+# 배경(docs/experiment_log.md, CLAUDE.md 2026-10-04 섹션 참고): 실주행에서 OSM map의
+# trajectory는 직진인데 로봇이 좌회전하는 문제를 3가지 원인(A: GPS 양자화로 heading
+# 추정이 흔들려 지도 자체가 잘못 그려짐, B: 지도가 정확해도 모델 자체의 미세한 좌측
+# bias, C: heading_mode=route_bearing처럼 gps_track을 전혀 안 쓰면 실제 경로 이탈을
+# 못 알아챔)으로 분리해서, 이 config는 A/C를 완화하면서 사용자가 명시한 "장애물 회피는
+# 필요없는 vanilla 환경이니, osm map이 직진이면 실제로 직진 주행하게 하자"는 요구를
+# 구조적으로 보장한다.
+#
+#  1. heading_mode=route_bearing_anchored
+#     - 기본은 route_bearing(지도 렌더링용 heading) 사용 -- GPS 양자화 노이즈 영향 없음.
+#     - gps_track이 route_bearing과 heading_anchor_pull_threshold_deg 이상 차이나는
+#       상태가 heading_anchor_pull_persist_ticks tick 이상 "지속"될 때만 gps_track으로
+#       끌려감(momentary 노이즈 한 틱으로는 안 끌려감).
+#  2. enable_off_route_safety=true, action=steer
+#     - is_off_route() 감지 자체는 allow_reroute와 무관하게 항상 평가됨(기존엔
+#       allow_reroute=False 뒤에 숨어서 감지조차 꺼져 있던 버그였음).
+#     - off_route_safety_threshold_m(3m) 이상 이탈 시, 비싼 OSRM 재라우팅 대신
+#       route_bearing_to_control() 기반의 가벼운 직접 조향으로 전환.
+#     - allow_reroute는 여전히 false로 둬서, 이 config에서는 "감지+경량 조향"까지만
+#       쓰고 실제 재라우팅은 하지 않음(재라우팅 폭주 버그 이력 있음, docs/experiment_log.md 참고).
+#  3. enable_straight_segment_override=true
+#     - 근거리(2m)/원거리(12m) route_bearing 차이가 20도 이내(=앞으로 직진 구간)면
+#       모델 예측을 무시하고 route_bearing_to_control()로 직접 조향 -- 직진 구간에서
+#       모델의 좌측 bias(원인 B)가 섞여들 여지를 구조적으로 없앰.
+#     - 실제 턴 구간(차이가 20도 넘음)에서는 이 override가 발동하지 않고 기존처럼
+#       모델 예측을 그대로 사용함.
+#
+# 우선순위(동시에 조건이 겹치면): off_route_safety > near_goal_override > straight_segment
+# (코드상 step()의 if/elif 체인 순서와 동일, omnivla_edge_deploy.py 참고)
+#
+# ⚠ 아직 실기기 검증 전 (오프라인 스모크 테스트만 통과, 2026-10-04). 배터리 충전 후
+# 짧은 구간부터 다시 실주행 테스트 필요.
+
+ckpt: checkpoints/omnivla_edge_rides11_odom_20m_20260910/best.pth
+map_range: 27
+
+heading_mode: route_bearing_anchored
+heading_anchor_pull_threshold_deg: 20.0
+heading_anchor_pull_persist_ticks: 5
+
+near_goal_override_dist_m: 8.0
+
+enable_off_route_safety: true
+off_route_safety_threshold_m: 3.0
+off_route_safety_action: steer
+allow_reroute: false
+
+enable_straight_segment_override: true
+straight_near_lookahead_m: 2.0
+straight_far_lookahead_m: 12.0
+straight_angle_threshold_deg: 20.0
+
+# goal_lat/goal_lon은 매 배포 장소에 맞게 CLI에서 덮어쓰거나 여기에 직접 채워서 사용.
+# goal_lat: 37.63106492192498
+# goal_lon: 127.07587033693103

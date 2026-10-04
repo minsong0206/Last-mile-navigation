@@ -168,6 +168,62 @@ HEADING_RATE_LIMIT_MARGIN = 2.0
 HEADING_ROUTE_CORRECTION_THRESHOLD_DEG = 45.0
 HEADING_ROUTE_CORRECTION_PERSIST_TICKS = 5
 
+# 2026-10-04 추가 (Harness 1 제안, docs/experiment_log.md 참고): heading_mode
+# "route_bearing_anchored" 전용 상수. 기존 auto 모드는 gps_track이 기본값이고
+# route_bearing은 "크게 어긋났을 때만" 끌어오는 구조였는데(위
+# HEADING_ROUTE_CORRECTION_*), 이걸 뒤집음 — route_bearing을 기본 anchor로 쓰고,
+# gps_track은 "충분히 길고 일관되게" 반박할 때만 끌어당긴다. Harness 1이 오프라인
+# 재생(heading_estimator_replay.py)으로 "min_disp_m만 올리는 건 깨끗한 승리가
+# 아님(최악 스파이크는 줄지만 중간 드리프트 노출시간은 오히려 늘어남)"을 확인해서
+# 나온 결론 — 노이즈 억제와 드리프트 감지를 같은 다이얼로 절충하지 않기 위함.
+DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG = 20.0
+DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS = 5
+
+# 2026-10-04 추가: is_off_route() 기반 상시 이탈 감지(안전망) 관련 상수.
+# 기존엔 is_off_route() 호출 자체가 allow_reroute(기본 False) 뒤에 숨어있어서
+# "감지"와 "재라우팅 실행"이 같이 꺼져 있었음 — 그래서 heading_mode=route_bearing
+# 테스트(deploy_20261004_111807.jsonl, 실측 4.85m 이동·목표쪽 진행 0.38m=약 85도
+# 옆으로 샘)에서 아무도 못 알아챘음. 감지는 allow_reroute와 완전히 분리해서 항상
+# 켜고(DEFAULT_ENABLE_OFF_ROUTE_SAFETY), 재라우팅(비용 크고 예전에 폭주 버그 있었음, 위
+# REROUTE_COOLDOWN_S 참고) 대신 가벼운 조치만 취한다.
+DEFAULT_ENABLE_OFF_ROUTE_SAFETY = False  # 기본 꺼짐 — 아직 실기기 미검증, 명시적으로 켜야 함
+DEFAULT_OFF_ROUTE_SAFETY_THRESHOLD_M = 3.0  # is_off_route()와 동일 기준값 재사용
+DEFAULT_OFF_ROUTE_SAFETY_ACTION = "steer"  # "steer"(route_bearing_to_control로 직접 조향) | "stop"(정지)
+
+# 2026-10-04 추가 (사용자 요청): "OSM map이 직진 경로를 보여주면 로봇도 반드시
+# 직진하게" — 모델 자체의 미세 좌편향(heading_route_diff_deg=0인 완벽한 지도에서도
+# 재현됨, deploy_20261004_104301.jsonl tick 37)은 지도를 아무리 정확하게 넣어도
+# 안 없어지는 걸 직접 확인했음(§1-8/§1-9/§1-10) — 그래서 "직진 구간에서는 모델
+# 예측 자체를 안 쓰고 route_bearing으로 바로 조향"하는 게 유일하게 그 요구사항을
+# 구조적으로 보장하는 방법. 장애물 회피는 이 프로젝트 범위 밖(vanilla 환경 가정,
+# 사용자 확인)이라 모델의 판단력을 여기서 포기하는 트레이드오프를 감수하기로 함.
+# 짧은 lookahead(바로 앞)와 긴 lookahead(더 멀리)의 route_bearing 차이가 작으면
+# "당분간 직진"으로 판단 — 턴이 다가오면 두 값이 벌어지므로 자동으로 모델 예측이
+# 다시 쓰임(이 구간은 지금까지 보니 모델이 지도 내용을 비교적 잘 따라감).
+DEFAULT_ENABLE_STRAIGHT_SEGMENT_OVERRIDE = False  # 기본 꺼짐 — 명시적으로 켜야 함
+DEFAULT_STRAIGHT_NEAR_LOOKAHEAD_M = 2.0
+DEFAULT_STRAIGHT_FAR_LOOKAHEAD_M = 12.0
+DEFAULT_STRAIGHT_ANGLE_THRESHOLD_DEG = 20.0
+
+# 2026-10-04 추가 (실측 사고, deploy_20261004_123749.jsonl): GPS 위치(lat/lon)가
+# frodobot_raw["speed"]는 계속 0보다 크게 보고되는데도 22초+ 동안 한 비트도 안 바뀌는
+# "GPS 동결"이 실측됨 — fix_quality=2/gps_fix_ok=True로 계속 "정상"처럼 보여서 기존
+# 체크(위 GPS fix 없음/품질 체크)로는 전혀 못 잡음. 동결 동안 route_bearing_rad()와
+# gps_track heading 둘 다 똑같이 멈춘 값에 묶여서, 모델이 더 이상 현실과 안 맞는 지도를
+# 계속 "충실히" 따라가며 같은 방향(예: 우회전)을 끝없이 반복하게 됨. 게다가
+# heading_mode=route_bearing_anchored의 pull 조건("gps_track이 N틱 연속 반박하면
+# 신뢰")이 "진짜 반박"과 "동결로 생기는 가짜 반박"을 구분 못 해서, 동결된 gps_track
+# 값을 그대로 믿고 끝까지 안 풀리는 2차 버그로 이어짐(Harness 1 cross-session 분석,
+# docs/experiment_log.md §1-12). 위치가 실제로 min_disp_m 이상 못 움직인 채
+# PERSIST_TICKS 이상 지속되고 그동안 로봇 자신이 보고하는 속도는 SPEED_THRESHOLD보다
+# 크면(=움직이고 있다고 자기보고하는데 위치만 안 바뀜) "동결"로 판정한다. 다른
+# 메커니즘들과 달리 이건 트레이드오프가 없는 순수 안전장치라 기본 ON(옵트아웃 방식) —
+# near_goal_override_dist_m(기본 8.0, 0으로 끄는 방식)과 동일한 선례.
+DEFAULT_ENABLE_GPS_FREEZE_GUARD = True
+DEFAULT_GPS_FREEZE_MIN_DISP_M = 0.03
+DEFAULT_GPS_FREEZE_PERSIST_TICKS = 10
+DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS = 0.15
+
 # 2026-09-18: is_off_route() 임계값을 15m→3m로 낮췄더니, OSRM이 자체적으로 요청 좌표를
 # 가장 가까운 매핑된 길(way)로 "스냅"하는 거리가 그보다 큰 지점(예: 매핑된 보행로가 없는
 # 개활지, 실측 3.38m)에서는 재라우팅을 해도 새 경로 시작점이 여전히 3m 넘게 떨어져 있어
@@ -410,7 +466,20 @@ class OmniVLAEdgeDeployment:
                  goal_reach_threshold_m=DEFAULT_GOAL_REACH_THRESHOLD_M,
                  initial_heading_lookahead_m=INITIAL_HEADING_LOOKAHEAD_M,
                  allow_reroute=False,
-                 near_goal_override_dist_m=DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M):
+                 near_goal_override_dist_m=DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M,
+                 heading_anchor_pull_threshold_deg=DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG,
+                 heading_anchor_pull_persist_ticks=DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS,
+                 enable_off_route_safety=DEFAULT_ENABLE_OFF_ROUTE_SAFETY,
+                 off_route_safety_threshold_m=DEFAULT_OFF_ROUTE_SAFETY_THRESHOLD_M,
+                 off_route_safety_action=DEFAULT_OFF_ROUTE_SAFETY_ACTION,
+                 enable_straight_segment_override=DEFAULT_ENABLE_STRAIGHT_SEGMENT_OVERRIDE,
+                 straight_near_lookahead_m=DEFAULT_STRAIGHT_NEAR_LOOKAHEAD_M,
+                 straight_far_lookahead_m=DEFAULT_STRAIGHT_FAR_LOOKAHEAD_M,
+                 straight_angle_threshold_deg=DEFAULT_STRAIGHT_ANGLE_THRESHOLD_DEG,
+                 enable_gps_freeze_guard=DEFAULT_ENABLE_GPS_FREEZE_GUARD,
+                 gps_freeze_min_disp_m=DEFAULT_GPS_FREEZE_MIN_DISP_M,
+                 gps_freeze_persist_ticks=DEFAULT_GPS_FREEZE_PERSIST_TICKS,
+                 gps_freeze_speed_threshold_mps=DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS):
         # 2026-09-25: --dry_run의 의미가 "이 프로세스는 GO LIVE 자체를 영구히
         # 거부하는 하드 락"으로 바뀜(순수 검증 세션용). 기본(플래그 없음)은
         # DRY_RUN 상태로 시작하되, 대시보드에서 정렬확인→ARM→GO LIVE를 거치면
@@ -430,9 +499,18 @@ class OmniVLAEdgeDeployment:
         #     실측 GPS heading이 이후 얼마나 잡히든 절대 넘기지 않음. 실외 테스트에서
         #     저속/근거리 구간의 GPS 잡음이 gps_track을 계속 흔드는 문제(순변위가
         #     누적경로보다 훨씬 작은 지그재그, heading 100°+ 튐)가 실측되어 대안으로
-        #     추가함 — 어느 쪽이 실제로 더 안전/안정적인지는 아직 비교 검증 전이라
-        #     기본값은 기존 동작("auto") 그대로 유지.
-        assert heading_mode in ("auto", "route_aligned_fixed"), \
+        #     추가함 — 실제 턴이 있는 경로에서는 그 턴을 아예 못 따라가는 단점이 있음
+        #     (2026-10-04 확인, 턴 있는 경로 테스트에는 안 맞음).
+        #   "route_bearing"(2026-10-04 추가) — 매 tick route_bearing_rad()를 그대로
+        #     heading으로 씀(gps_track/EMA 완전히 안 씀). route_aligned_fixed처럼
+        #     GPS 양자화 노이즈에 영향을 안 받으면서도, route_bearing은 route 지오메트리
+        #     기반이라 실제 턴이 있으면 자연스럽게 따라감(2026-10-04 실측: 같은 run에서
+        #     route_bearing이 54틱 연속 완전히 고정됐던 반면 gps_track 기반 heading은
+        #     같은 구간에서 -90°~180°까지 요동침 — docs/experiment_log.md §1-9/1-10).
+        #     단점(사용자 확인 후 채택, 2026-10-04): 로봇이 실제로 경로를 벗어나도
+        #     이 모드는 그걸 전혀 못 알아챔(지도가 항상 "경로 위에 있다"고 가정하고
+        #     그려짐) — 지금처럼 짧고 통제된 테스트 구간에서만 쓰기로 함.
+        assert heading_mode in ("auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored"), \
             f"알 수 없는 heading_mode: {heading_mode!r}"
         self.heading_mode = heading_mode
 
@@ -467,6 +545,7 @@ class OmniVLAEdgeDeployment:
         # 경로는 배포 시작 시 1번만 계산해서 캐싱 (osmnav 구조 참고 — 매 프레임 재쿼리 안 함).
         # 시작 위치를 아직 모르므로, 첫 poll_frodobot() 이후 run()에서 set_goal() 호출.
         self._route_initialized = False
+        self._is_off_route_now = False  # 2026-10-04 추가: _ensure_route_initialized()가 매 tick 갱신
 
         # 2026-09-26 추가: goal 도착 감지 — 이전엔 목표 근처에 도달해도 계속 명령이
         # 나갔음(실제 로그로 확인된 갭). 한 번 도착(_goal_reached=True)하면 이후
@@ -480,6 +559,32 @@ class OmniVLAEdgeDeployment:
         # 상수 설명 참고. 0 이하로 주면 완전히 비활성화(순수 모델 출력만 사용,
         # 기존 동작) — 비교 테스트용으로 남겨둠.
         self.near_goal_override_dist_m = near_goal_override_dist_m
+
+        # 2026-10-04 추가 — 전부 docs/experiment_log.md의 Harness 1/사용자 논의 결과를
+        # config/CLI로 독립 실험 가능하게 분리한 것 (기본은 전부 꺼짐/기존 동작 유지,
+        # 하나씩 켜서 비교 가능).
+        self.heading_anchor_pull_threshold_deg = heading_anchor_pull_threshold_deg
+        self.heading_anchor_pull_persist_ticks = heading_anchor_pull_persist_ticks
+        self.enable_off_route_safety = enable_off_route_safety
+        self.off_route_safety_threshold_m = off_route_safety_threshold_m
+        assert off_route_safety_action in ("stop", "steer"), \
+            f"알 수 없는 off_route_safety_action: {off_route_safety_action!r}"
+        self.off_route_safety_action = off_route_safety_action
+        self.enable_straight_segment_override = enable_straight_segment_override
+        self.straight_near_lookahead_m = straight_near_lookahead_m
+        self.straight_far_lookahead_m = straight_far_lookahead_m
+        self.straight_angle_threshold_deg = straight_angle_threshold_deg
+
+        # 2026-10-04 추가 (실측 사고, deploy_20261004_123749.jsonl — 위 DEFAULT_ENABLE_GPS_FREEZE_GUARD
+        # 상수 설명 참고): GPS 위치 동결 감지. past_track과 별개로 독립 추적(정렬확인/보정
+        # 이벤트로 past_track이 clear돼도 동결 감지는 끊기지 않게).
+        self.enable_gps_freeze_guard = enable_gps_freeze_guard
+        self.gps_freeze_min_disp_m = gps_freeze_min_disp_m
+        self.gps_freeze_persist_ticks = gps_freeze_persist_ticks
+        self.gps_freeze_speed_threshold_mps = gps_freeze_speed_threshold_mps
+        self._gps_freeze_ticks = 0
+        self._gps_freeze_last_latlon = None
+        self._gps_frozen_now = False
 
         # 2026-09-26 추가: INITIAL_HEADING_LOOKAHEAD_M을 CLI로 조절 가능하게 함 —
         # 실제 주행에서 목표 근처(dist_to_goal≈6.9m)에서 정렬 확인을 눌렀더니,
@@ -522,6 +627,13 @@ class OmniVLAEdgeDeployment:
         # 넘은 채 연속으로 몇 틱째인지 — HEADING_ROUTE_CORRECTION_PERSIST_TICKS 도달 시
         # route_bearing으로 강제 재동기화.
         self._heading_divergence_ticks = 0
+
+        # 2026-10-04 추가: heading_mode="route_bearing_anchored" 전용 — gps_track이
+        # route_bearing과 DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG 이상 연속으로 몇 틱째
+        # 어긋나는지. DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS 도달 시에만 그 tick 한정으로
+        # gps_track 쪽을 신뢰(위 _heading_divergence_ticks와 반대 방향 로직 — 기본은
+        # route_bearing, gps_track은 지속적 반증이 쌓여야만 예외적으로 끌어당김).
+        self._heading_anchor_pull_ticks = 0
 
         # 마지막 재라우팅 시각 (REROUTE_COOLDOWN_S 참고 — 무한 재라우팅 스팸 방지)
         self._last_reroute_ts = 0.0
@@ -566,6 +678,19 @@ class OmniVLAEdgeDeployment:
             "heading_mode": self.heading_mode,
             "goal_reach_threshold_m": self.goal_reach_threshold_m,
             "near_goal_override_dist_m": self.near_goal_override_dist_m,
+            "heading_anchor_pull_threshold_deg": self.heading_anchor_pull_threshold_deg,
+            "heading_anchor_pull_persist_ticks": self.heading_anchor_pull_persist_ticks,
+            "enable_off_route_safety": self.enable_off_route_safety,
+            "off_route_safety_threshold_m": self.off_route_safety_threshold_m,
+            "off_route_safety_action": self.off_route_safety_action,
+            "enable_straight_segment_override": self.enable_straight_segment_override,
+            "straight_near_lookahead_m": self.straight_near_lookahead_m,
+            "straight_far_lookahead_m": self.straight_far_lookahead_m,
+            "straight_angle_threshold_deg": self.straight_angle_threshold_deg,
+            "enable_gps_freeze_guard": self.enable_gps_freeze_guard,
+            "gps_freeze_min_disp_m": self.gps_freeze_min_disp_m,
+            "gps_freeze_persist_ticks": self.gps_freeze_persist_ticks,
+            "gps_freeze_speed_threshold_mps": self.gps_freeze_speed_threshold_mps,
             # 2026-09-25: 각 step 레코드의 context_frame_paths/map_replay_path를
             # 어떻게 실제 파일로 바꾸는지 — 별도 코드를 몰라도 이 JSONL 파일 하나만
             # 보고 알 수 있도록 규칙 자체를 데이터로 남겨둔다.
@@ -653,28 +778,38 @@ class OmniVLAEdgeDeployment:
         if not self._route_initialized:
             self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
             self._route_initialized = True
+            self._is_off_route_now = False
             self._log_jsonl({"type": "event", "ts": time.time(), "event": "route_init",
                               "lat": lat, "lon": lon,
                               "route_latlon": self.map_builder.get_route_latlon(),
                               "osrm_fallback": self.map_builder.last_osrm_fallback,
                               "start_snap_m": self.map_builder.last_start_snap_m,
                               "goal_snap_m": self.map_builder.last_goal_snap_m})
-        elif (self.allow_reroute
-                and self.map_builder.is_off_route(lat, lon, threshold_m=3.0)
-                and time.time() - self._last_reroute_ts >= REROUTE_COOLDOWN_S):
-            if dist_to_goal_m is not None and dist_to_goal_m <= REROUTE_DISABLE_NEAR_GOAL_M:
-                self.state.log(f"경로 이탈 감지했지만 목표 근처(dist={dist_to_goal_m:.1f}m ≤ "
-                                f"{REROUTE_DISABLE_NEAR_GOAL_M:.0f}m)라 재라우팅 생략")
-            else:
-                self.state.log("경로 이탈 감지 → 재라우팅")
-                self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
-                self._last_reroute_ts = time.time()
-                self._log_jsonl({"type": "event", "ts": time.time(), "event": "reroute",
-                                  "lat": lat, "lon": lon,
-                                  "route_latlon": self.map_builder.get_route_latlon(),
-                                  "osrm_fallback": self.map_builder.last_osrm_fallback,
-                                  "start_snap_m": self.map_builder.last_start_snap_m,
-                                  "goal_snap_m": self.map_builder.last_goal_snap_m})
+        else:
+            # 2026-10-04 추가: 감지(is_off_route 호출)를 allow_reroute와 완전히 분리함.
+            # 기존엔 아래 elif 조건 자체(allow_reroute and is_off_route(...))에 묶여있어서
+            # allow_reroute=False(기본값)일 때 "감지" 자체가 전혀 안 됐음 — 그래서
+            # heading_mode=route_bearing 테스트(deploy_20261004_111807.jsonl, 실측
+            # 4.85m 이동·목표쪽 진행 0.38m=약 85도 옆으로 샘)를 아무도 못 알아챘음.
+            # self._is_off_route_now는 self.enable_off_route_safety가 켜져 있으면 step()
+            # 뒷부분에서 가벼운 조치(정지/직접 조향)에 쓰임 — 여기선 감지만 한다.
+            self._is_off_route_now = self.map_builder.is_off_route(
+                lat, lon, threshold_m=self.off_route_safety_threshold_m)
+            if (self.allow_reroute and self._is_off_route_now
+                    and time.time() - self._last_reroute_ts >= REROUTE_COOLDOWN_S):
+                if dist_to_goal_m is not None and dist_to_goal_m <= REROUTE_DISABLE_NEAR_GOAL_M:
+                    self.state.log(f"경로 이탈 감지했지만 목표 근처(dist={dist_to_goal_m:.1f}m ≤ "
+                                    f"{REROUTE_DISABLE_NEAR_GOAL_M:.0f}m)라 재라우팅 생략")
+                else:
+                    self.state.log("경로 이탈 감지 → 재라우팅")
+                    self.map_builder.set_goal(lat, lon, self.goal_lat, self.goal_lon)
+                    self._last_reroute_ts = time.time()
+                    self._log_jsonl({"type": "event", "ts": time.time(), "event": "reroute",
+                                      "lat": lat, "lon": lon,
+                                      "route_latlon": self.map_builder.get_route_latlon(),
+                                      "osrm_fallback": self.map_builder.last_osrm_fallback,
+                                      "start_snap_m": self.map_builder.last_start_snap_m,
+                                      "goal_snap_m": self.map_builder.last_goal_snap_m})
         self.state.update(osrm_fallback=self.map_builder.last_osrm_fallback,
                            start_snap_m=self.map_builder.last_start_snap_m,
                            goal_snap_m=self.map_builder.last_goal_snap_m)
@@ -712,6 +847,7 @@ class OmniVLAEdgeDeployment:
         had_stale_ema = self._heading_ema_vec is not None
         self._heading_ema_vec = None
         self._heading_divergence_ticks = 0
+        self._heading_anchor_pull_ticks = 0
         self.past_track.clear()
         self._route_aligned_heading_rad = bearing
         self._route_aligned_confirmed_ts = time.time()
@@ -909,6 +1045,28 @@ class OmniVLAEdgeDeployment:
                                           for fid in context_frame_ids]
         self.past_track.append((lat, lon))
 
+        # 2026-10-04 추가 (실측 사고, deploy_20261004_123749.jsonl): GPS 동결 감지 —
+        # 위치가 gps_freeze_min_disp_m 이상 못 움직인 채 gps_freeze_persist_ticks 이상
+        # 지속되고, 그동안 로봇 자신이 보고하는 speed가 gps_freeze_speed_threshold_mps보다
+        # 크면(=움직이고 있다고 자기보고하는데 위치만 안 바뀜) "동결"로 판정한다.
+        # past_track과 별개로 독립 추적 — 정렬확인/route_corrected가 past_track을
+        # clear해도 이 감지는 끊기지 않아야 함.
+        speed_mps = float((raw_data or {}).get("speed") or 0.0)
+        if (self._gps_freeze_last_latlon is not None
+                and latlon_distance_m(lat, lon, *self._gps_freeze_last_latlon) < self.gps_freeze_min_disp_m
+                and speed_mps >= self.gps_freeze_speed_threshold_mps):
+            self._gps_freeze_ticks += 1
+        else:
+            self._gps_freeze_ticks = 0
+        self._gps_freeze_last_latlon = (lat, lon)
+        self._gps_frozen_now = (self.enable_gps_freeze_guard
+                                 and self._gps_freeze_ticks >= self.gps_freeze_persist_ticks)
+        record["gps_frozen"] = self._gps_frozen_now
+        if self._gps_frozen_now and self._gps_freeze_ticks == self.gps_freeze_persist_ticks:
+            self.state.log(f"⚠ GPS 위치 동결 감지(speed={speed_mps:.2f}m/s인데 위치가 "
+                            f"{self.gps_freeze_persist_ticks}틱 이상 {self.gps_freeze_min_disp_m}m "
+                            f"이상 안 움직임) — 정지 + heading anchor pull 보류")
+
         # heading 소스: 2026-08-25 실배포 로그 분석(docs/0825.md 2-2)에서 IMU 컴퍼스와
         # GPS궤적 기반 heading이 평균 +97° 어긋남을 확인 — 학습 데이터의 heading은
         # GPS궤적 기반(atan2, osm_map_generator_rides11.py::estimate_headings()와 동일
@@ -932,7 +1090,57 @@ class OmniVLAEdgeDeployment:
         # heading과 무관하게 (lat, lon)+캐싱된 route만 쓰는 순수 조회라 중복 호출 비용 작음.
         route_bearing_rad_now = self.map_builder.route_bearing_rad(lat, lon)
 
-        if self.heading_mode == "route_aligned_fixed" and self._route_aligned_heading_rad is not None:
+        if self.heading_mode == "route_bearing_anchored" and route_bearing_rad_now is not None:
+            # 2026-10-04 추가 (Harness 1 제안) — route_bearing을 기본값으로 매 tick
+            # 그대로 쓰되(route_bearing 자체는 route 지오메트리 기반이라 안정적임이
+            # 실측으로 확인됨, §1-9/1-10: 54틱 연속 완전히 고정됐었음), gps_track이
+            # DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG 이상 DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS
+            # 연속으로 반박할 때만 그 tick 한정으로 gps_track을 대신 신뢰함. 위
+            # route_corrected(기본=gps_track, route_bearing은 예외적 보정)와 정반대
+            # 우선순위 — Harness 1의 오프라인 재생 검증(min_disp_m만 올리는 건 최악
+            # 스파이크는 줄지만 중간 드리프트 노출시간이 오히려 늘어남)에 근거함.
+            map_heading_rad = route_bearing_rad_now
+            source_label = "route_bearing_anchor"
+            if gps_heading_rad is not None:
+                pull_diff_deg = (math.degrees(gps_heading_rad - route_bearing_rad_now) + 180) % 360 - 180
+                if abs(pull_diff_deg) >= self.heading_anchor_pull_threshold_deg:
+                    self._heading_anchor_pull_ticks += 1
+                else:
+                    self._heading_anchor_pull_ticks = 0
+                # 2026-10-04 추가 (Harness 1 cross-session 분석, 실측 사고
+                # deploy_20261004_123749.jsonl): GPS가 동결되면 gps_track도 route_bearing과
+                # 똑같이 멈춘 값에서 계산되므로 "지속 반박" 조건을 영원히 만족시켜버려서
+                # (진짜 반박과 구분 불가) 끝까지 안 풀리는 버그가 있었음 — 동결 중에는
+                # pull 자체를 보류하고 route_bearing_anchor를 유지(아래 override 체인에서
+                # gps_freeze_safety가 최우선으로 정지시킴, 여기선 지도 내용만 안전하게 유지).
+                if (self._heading_anchor_pull_ticks >= self.heading_anchor_pull_persist_ticks
+                        and not self._gps_frozen_now):
+                    map_heading_rad = gps_heading_rad
+                    source_label = "gps_track_pull"
+            else:
+                self._heading_anchor_pull_ticks = 0
+            smoothed_deg = math.degrees(map_heading_rad)
+            record["heading_diff_deg"] = None
+            record["smoothed_heading_deg"] = smoothed_deg
+            record["map_heading_source"] = source_label
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(미사용)  GPS궤적={record['gps_heading_deg']}  "
+                  f"route_bearing_anchored(소스={source_label})={smoothed_deg:+7.1f}°  "
+                  f"(pull_ticks={self._heading_anchor_pull_ticks})")
+        elif self.heading_mode == "route_bearing" and route_bearing_rad_now is not None:
+            # 2026-10-04 추가: --heading_mode route_bearing — gps_track/EMA를 아예 안 쓰고
+            # 매 tick route_bearing_rad()를 그대로 heading으로 사용. route_bearing_rad_now를
+            # 못 구하는 tick(route 아직 없음/현재 위치가 route 끝 근처)에는 이 조건 자체가
+            # 거짓이 되어 아래 다른 분기(gps_track/route_aligned/imu_fallback)로 자연스럽게
+            # 넘어가고, 다음 tick에 다시 쓸 수 있게 되면 자동으로 이 분기가 우선됨(매 tick
+            # 새로 평가되는 if/elif라 별도 상태 추적 불필요).
+            map_heading_rad = route_bearing_rad_now
+            smoothed_deg = math.degrees(map_heading_rad)
+            record["heading_diff_deg"] = None
+            record["smoothed_heading_deg"] = smoothed_deg
+            record["map_heading_source"] = "route_bearing"
+            print(f"    [heading] IMU컴퍼스={imu_deg:+7.1f}°(미사용)  GPS궤적={record['gps_heading_deg']}"
+                  f"(참고용, 미반영)  route_bearing 직접 사용(모드=route_bearing)={smoothed_deg:+7.1f}°")
+        elif self.heading_mode == "route_aligned_fixed" and self._route_aligned_heading_rad is not None:
             # 2026-09-26 추가: --heading_mode route_aligned_fixed — 실외 테스트에서
             # 정지/저속 구간의 GPS 잡음이 gps_track/gps_ema_hold를 계속 흔드는 문제가
             # 실측됨(누적 이동거리/순변위가 어긋나는 지그재그 패턴, heading이 100°+
@@ -1046,6 +1254,15 @@ class OmniVLAEdgeDeployment:
                 prev_deg = math.degrees(map_heading_rad)
                 map_heading_rad = route_bearing_rad_now
                 self._heading_ema_vec = complex(math.cos(map_heading_rad), math.sin(map_heading_rad))
+                # 2026-10-04 추가: past_track도 같이 비워야 함 — 안 비우면
+                # estimate_heading_from_track()이 다음 tick부터도 "보정 이전"(틀린
+                # heading으로 주행하던 동안의) GPS 이력을 계속 거슬러 올라가 재계산하고,
+                # 그 오염된 구간이 min_disp_m(1.5m)만큼 흘러나갈 때까지(약 15~16틱)
+                # 또 똑같이 틀어진 값으로 수렴해버림 — 실측으로 확인됨
+                # (deploy_20261004_103114.jsonl, route_corrected가 매번 15~16틱
+                # 주기로 똑같은 -50°대 값에 반복 수렴). _confirm_route_alignment()가
+                # 이미 하는 것과 동일한 조치.
+                self.past_track.clear()
                 smoothed_deg = math.degrees(map_heading_rad)
                 record["smoothed_heading_deg"] = smoothed_deg
                 record["map_heading_source"] = "route_corrected"
@@ -1084,23 +1301,81 @@ class OmniVLAEdgeDeployment:
         linear, angular = clip_control(linear, angular)
         linear_before_override, angular_before_override = linear, angular
 
-        # 2026-10-03 추가 (Harness 1 §1-8/§3-1): future-route가 화면상 너무 짧아지는
-        # 근거리에서는 모델 raw 출력이 실제 지도 내용과 무관하게 결정론적으로
-        # 좌회전하는 게 실측됨 — DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M 상수 설명 참고.
-        # 이 구간에서는 모델 예측을 아예 버리고 route_bearing_to_control()로 대체.
-        # near_goal_override_dist_m<=0이면 완전 비활성(비교 테스트용).
+        # 2026-10-03/04 추가: 모델 예측을 안 믿고 route_bearing 기반으로 대체하는
+        # 조건들 — 우선순위대로 하나만 적용(동시에 여러 개 해당해도 가장 위 것만).
+        # 전부 override_reason 하나로 로그에 남겨서 어느 조건이 발동했는지 항상 알 수 있음.
         near_goal_override_applied = False
-        if (self.near_goal_override_dist_m > 0 and dist_to_goal_m <= self.near_goal_override_dist_m
+        straight_segment_override_applied = False
+        off_route_safety_applied = False
+        gps_freeze_safety_applied = False
+        override_reason = None
+
+        if self.enable_gps_freeze_guard and self._gps_frozen_now:
+            # 2026-10-04 추가 (실측 사고, deploy_20261004_123749.jsonl): 위치 입력 자체가
+            # 신뢰 불가능한 상태라 off_route_safety/near_goal/straight_segment 전부
+            # route_bearing/거리 계산에 의존하므로 같이 못 믿음 — 가장 먼저, 무조건 정지.
+            gps_freeze_safety_applied = True
+            override_reason = "gps_freeze_safety"
+            linear, angular = 0.0, 0.0
+        elif self.enable_off_route_safety and self._is_off_route_now:
+            # 2026-10-04 추가 (Harness 1 제안): is_off_route()는 allow_reroute와
+            # 무관하게 항상 평가됨(_ensure_route_initialized() 참고) — 여기서는 그
+            # 결과로 "가벼운" 조치만 취함(무거운 전체 재라우팅은 여전히 allow_reroute
+            # 쪽에서만). deploy_20261004_111807.jsonl(실측 4.85m 이동·목표쪽 진행
+            # 0.38m=약 85도 이탈)처럼 heading만으로는 못 잡는 "진짜 위치 이탈"의
+            # 안전망 — heading_mode와 완전히 무관하게 작동.
+            off_route_safety_applied = True
+            override_reason = "off_route_safety"
+            if self.off_route_safety_action == "stop":
+                linear, angular = 0.0, 0.0
+                self.state.log(f"⚠ 경로 이탈 감지(안전망, {self.off_route_safety_threshold_m:.1f}m 초과) — 정지")
+            elif self._last_route_bearing_rad is not None:
+                target_time_s = 3 * WAYPOINT_STRIDE_SEC
+                linear, angular = route_bearing_to_control(
+                    self._last_route_bearing_rad, map_heading_rad, target_time_s)
+                linear, angular = clip_control(linear, angular)
+                self.state.log(f"⚠ 경로 이탈 감지(안전망, {self.off_route_safety_threshold_m:.1f}m 초과) — "
+                                f"route_bearing 기반 조향으로 전환")
+            else:
+                linear, angular = 0.0, 0.0  # route_bearing도 없으면 안전하게 정지
+        elif (self.near_goal_override_dist_m > 0 and dist_to_goal_m <= self.near_goal_override_dist_m
                 and self._last_route_bearing_rad is not None):
+            # 2026-10-03 추가 (Harness 1 §1-8/§3-1): future-route가 화면상 너무 짧아지는
+            # 근거리에서는 모델 raw 출력이 실제 지도 내용과 무관하게 결정론적으로
+            # 좌회전하는 게 실측됨 — DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M 상수 설명 참고.
             target_time_s = 3 * WAYPOINT_STRIDE_SEC  # waypoint_to_control()의 target_step=2와 동일 시정수
             linear, angular = route_bearing_to_control(
                 self._last_route_bearing_rad, map_heading_rad, target_time_s)
             linear, angular = clip_control(linear, angular)
             near_goal_override_applied = True
+            override_reason = "near_goal"
             self.state.log(f"near-goal override 발동(dist={dist_to_goal_m:.1f}m ≤ "
                             f"{self.near_goal_override_dist_m:.1f}m): 모델 예측 angular="
                             f"{angular_before_override:+.3f} 대신 route_bearing 기반 "
                             f"angular={angular:+.3f} 사용")
+        elif self.enable_straight_segment_override and self._route_initialized:
+            # 2026-10-04 추가 (사용자 요청): "OSM map이 직진 경로를 보여주면 로봇도
+            # 반드시 직진하게" — 모델 자체의 미세 좌편향은 지도가 완벽해도 재현됨
+            # (deploy_20261004_104301.jsonl tick 37, heading_route_diff_deg=0인데도
+            # 좌회전 예측) — 지도를 아무리 정확하게 넣어도 안 없어지므로, 직진
+            # 구간에서는 모델 예측 자체를 안 쓰는 것만이 구조적으로 보장되는 방법.
+            # 짧은/긴 lookahead의 route_bearing 차이로 "당분간 직진"을 판정 — 턴이
+            # 다가오면 두 값이 벌어져서 자동으로 모델 예측이 다시 쓰임(턴 구간은
+            # 지금까지 보니 모델이 지도 내용을 비교적 잘 따라감, §1-2 20m+ 버킷 참고).
+            near_b = self.map_builder.route_bearing_rad(lat, lon, lookahead_m=self.straight_near_lookahead_m)
+            far_b = self.map_builder.route_bearing_rad(lat, lon, lookahead_m=self.straight_far_lookahead_m)
+            if near_b is not None and far_b is not None:
+                straight_diff_deg = abs((math.degrees(far_b - near_b) + 180) % 360 - 180)
+                if straight_diff_deg <= self.straight_angle_threshold_deg:
+                    target_time_s = 3 * WAYPOINT_STRIDE_SEC
+                    linear, angular = route_bearing_to_control(near_b, map_heading_rad, target_time_s)
+                    linear, angular = clip_control(linear, angular)
+                    straight_segment_override_applied = True
+                    override_reason = "straight_segment"
+                    self.state.log(f"직진 구간 override 발동(근/원거리 route_bearing 차이="
+                                    f"{straight_diff_deg:.1f}° ≤ {self.straight_angle_threshold_deg:.0f}°): "
+                                    f"모델 예측 angular={angular_before_override:+.3f} 대신 "
+                                    f"route_bearing 기반 angular={angular:+.3f} 사용")
 
         # 2026-09-25 추가 디버그 필드: route bearing/heading 차이/지도 회전각/target
         # waypoint — 6번(시각화)에서 합의한 "GO 누르기 전에 확인할 수치들"
@@ -1119,13 +1394,24 @@ class OmniVLAEdgeDeployment:
                        map_replay_path=self._last_map_replay_path,
                        linear_before_override=linear_before_override,
                        angular_before_override=angular_before_override,
-                       near_goal_override_applied=near_goal_override_applied)
+                       near_goal_override_applied=near_goal_override_applied,
+                       straight_segment_override_applied=straight_segment_override_applied,
+                       off_route_safety_applied=off_route_safety_applied,
+                       gps_freeze_safety_applied=gps_freeze_safety_applied,
+                       override_reason=override_reason,
+                       is_off_route=self._is_off_route_now)
         self._log_jsonl(record)
         self.state.update(route_bearing_deg=route_bearing_deg,
                            heading_route_diff_deg=heading_route_diff_deg,
                            map_rotation_deg=map_rotation_deg,
                            target_waypoint_xy=(target_x, target_y),
-                           near_goal_override_applied=near_goal_override_applied)
+                           near_goal_override_applied=near_goal_override_applied,
+                           straight_segment_override_applied=straight_segment_override_applied,
+                           off_route_safety_applied=off_route_safety_applied,
+                           gps_freeze_safety_applied=gps_freeze_safety_applied,
+                           override_reason=override_reason,
+                           is_off_route=self._is_off_route_now,
+                           gps_frozen=self._gps_frozen_now)
         return linear, angular
 
     def run(self):
@@ -1265,13 +1551,29 @@ class OmniVLAEdgeDeployment:
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", type=str, required=True)
-    p.add_argument("--map_range", type=float, required=True,
+    # 2026-10-04 추가: 실험 파라미터를 커맨드라인 플래그로만 하드코딩/타이핑하지 않고
+    # config 파일(YAML)로 묶어서 관리할 수 있게 함 — 오늘 같은 날(heading_mode/
+    # near_goal_override_dist_m/rate-limit 등 여러 실험 변형을 빠르게 반복) 매번 긴
+    # 커맨드를 새로 조합하지 않아도 되게. --config로 먼저 로드한 값들을 기본값으로
+    # 깔고, 그 뒤에 명시적으로 준 커맨드라인 플래그가 항상 우선함(set_defaults 뒤에
+    # 최종 parse_args가 실행되는 순서 그대로 적용됨). ckpt/map_range/goal_lat/goal_lon은
+    # "실수로 빠뜨리면 안 됨"이라 원래 required=True였는데, config로 줄 수도 있어야
+    # 하니 required는 빼고 최종 parse 뒤에 수동으로 누락 여부를 검사함(안전장치
+    # 자체는 그대로 유지, 어디서 왔는지만 config/CLI 둘 다 허용).
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None,
+                      help="실험 설정을 묶어둔 YAML 파일 경로 (deployment/configs/ 참고). "
+                           "여기 적힌 값들이 기본값이 되고, 그 외에 명시적으로 준 "
+                           "커맨드라인 플래그가 있으면 그게 항상 우선함.")
+    pre_args, _ = pre.parse_known_args()
+
+    p = argparse.ArgumentParser(parents=[pre])
+    p.add_argument("--ckpt", type=str, default=None)
+    p.add_argument("--map_range", type=float, default=None,
                    help="체크포인트를 학습시킨 맵 반경과 반드시 동일해야 함 "
-                        "(baseline=25, 12m실험=12, 20m실험=20). 체크포인트마다 다르므로 기본값 없음 — 반드시 명시.")
-    p.add_argument("--goal_lat", type=float, required=True)
-    p.add_argument("--goal_lon", type=float, required=True)
+                        "(baseline=25, 12m실험=12, 20m실험=20). 체크포인트마다 다르므로 기본값 없음 — 반드시 명시(CLI 또는 --config).")
+    p.add_argument("--goal_lat", type=float, default=None)
+    p.add_argument("--goal_lon", type=float, default=None)
     p.add_argument("--debug_port", type=int, default=8080,
                    help="모니터링 웹 대시보드 포트 (0이면 비활성화)")
     p.add_argument("--dry_run", action="store_true",
@@ -1281,12 +1583,22 @@ if __name__ == "__main__":
                         "'정렬 확인' → 'ARM' → 'GO LIVE'를 명시적으로 눌러야 함 (재시작 불필요, "
                         "같은 프로세스 안에서 frame_buffer/GPS 궤적/heading 상태 그대로 유지).")
     p.add_argument("--heading_mode", type=str, default="auto",
-                   choices=["auto", "route_aligned_fixed"],
+                   choices=["auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored"],
                    help="auto(기본) = 정렬 확인은 실측 GPS heading이 잡히기 전까지의 "
                         "임시값일 뿐, 실측(gps_track)이 확보되면 자동으로 전환됨(기존 동작). "
                         "route_aligned_fixed = 정렬 확인으로 고정한 값을 런 내내 그대로 "
-                        "사용, 이후 GPS 궤적이 얼마나 잡히든 절대 안 넘어감 — 저속/근거리 "
-                        "구간에서 GPS 잡음이 gps_track을 계속 흔드는 문제의 대안.")
+                        "사용, 이후 GPS 궤적이 얼마나 잡히든 절대 안 넘어감 — 턴이 없는 "
+                        "직선 구간 전용(실제 턴은 전혀 못 따라감). "
+                        "route_bearing = 매 tick route_bearing_rad()를 그대로 heading으로 "
+                        "사용(gps_track/EMA 전혀 안 씀) — GPS 양자화 노이즈 영향 없이, 실제 "
+                        "턴도 route 지오메트리를 통해 자연스럽게 따라감. 단, 로봇이 실제로 "
+                        "경로를 벗어나도 전혀 못 알아챔 — 짧고 통제된 테스트 구간 전용 "
+                        "(2026-10-04, docs/experiment_log.md §1-9/1-10 참고). "
+                        "route_bearing_anchored = route_bearing을 기본값으로 쓰되 "
+                        "gps_track이 --heading_anchor_pull_threshold_deg 이상 "
+                        "--heading_anchor_pull_persist_ticks 연속으로 반박하면 그 tick만 "
+                        "gps_track을 신뢰(Harness 1 제안, 2026-10-04) — route_bearing 단독보다 "
+                        "드리프트에 조금 더 반응함.")
     p.add_argument("--goal_reach_threshold_m", type=float, default=DEFAULT_GOAL_REACH_THRESHOLD_M,
                    help=f"목표까지 이 거리(m) 이내로 들어오면 도착으로 간주하고 영구 정지 "
                         f"(기본 {DEFAULT_GOAL_REACH_THRESHOLD_M}m). 한 번 도착하면 다시 안 풀림.")
@@ -1295,12 +1607,65 @@ if __name__ == "__main__":
                         f"조향으로 대체 (기본 {DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M}m — 27m 체크포인트 "
                         f"기준 실측 보정값, 다른 체크포인트/map_range면 재측정 필요, "
                         f"docs/experiment_log.md §1-8 참고). 0 이하로 주면 비활성화(비교 테스트용).")
+    p.add_argument("--heading_anchor_pull_threshold_deg", type=float,
+                   default=DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG,
+                   help=f"heading_mode=route_bearing_anchored 전용 — gps_track이 route_bearing과 "
+                        f"이 각도(°) 이상 어긋나야 '반박'으로 침 (기본 {DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG}°).")
+    p.add_argument("--heading_anchor_pull_persist_ticks", type=int,
+                   default=DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS,
+                   help=f"heading_mode=route_bearing_anchored 전용 — 반박이 몇 틱 연속돼야 그 tick에 "
+                        f"gps_track을 신뢰할지 (기본 {DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS}틱).")
+    p.add_argument("--enable_off_route_safety", action="store_true",
+                   help="is_off_route() 기반 상시 이탈 감지 안전망 켬 (기본 꺼짐, 2026-10-04 Harness 1 "
+                        "제안) — allow_reroute와 무관하게 항상 평가되고, 이탈 시 --off_route_safety_action "
+                        "으로 지정한 가벼운 조치만 취함(무거운 전체 재라우팅은 여전히 --allow_reroute에서만).")
+    p.add_argument("--off_route_safety_threshold_m", type=float,
+                   default=DEFAULT_OFF_ROUTE_SAFETY_THRESHOLD_M,
+                   help=f"--enable_off_route_safety의 이탈 판정 거리(m) (기본 {DEFAULT_OFF_ROUTE_SAFETY_THRESHOLD_M}m, "
+                        f"is_off_route() 자체 기본값과 동일).")
+    p.add_argument("--off_route_safety_action", type=str, default=DEFAULT_OFF_ROUTE_SAFETY_ACTION,
+                   choices=["stop", "steer"],
+                   help=f"--enable_off_route_safety 발동 시 조치 (기본 {DEFAULT_OFF_ROUTE_SAFETY_ACTION!r}) — "
+                        f"'stop'=정지, 'steer'=route_bearing_to_control()로 직접 조향.")
+    p.add_argument("--enable_straight_segment_override", action="store_true",
+                   help="직진 구간에서 모델 예측 대신 route_bearing 기반 조향을 강제 (기본 꺼짐, "
+                        "2026-10-04 사용자 요청 — '지도가 직진이면 로봇도 반드시 직진'을 구조적으로 "
+                        "보장). 근/원거리 route_bearing 차이로 직진 여부 판정 — "
+                        "--straight_near_lookahead_m/--straight_far_lookahead_m/"
+                        "--straight_angle_threshold_deg로 조절.")
+    p.add_argument("--straight_near_lookahead_m", type=float, default=DEFAULT_STRAIGHT_NEAR_LOOKAHEAD_M,
+                   help=f"--enable_straight_segment_override 전용, 짧은 lookahead(m) (기본 "
+                        f"{DEFAULT_STRAIGHT_NEAR_LOOKAHEAD_M}m).")
+    p.add_argument("--straight_far_lookahead_m", type=float, default=DEFAULT_STRAIGHT_FAR_LOOKAHEAD_M,
+                   help=f"--enable_straight_segment_override 전용, 긴 lookahead(m) (기본 "
+                        f"{DEFAULT_STRAIGHT_FAR_LOOKAHEAD_M}m).")
+    p.add_argument("--straight_angle_threshold_deg", type=float,
+                   default=DEFAULT_STRAIGHT_ANGLE_THRESHOLD_DEG,
+                   help=f"--enable_straight_segment_override 전용 — 근/원거리 route_bearing 차이가 "
+                        f"이 각도(°) 이내면 '직진'으로 판정 (기본 {DEFAULT_STRAIGHT_ANGLE_THRESHOLD_DEG}°).")
     p.add_argument("--initial_heading_lookahead_m", type=float, default=INITIAL_HEADING_LOOKAHEAD_M,
                    help=f"'정렬 확인' 시 route tangent를 계산하는 lookahead 거리(m) "
                         f"(기본 {INITIAL_HEADING_LOOKAHEAD_M}m). 목표 근처처럼 경로가 국소적으로 "
                         f"꺾이는 구간에서 짧은 값이 실제 진행 방향과 크게 어긋난 heading을 "
                         f"고정시키는 사고가 실측됨(2026-09-26) — 그런 구간에서 정렬 확인이 "
                         f"필요하면 이 값을 5~10m로 늘려서 국소 꺾임에 덜 민감하게 만들 것.")
+    p.add_argument("--disable_gps_freeze_guard", action="store_true",
+                   help="GPS 위치 동결 안전장치를 끔 (기본 켜짐, 2026-10-04 실측 사고 "
+                        "deploy_20261004_123749.jsonl 이후 추가 — speed>0인데 위치가 "
+                        "--gps_freeze_persist_ticks 이상 --gps_freeze_min_disp_m도 못 움직이면 "
+                        "정지 + heading_mode=route_bearing_anchored의 gps_track pull도 보류함. "
+                        "다른 메커니즘과 달리 트레이드오프가 없는 순수 안전장치라 기본 켜짐 — "
+                        "끄는 건 비교 테스트 등 특수한 경우만.")
+    p.add_argument("--gps_freeze_min_disp_m", type=float, default=DEFAULT_GPS_FREEZE_MIN_DISP_M,
+                   help=f"GPS 동결 판정 최소 이동거리(m) — 이보다 적게 움직이면 '안 움직인 것'으로 "
+                        f"침 (기본 {DEFAULT_GPS_FREEZE_MIN_DISP_M}m).")
+    p.add_argument("--gps_freeze_persist_ticks", type=int, default=DEFAULT_GPS_FREEZE_PERSIST_TICKS,
+                   help=f"GPS 동결 판정에 필요한 연속 tick 수 (기본 {DEFAULT_GPS_FREEZE_PERSIST_TICKS}틱).")
+    p.add_argument("--gps_freeze_speed_threshold_mps", type=float,
+                   default=DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS,
+                   help=f"이 속도(m/s) 이상을 로봇이 자기보고하는 동안에만 '동결'로 판정 — 로봇이 "
+                        f"실제로 정지해 있어서 위치가 안 바뀌는 정상 상황은 제외 (기본 "
+                        f"{DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS}m/s).")
     p.add_argument("--allow_reroute", action="store_true",
                    help="기본은 재라우팅 완전 비활성화(최초 route_init 경로만 런 내내 그대로 "
                         "사용). 목표에서 멀리 떨어진 거의 정지 상태에서도 is_off_route()가 "
@@ -1308,7 +1673,24 @@ if __name__ == "__main__":
                         "다른 경로를 반환해 계획 경로 방향이 요동치는 문제가 실측됨(2026-09-26, "
                         "2026-09-18에도 유사 현상 기록). 이 플래그를 주면 기존 동작(경로 이탈 "
                         "감지 시 재계산, REROUTE_DISABLE_NEAR_GOAL_M 보호 포함)으로 되돌림.")
+
+    if pre_args.config:
+        import yaml
+        with open(pre_args.config) as f:
+            cfg = yaml.safe_load(f) or {}
+        unknown = set(cfg) - {a.dest for a in p._actions}
+        if unknown:
+            raise ValueError(f"--config {pre_args.config}에 모르는 키가 있음: {sorted(unknown)} "
+                              f"(오타 확인 — 이 CLI가 아는 플래그 이름과 정확히 일치해야 함)")
+        p.set_defaults(**cfg)
+        print(f"[deploy] --config {pre_args.config} 로드됨: {cfg}")
+
     args = p.parse_args()
+
+    missing = [name for name in ("ckpt", "map_range", "goal_lat", "goal_lon") if getattr(args, name) is None]
+    if missing:
+        raise SystemExit(f"다음 값이 CLI 플래그로도, --config로도 안 주어짐(실수 방지를 위해 "
+                          f"필수): {missing} — 둘 중 하나로는 반드시 지정할 것.")
 
     deployer = OmniVLAEdgeDeployment(
         ckpt_path=args.ckpt, map_range_m=args.map_range,
@@ -1319,5 +1701,18 @@ if __name__ == "__main__":
         initial_heading_lookahead_m=args.initial_heading_lookahead_m,
         allow_reroute=args.allow_reroute,
         near_goal_override_dist_m=args.near_goal_override_dist_m,
+        heading_anchor_pull_threshold_deg=args.heading_anchor_pull_threshold_deg,
+        heading_anchor_pull_persist_ticks=args.heading_anchor_pull_persist_ticks,
+        enable_off_route_safety=args.enable_off_route_safety,
+        off_route_safety_threshold_m=args.off_route_safety_threshold_m,
+        off_route_safety_action=args.off_route_safety_action,
+        enable_straight_segment_override=args.enable_straight_segment_override,
+        straight_near_lookahead_m=args.straight_near_lookahead_m,
+        straight_far_lookahead_m=args.straight_far_lookahead_m,
+        straight_angle_threshold_deg=args.straight_angle_threshold_deg,
+        enable_gps_freeze_guard=not args.disable_gps_freeze_guard,
+        gps_freeze_min_disp_m=args.gps_freeze_min_disp_m,
+        gps_freeze_persist_ticks=args.gps_freeze_persist_ticks,
+        gps_freeze_speed_threshold_mps=args.gps_freeze_speed_threshold_mps,
     )
     deployer.run()

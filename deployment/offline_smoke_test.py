@@ -124,12 +124,27 @@ def _base_gps(lat, lon, orientation=192.0):
 def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto",
                    goal_lat=None, goal_lon=None, goal_reach_threshold_m=dep.DEFAULT_GOAL_REACH_THRESHOLD_M,
                    initial_heading_lookahead_m=dep.INITIAL_HEADING_LOOKAHEAD_M,
-                   allow_reroute=False, near_goal_override_dist_m=0.0):
-    # near_goal_override_dist_m 기본값을 0(비활성)으로 둠 -- 대부분의 기존 테스트는
-    # 이 기능과 무관한 걸 검증하는 거라, 운영 기본값(8.0m)을 그대로 쓰면 goal 근처
-    # GPS 시퀀스를 쓰는 테스트들의 angular/linear가 모델 예측이 아니라 route_bearing
-    # 기반으로 바뀌어서 기존 검증 의도와 어긋날 수 있음. 이 기능 자체를 검증하는
-    # 테스트에서만 명시적으로 켬.
+                   allow_reroute=False, near_goal_override_dist_m=0.0,
+                   heading_anchor_pull_threshold_deg=dep.DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG,
+                   heading_anchor_pull_persist_ticks=dep.DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS,
+                   enable_off_route_safety=False,
+                   off_route_safety_threshold_m=dep.DEFAULT_OFF_ROUTE_SAFETY_THRESHOLD_M,
+                   off_route_safety_action=dep.DEFAULT_OFF_ROUTE_SAFETY_ACTION,
+                   enable_straight_segment_override=False,
+                   straight_near_lookahead_m=dep.DEFAULT_STRAIGHT_NEAR_LOOKAHEAD_M,
+                   straight_far_lookahead_m=dep.DEFAULT_STRAIGHT_FAR_LOOKAHEAD_M,
+                   straight_angle_threshold_deg=dep.DEFAULT_STRAIGHT_ANGLE_THRESHOLD_DEG,
+                   enable_gps_freeze_guard=False,
+                   gps_freeze_min_disp_m=dep.DEFAULT_GPS_FREEZE_MIN_DISP_M,
+                   gps_freeze_persist_ticks=dep.DEFAULT_GPS_FREEZE_PERSIST_TICKS,
+                   gps_freeze_speed_threshold_mps=dep.DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS):
+    # near_goal_override_dist_m/enable_off_route_safety/enable_straight_segment_override/
+    # enable_gps_freeze_guard 기본값을 전부 꺼진 상태로 둠 -- 대부분의 기존 테스트는 이
+    # 기능들과 무관한 걸 검증하는 거라, 운영 기본값(near_goal_override_dist_m/
+    # enable_gps_freeze_guard는 운영에서 기본 켜짐)을 그대로 쓰면 angular/linear가 모델
+    # 예측이 아니라 route_bearing 기반으로 바뀌거나, 테스트용 합성 텔레메트리(speed=0.3,
+    # 고정 GPS로 여러 틱 시작하는 경우 多)가 동결로 오판되어 기존 검증 의도와 어긋날 수
+    # 있음. 각 기능 자체를 검증하는 테스트에서만 명시적으로 켬.
     deployer = dep.OmniVLAEdgeDeployment(
         ckpt_path=str(CKPT_PATH), map_range_m=20.0,
         goal_lat=goal_lat if goal_lat is not None else GOAL_LAT,
@@ -139,6 +154,19 @@ def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto
         initial_heading_lookahead_m=initial_heading_lookahead_m,
         allow_reroute=allow_reroute,
         near_goal_override_dist_m=near_goal_override_dist_m,
+        heading_anchor_pull_threshold_deg=heading_anchor_pull_threshold_deg,
+        heading_anchor_pull_persist_ticks=heading_anchor_pull_persist_ticks,
+        enable_off_route_safety=enable_off_route_safety,
+        off_route_safety_threshold_m=off_route_safety_threshold_m,
+        off_route_safety_action=off_route_safety_action,
+        enable_straight_segment_override=enable_straight_segment_override,
+        straight_near_lookahead_m=straight_near_lookahead_m,
+        straight_far_lookahead_m=straight_far_lookahead_m,
+        straight_angle_threshold_deg=straight_angle_threshold_deg,
+        enable_gps_freeze_guard=enable_gps_freeze_guard,
+        gps_freeze_min_disp_m=gps_freeze_min_disp_m,
+        gps_freeze_persist_ticks=gps_freeze_persist_ticks,
+        gps_freeze_speed_threshold_mps=gps_freeze_speed_threshold_mps,
     )
     tick_count = [0]
     real_step = deployer.step
@@ -599,6 +627,124 @@ def test_g_reroute_disabled_by_default():
             print(f"[OK] allow_reroute=False(기본값): 경로를 크게 벗어나도 reroute 0회 (최초 route만 유지)")
 
 
+# ── test H: 2026-10-04 신규 메커니즘 3종 (route_bearing_anchored / 직진구간 override /
+#            allow_reroute와 분리된 상시 이탈 감지 안전망) ───────────────────────────
+def test_h_new_mechanisms_2026_10_04():
+    print("\n========== test_h_new_mechanisms_2026_10_04 ==========")
+    camera_frames = _load_camera_frames() * 3
+    n_ticks = 15
+
+    # h1) heading_mode=route_bearing_anchored: map_heading_source가 알려진 값만 나오는지
+    gps_sequence = [_base_gps(1000, 1000)] * 2
+    for i in range(n_ticks):
+        gps_sequence.append(_base_gps(BASE_LAT - i * 0.00002, BASE_LON))
+    fake_get, fake_post, _ = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=n_ticks,
+                                  heading_mode="route_bearing_anchored")
+        deployer.run()
+    logs = _read_jsonl(deployer.log_path)
+    sources = {l["map_heading_source"] for l in logs if l["type"] == "step" and l.get("map_heading_source")}
+    assert sources <= {"route_bearing_anchor", "gps_track_pull", "route_aligned"}, \
+        f"route_bearing_anchored 모드인데 알 수 없는 map_heading_source 등장: {sources}"
+    print(f"[OK] heading_mode=route_bearing_anchored: map_heading_source 전부 알려진 값({sources})")
+
+    # h2) enable_straight_segment_override: 직진 구간에서 발동하고, override_reason이 남는지
+    fake_get, fake_post, _ = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=n_ticks,
+                                  heading_mode="auto", enable_straight_segment_override=True)
+        deployer.run()
+    logs = _read_jsonl(deployer.log_path)
+    steps = [l for l in logs if l["type"] == "step" and "straight_segment_override_applied" in l]
+    applied = [s for s in steps if s["straight_segment_override_applied"]]
+    assert len(applied) > 0, "직진 구간인데 straight_segment_override가 한 번도 발동 안 함"
+    assert all(s["override_reason"] == "straight_segment" for s in applied)
+    assert all(abs(s["angular"]) <= dep.MAX_W * 2.0 + 1e-6 for s in applied), \
+        "straight_segment_override의 angular가 clip_control 범위를 벗어남"
+    print(f"[OK] enable_straight_segment_override: {len(applied)}/{len(steps)} tick에서 발동, "
+          f"override_reason/clip 범위 정상")
+
+    # h3) enable_off_route_safety: allow_reroute=False여도 is_off_route 감지는 항상 동작,
+    #     reroute는 여전히 안 일어나고, action=stop이면 명령이 항상 (0,0)인지
+    gps_sequence2 = [_base_gps(1000, 1000)] * 2
+    for i in range(n_ticks):
+        gps_sequence2.append(_base_gps(BASE_LAT, BASE_LON + i * 0.0001))
+    fake_get, fake_post, _ = build_fake_requests(camera_frames, gps_sequence2)
+    with mock.patch("requests.get", side_effect=fake_get), mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=n_ticks,
+                                  heading_mode="auto", allow_reroute=False,
+                                  enable_off_route_safety=True, off_route_safety_action="stop")
+        deployer.run()
+    logs = _read_jsonl(deployer.log_path)
+    steps = [l for l in logs if l["type"] == "step" and "is_off_route" in l]
+    assert any(s["is_off_route"] for s in steps), \
+        "is_off_route가 한 번도 True가 안 됨 -- allow_reroute=False여도 감지는 돼야 함"
+    safety_applied = [s for s in steps if s.get("off_route_safety_applied")]
+    assert len(safety_applied) > 0, "off_route_safety_applied가 한 번도 발동 안 함"
+    assert all(s["linear"] == 0.0 and s["angular"] == 0.0 for s in safety_applied), \
+        "off_route_safety_action=stop인데 non-zero 명령이 전송됨"
+    reroute_events = [l for l in logs if l.get("event") == "reroute"]
+    assert len(reroute_events) == 0, \
+        "allow_reroute=False인데 reroute가 발생함 -- 감지(is_off_route)와 액션(reroute)이 분리되지 않음"
+    print("[OK] enable_off_route_safety: is_off_route 감지는 allow_reroute와 무관하게 항상 동작, "
+          "reroute는 여전히 발생 안 함, action=stop에서 명령이 항상 (0,0)")
+
+
+# ── test I: 2026-10-04 GPS 동결 안전장치 (실측 사고 deploy_20261004_123749.jsonl 재현) ──
+def test_i_gps_freeze_guard():
+    print("\n========== test_i_gps_freeze_guard ==========")
+    camera_frames = _load_camera_frames() * 3
+    n_moving = 15
+    n_frozen = 15
+    n_ticks = 2 + n_moving + n_frozen
+
+    gps_sequence = [_base_gps(1000, 1000)] * 2
+    # 실제로 이동(goal과 다른 방향, lon만 증가 -- gps_track heading이 route_bearing과
+    # 벌어지게 만들어서 "진짜 반박처럼 보이는" 상태를 먼저 만든다 -- test_h h3 off-route
+    # 시나리오와 동일 패턴).
+    for i in range(n_moving):
+        gps_sequence.append(_base_gps(BASE_LAT, BASE_LON + i * 0.0001))
+    # 그 다음 speed>0(=_base_gps 기본 0.3m/s)인데 lat/lon은 완전히 동결(마지막 위치 반복)
+    # -- deploy_20261004_123749.jsonl에서 실측된 22초+ GPS 동결과 동일 패턴.
+    frozen_lat, frozen_lon = BASE_LAT, BASE_LON + (n_moving - 1) * 0.0001
+    for _ in range(n_frozen):
+        gps_sequence.append(_base_gps(frozen_lat, frozen_lon))
+
+    fake_get, fake_post, _ = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), mock.patch("requests.post", side_effect=fake_post):
+        # heading_anchor_pull_threshold_deg=0/persist_ticks=1: 동결 가드가 없으면
+        # gps_track이 route_bearing과 조금만 벌어져도 즉시 pull되는, 가장 불리한 조건.
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=n_ticks,
+                                  heading_mode="route_bearing_anchored",
+                                  heading_anchor_pull_threshold_deg=0.0,
+                                  heading_anchor_pull_persist_ticks=1,
+                                  enable_gps_freeze_guard=True,
+                                  gps_freeze_persist_ticks=10)
+        deployer.run()
+
+    logs = _read_jsonl(deployer.log_path)
+    steps = [l for l in logs if l["type"] == "step" and "gps_frozen" in l]
+    frozen_steps = [s for s in steps if s["gps_frozen"]]
+    assert len(frozen_steps) > 0, \
+        f"gps_frozen이 한 번도 True가 안 됨 (n_frozen={n_frozen}, persist_ticks=10 — 더 길게 줘야 할 수도)"
+    print(f"[OK] gps_frozen=True인 tick {len(frozen_steps)}개 발생 (총 {len(steps)}개 중)")
+
+    assert all(s["override_reason"] == "gps_freeze_safety" for s in frozen_steps), \
+        f"gps_frozen인데 override_reason이 gps_freeze_safety가 아닌 tick 있음: " \
+        f"{[s['override_reason'] for s in frozen_steps]}"
+    assert all(s["linear"] == 0.0 and s["angular"] == 0.0 for s in frozen_steps), \
+        "gps_frozen인데 non-zero 명령이 전송됨"
+    print("[OK] gps_frozen 구간 전부 override_reason=gps_freeze_safety, 명령 (0,0) 고정")
+
+    sources_during_freeze = {s["map_heading_source"] for s in frozen_steps}
+    assert "gps_track_pull" not in sources_during_freeze, \
+        f"동결 중인데도 heading_anchor_pull_threshold_deg=0/persist=1(최대로 불리한 조건)에서 " \
+        f"gps_track_pull로 전환됨 -- 동결 가드가 pull을 막지 못함: {sources_during_freeze}"
+    print(f"[OK] 동결 구간 내내 map_heading_source가 gps_track_pull로 전환되지 않음 "
+          f"(실제 값: {sources_during_freeze}) -- route_bearing_anchored의 pull 버그 수정 확인")
+
+
 if __name__ == "__main__":
     test_a_dry_run_lock()
     test_b_full_workflow()
@@ -607,4 +753,6 @@ if __name__ == "__main__":
     test_e_goal_reached_stop()
     test_f_initial_heading_lookahead_configurable()
     test_g_reroute_disabled_by_default()
+    test_h_new_mechanisms_2026_10_04()
+    test_i_gps_freeze_guard()
     print("\n모든 오프라인 스모크 테스트 통과.")

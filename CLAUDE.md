@@ -43,7 +43,75 @@ Step 5. 배포                    deployment/                          → Frodo
   확인할 것. 체크포인트(`*.pth`)와 대용량 데이터는 git이 아니라 Hugging Face에 올림
   (계정 `minsonganingee`, private repo).
 
-## ⚠ 2026-10-03 세션 요약 — 다음 세션 최우선으로 읽을 것
+## ⚠ 2026-10-04 세션 요약 — 다음 세션(다른 컴퓨터 포함) 최우선으로 읽을 것
+
+상세는 반드시 `docs/experiment_log.md` §1-8~§1-11 먼저 읽을 것(이 섹션은 결론만).
+이 세션은 Harness 1(학습/모델 분석, 이 요약 작성)과 Harness 2(실배포, 다른 터미널)가
+동시에 작업하면서 cross-session 메시지로 계속 논의한 결과임.
+
+**1) 좌편향 메커니즘은 §1-8에서 이미 규명됨 — 근데 그거랑 "별개로" heading 추정
+불안정성이라는 2번째 문제가 실주행에서 계속 발견됨:**
+- `auto` 모드에서 GPS 양자화(위경도 축별 비동기 업데이트) 때문에 `gps_track`
+  heading 추정값이 (atan2 특성상) 몇 개의 "격자 각도"(-90°, 180°, -128.4° 등)에
+  스냅되듯 튐 → 지도가 실제로 왜곡된 방향으로 회전 렌더링됨 → 모델은 **그 (왜곡된)
+  지도 내용을 충실히 따라가며** 실제와 무관한 강한 좌/우 angular를 냄(한 run에서
+  heading_route_diff_deg가 -21.5°→+54.4°까지 널뛰기, §1-9/§1-10). "좌회전 후
+  바로 우회전"이 겹쳐서 실제로는 직진처럼 보이는 사고도 실측됨.
+- **오프라인 재생으로 검증함**(`deployment/analysis/heading_estimator_replay.py`,
+  실제 production 함수 `estimate_heading_from_track()` 그대로 import해서 과거
+  GPS 이력 재생 — 로직이 production과 100% 일치하는 것까지 확인함): `min_disp_m`/
+  `fast_disp_m`을 올려서 추정을 더 보수적으로 만들면 **최악의 스파이크(≥45°)는
+  줄지만, 중간 정도 드리프트(≥20°) 노출 시간은 오히려 늘어나는 trade-off가 실측됨**
+  — 파라미터 하나만 조정하는 건 깨끗한 해법이 아님.
+- Harness 2가 오늘 `heading_mode=route_bearing`(heading을 route_bearing에 고정,
+  gps_track 안 씀)을 실험적으로 추가했는데, **이게 새로운 실패모드를 만듦**: 로봇이
+  실제로 경로를 85°가량 이탈(4.85m 이동 중 goal 방향 진행은 0.38m뿐, run
+  `111807`)해도 **아무도 감지 못 함** — "heading을 안정화"가 "실제 이탈을 못
+  보는 것"과 트레이드오프라는 게 실측으로 확인됨.
+
+**2) 설계 제안 → Harness 2가 같은 날(2026-10-04) 구현 완료함(상세: `docs/experiment_log.md`
+§1-11), 아래는 그 결과 요약 — ⚠ 실기기 검증은 아직 전(배터리 부족):**
+- `heading_mode=route_bearing_anchored` 추가: 지도 렌더링용 heading은 route_bearing을
+  기본값(anchor)으로 쓰고, gps_track은 `heading_anchor_pull_threshold_deg`(기본 20°)
+  이상 차이가 `heading_anchor_pull_persist_ticks`(기본 5틱) 이상 "지속"돼야만
+  끌어당김(순간 노이즈 무시).
+- `enable_off_route_safety` 추가: `is_off_route()` 감지를 `allow_reroute`에서 완전히
+  분리(기존엔 `allow_reroute=False`가 감지 자체까지 막던 버그였음 — reroute 폭주
+  버그 수정 때 같이 묶여서 꺼진 것으로 확인됨). 감지는 상시 켜두고, 이탈 시
+  `off_route_safety_action="steer"`(route_bearing 기반 경량 조향, OSRM 재호출 없음)
+  또는 `"stop"`으로 가볍게 대응 — 폭주 재발 없이 상시 안전망으로 동작.
+- 사용자가 추가로 요청한 4번째 메커니즘 `enable_straight_segment_override`: 근거리/
+  원거리 route_bearing 차이가 작으면(직진 구간) 모델 예측을 무시하고 route_bearing
+  기반으로 직접 조향 — §1-8/위 1번의 모델 자체 좌편향을 재학습 없이 구조적으로 우회.
+- 전부 기본값 꺼짐, `--config <yaml>`(예: `deployment/configs/route_bearing_anchored_safety.yaml`)
+  또는 개별 CLI 플래그로 독립적으로 켤 수 있음. `offline_smoke_test.py`에 전용 테스트
+  (`test_h_new_mechanisms_2026_10_04`) 추가, 8개 전부 통과 확인(2026-10-04).
+
+**3) 재학습(파인튜닝 재개) 시 최우선순위 — 사용자 질문에 대한 결론, 다른 컴퓨터에서
+이어서 진행할 때 참고**:
+1. **(최우선, 아직 blocked) §1-3 — raw Arrow 데이터로 "세그먼트 끝 몇 m 구간의
+   GT heading이 좌/우로 쏠려있는지" 직접 확인.** §1-8에서 밝혀진 진짜 트리거가
+   "화면에 그려진 future-route 선분이 짧아 보이는 순간"이었는데, 12m/20m
+   구세대 체크포인트로 재현해봐도(§1-6/§1-7) 맵을 좁혀서 그 트리거 구간을 줄여도
+   **작고 체크포인트마다 다른 잔차 좌편향이 남음** — 모델이 데이터에서 "짧은
+   future-route = 턴"이라는 가짜 상관관계를 배웠을 가능성이 있고, 이게 맞다면
+   map_range_m/아키텍처를 아무리 고쳐도 재학습 때마다 같은 편향이 재발할 위험이
+   있음. `episode_selector.py`의 세그먼트 분할 방식(어디서 자르는지)이 원인일
+   수 있음 — "ms" 외장드라이브 머신 접근이 필요(이 노트북엔 Arrow 원본 없음,
+   §1-3 상세 참고).
+2. **map_range_m은 실제 예측 horizon(~5m)에 맞춰 좁게(12m 전후, 지표상 가장
+   좋았던 값) + 반드시 지금 production geometry(전방reach+REAR_RATIO,
+   cartocdn 타일, WAYPOINT_STRIDE=7)로 새로 학습** — 기존 12m/20m 체크포인트는
+   전부 2026-09-05 이전 구세대(정중앙대칭crop, zoom18, WAYPOINT_STRIDE=3)라
+   재사용 불가, 새로 학습해야 함.
+3. **재학습 후 실주행 전에 기존 진단 스크립트(`deployment/analysis/*.py` —
+   ablation/mirror, bbox_h 분리, checkpoint 세대 비교)를 새 체크포인트에 먼저
+   오프라인으로 돌려서** 결정론적 좌편향이 사라졌는지 확인 — 로봇/배터리 소모
+   전에 싸게 걸러낼 수 있음.
+
+---
+
+## ⚠ 2026-10-03 세션 요약 (2026-10-04에 의해 일부 갱신됨 — 위 최신 요약 먼저 읽을 것)
 
 **좌편향 조사가 크게 진전됨 — 메커니즘을 구체적으로 규명하고 완화책까지 구현했으나 아직 실기기 미검증.**
 상세는 반드시 `docs/experiment_log.md` 먼저 읽을 것(이 섹션은 요약만).
