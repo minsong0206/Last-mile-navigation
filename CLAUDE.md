@@ -45,69 +45,78 @@ Step 5. 배포                    deployment/                          → Frodo
 
 ## ⚠ 2026-10-04 세션 요약 — 다음 세션(다른 컴퓨터 포함) 최우선으로 읽을 것
 
-상세는 반드시 `docs/experiment_log.md` §1-8~§1-11 먼저 읽을 것(이 섹션은 결론만).
-이 세션은 Harness 1(학습/모델 분석, 이 요약 작성)과 Harness 2(실배포, 다른 터미널)가
-동시에 작업하면서 cross-session 메시지로 계속 논의한 결과임.
+상세는 반드시 `docs/experiment_log.md` §1-8~§1-18 먼저 읽을 것(이 섹션은 결론만).
+이 세션은 Harness 1(학습/모델 분석)과 Harness 2(실배포, 이 세션)가 cross-session
+메시지로 계속 교차검증하며 진행함. **git 브랜치 3개로 정리됨**:
+- `main` / `stable-gps-freeze-20261004`(`origin`에 둘 다 push됨) — 오늘 아침 커밋
+  (`b7d8c9e`, 4개 메커니즘 + GPS 동결 가드 **초기 버전**, 아래 재무장 버그 있는 채로)
+  에 고정. 사용자가 "이 지점부터 다시 실험하고 싶다"고 명시적으로 돌아가서 쓴 브랜치.
+- `experiment-heading-dev`(`origin`에 push됨, `80c230e`) — 오늘 오후 추가 수정분
+  (아래 2번) 전부 포함, 계속 developing 중인 브랜치. **다음 세션은 기본적으로 여기서
+  이어갈 것** (단, `stable-gps-freeze-20261004`로 되돌아가 비교 실험을 더 하고 싶다고
+  할 수도 있음 — 사용자 지시 확인).
 
-**1) 좌편향 메커니즘은 §1-8에서 이미 규명됨 — 근데 그거랑 "별개로" heading 추정
-불안정성이라는 2번째 문제가 실주행에서 계속 발견됨:**
-- `auto` 모드에서 GPS 양자화(위경도 축별 비동기 업데이트) 때문에 `gps_track`
-  heading 추정값이 (atan2 특성상) 몇 개의 "격자 각도"(-90°, 180°, -128.4° 등)에
-  스냅되듯 튐 → 지도가 실제로 왜곡된 방향으로 회전 렌더링됨 → 모델은 **그 (왜곡된)
-  지도 내용을 충실히 따라가며** 실제와 무관한 강한 좌/우 angular를 냄(한 run에서
-  heading_route_diff_deg가 -21.5°→+54.4°까지 널뛰기, §1-9/§1-10). "좌회전 후
-  바로 우회전"이 겹쳐서 실제로는 직진처럼 보이는 사고도 실측됨.
-- **오프라인 재생으로 검증함**(`deployment/analysis/heading_estimator_replay.py`,
-  실제 production 함수 `estimate_heading_from_track()` 그대로 import해서 과거
-  GPS 이력 재생 — 로직이 production과 100% 일치하는 것까지 확인함): `min_disp_m`/
-  `fast_disp_m`을 올려서 추정을 더 보수적으로 만들면 **최악의 스파이크(≥45°)는
-  줄지만, 중간 정도 드리프트(≥20°) 노출 시간은 오히려 늘어나는 trade-off가 실측됨**
-  — 파라미터 하나만 조정하는 건 깨끗한 해법이 아님.
-- Harness 2가 오늘 `heading_mode=route_bearing`(heading을 route_bearing에 고정,
-  gps_track 안 씀)을 실험적으로 추가했는데, **이게 새로운 실패모드를 만듦**: 로봇이
-  실제로 경로를 85°가량 이탈(4.85m 이동 중 goal 방향 진행은 0.38m뿐, run
-  `111807`)해도 **아무도 감지 못 함** — "heading을 안정화"가 "실제 이탈을 못
-  보는 것"과 트레이드오프라는 게 실측으로 확인됨.
+**1) 실기기에서 반복 확인된 결론 — 우회전 실패는 heading_mode/override 설정과
+무관하게 재현됨, 모델 자체의 한계로 결론 내림(아직 재학습 전까지는 디플로이 코드로
+못 고침):**
+- 같은 실제 지점(route_bearing이 `-105°`대에서 `164~178°`대까지 거의 90도 우회전
+  요구)에서 **세 가지 완전히 다른 설정**(pull 기본 켬 / `straight_segment_override`만
+  끔 / pull까지 완전히 끔(`heading_anchor_pull_threshold_deg=999`) + 위치기반
+  `off_route_safety`로 대체)으로 각각 테스트했는데 **전부 우회전 실패**(`143423`,
+  `144650`, `145526`(연석 충돌 발생 — 실제 물리적 접촉, 로봇 이상 없음 확인됨),
+  `145951`).
+- 특히 `145951`은 지도가 100% 깨끗(`route_bearing_anchor`, `diff=0.0`, pull 전혀
+  없음)했는데도 모델 raw angular가 ±0.02 수준(필요한 각속도의 1/15)뿐이었음 —
+  **지도/heading 노이즈와 무관하게 모델이 이 급커브를 못 돈다는 게 직접 확인됨.**
+- 반대로 `130300`(같은 코드, `stable-gps-freeze-20261004`)은 같은 지점에서 pull이
+  껴도 몇 틱 만에 `route_bearing_anchor`로 복귀해서 결국 목표 2.3m까지 도달 —
+  **같은 코드인데 그날 GPS 환경이 얼마나 오래/심하게 pull을 붙잡아두는지에 따라
+  성공/실패가 갈림**(`151207`에서는 pull이 사용자가 멈출 때까지 20초+ 동안 **계속
+  다른** 격자각도 사이를 오가며 한 번도 안 풀림 — 재현성이 보장 안 되는 실시간
+  환경 변수임을 확인).
+- **직진 구간 좌편향(B)도 run마다 방향/크기가 다름**(어떤 run은 +0.02~0.03 좌측,
+  `151819`는 오히려 -0.062 우측 쪽) — **고정된 상수 보정(예: unity 클론에 있었던
+  `map_angular_bias_rad_s=-0.03`, 메인 레포엔 원래 없었음)은 위험**할 수 있음(run마다
+  방향이 바뀌므로). 사용자가 "소프트웨어 명령은 거의 중립인데 실제로는 계속 좌로
+  샌다"고 느낀 지점(`151819`)도 있어서, **하드웨어(휠 캘리브레이션) 쪽 가설**도
+  Harness 1이 제기함 — 로봇을 평평한 곳에서 `angular=0`만 계속 보내는 순수 하드웨어
+  테스트로 확인 필요(아직 안 함).
 
-**2) 설계 제안 → Harness 2가 같은 날(2026-10-04) 구현 완료함(상세: `docs/experiment_log.md`
-§1-11), 아래는 그 결과 요약 — ⚠ 실기기 검증은 아직 전(배터리 부족):**
-- `heading_mode=route_bearing_anchored` 추가: 지도 렌더링용 heading은 route_bearing을
-  기본값(anchor)으로 쓰고, gps_track은 `heading_anchor_pull_threshold_deg`(기본 20°)
-  이상 차이가 `heading_anchor_pull_persist_ticks`(기본 5틱) 이상 "지속"돼야만
-  끌어당김(순간 노이즈 무시).
-- `enable_off_route_safety` 추가: `is_off_route()` 감지를 `allow_reroute`에서 완전히
-  분리(기존엔 `allow_reroute=False`가 감지 자체까지 막던 버그였음 — reroute 폭주
-  버그 수정 때 같이 묶여서 꺼진 것으로 확인됨). 감지는 상시 켜두고, 이탈 시
-  `off_route_safety_action="steer"`(route_bearing 기반 경량 조향, OSRM 재호출 없음)
-  또는 `"stop"`으로 가볍게 대응 — 폭주 재발 없이 상시 안전망으로 동작.
-- 사용자가 추가로 요청한 4번째 메커니즘 `enable_straight_segment_override`: 근거리/
-  원거리 route_bearing 차이가 작으면(직진 구간) 모델 예측을 무시하고 route_bearing
-  기반으로 직접 조향 — §1-8/위 1번의 모델 자체 좌편향을 재학습 없이 구조적으로 우회.
-- 전부 기본값 꺼짐, `--config <yaml>`(예: `deployment/configs/route_bearing_anchored_safety.yaml`)
-  또는 개별 CLI 플래그로 독립적으로 켤 수 있음. `offline_smoke_test.py`에 전용 테스트
-  (`test_h_new_mechanisms_2026_10_04`) 추가, 8개 전부 통과 확인(2026-10-04).
+**2) 오늘 오후 추가 수정 4건(`experiment-heading-dev`, `80c230e`) — 전부 오프라인
+스모크 테스트(10개) 통과, 위 1번의 "모델이 급커브 못 도는" 문제는 못 고침(원래
+목표가 그게 아니었음 — heading 노이즈/크래시 안정성 목적):**
+- GPS 동결 플래그가 10틱마다 재무장(re-arm)되던 버그 수정 — speed 조건을 "매 틱
+  AND"에서 "동결 구간 안에서 한 번이라도 OR"로 바꿔서, 한 번 동결 확정되면 실제
+  위치 변화 전까지 계속 유지되게 함.
+- `route_bearing_anchored`의 pull에 `gps_accumulated_path_m >= 1.5m` readiness
+  게이트 추가 — GO LIVE 직후처럼 이동량이 적을 때 짧은창 추정의 잡음성 pull 방지.
+  **단, "매번 다른 격자각도로 계속 바뀌며 pull 상태 자체가 안 풀리는" 변종
+  (`151207`에서 재확인)은 이 두 수정으로도 못 잡음** — pull을 "절대 지속시간"으로
+  도 한계 두는 방향이 다음 후보(Harness 1에 전달 예정).
+- `straight_segment_override`/`near_goal_override`/`off_route_safety`(steer)가
+  조향 계산 시 그 틱의 (오염 가능한) `map_heading_rad` 대신 매번 새로 구하는
+  `route_bearing_rad_now`를 기준으로 쓰도록 수정 — 1틱짜리 노이즈로 풀파워(0.3)
+  조향이 튀던 버그 해결.
+- `poll_frodobot()`/`send_control()`에 네트워크 재시도(2회, 0.3초 간격) 추가 —
+  SDK 서버 1~2초 일시적 hiccup으로 전체 프로세스가 죽던 문제 완화(통신 완전
+  불능이면 여전히 정지 후 종료, 안전 원칙 유지).
 
-**3) 재학습(파인튜닝 재개) 시 최우선순위 — 사용자 질문에 대한 결론, 다른 컴퓨터에서
-이어서 진행할 때 참고**:
-1. **(최우선, 아직 blocked) §1-3 — raw Arrow 데이터로 "세그먼트 끝 몇 m 구간의
-   GT heading이 좌/우로 쏠려있는지" 직접 확인.** §1-8에서 밝혀진 진짜 트리거가
-   "화면에 그려진 future-route 선분이 짧아 보이는 순간"이었는데, 12m/20m
-   구세대 체크포인트로 재현해봐도(§1-6/§1-7) 맵을 좁혀서 그 트리거 구간을 줄여도
-   **작고 체크포인트마다 다른 잔차 좌편향이 남음** — 모델이 데이터에서 "짧은
-   future-route = 턴"이라는 가짜 상관관계를 배웠을 가능성이 있고, 이게 맞다면
-   map_range_m/아키텍처를 아무리 고쳐도 재학습 때마다 같은 편향이 재발할 위험이
-   있음. `episode_selector.py`의 세그먼트 분할 방식(어디서 자르는지)이 원인일
-   수 있음 — "ms" 외장드라이브 머신 접근이 필요(이 노트북엔 Arrow 원본 없음,
-   §1-3 상세 참고).
-2. **map_range_m은 실제 예측 horizon(~5m)에 맞춰 좁게(12m 전후, 지표상 가장
-   좋았던 값) + 반드시 지금 production geometry(전방reach+REAR_RATIO,
-   cartocdn 타일, WAYPOINT_STRIDE=7)로 새로 학습** — 기존 12m/20m 체크포인트는
-   전부 2026-09-05 이전 구세대(정중앙대칭crop, zoom18, WAYPOINT_STRIDE=3)라
-   재사용 불가, 새로 학습해야 함.
-3. **재학습 후 실주행 전에 기존 진단 스크립트(`deployment/analysis/*.py` —
-   ablation/mirror, bbox_h 분리, checkpoint 세대 비교)를 새 체크포인트에 먼저
-   오프라인으로 돌려서** 결정론적 좌편향이 사라졌는지 확인 — 로봇/배터리 소모
-   전에 싸게 걸러낼 수 있음.
+**3) 별개로 발견한 미해결 이슈 (코드 안 건드림)**: `dashboard_capture.py`가
+`-movflags +faststart`로 mp4를 쓰는데, 중간에 pyppeteer/Chrome이 죽으면(오늘 2번,
+`144650`/`151819`) **그 시점까지 찍힌 영상 전체가 통째로 복구 불가능해짐**(moov
+박스가 끝에 한 번에 써져서). `+frag_keyframe+empty_moov`(fragmented mp4)로 바꾸면
+죽어도 그때까지는 재생 가능 — 아직 적용 안 함, 다음에 할 일.
+
+**4) 재학습 시 최우선순위 (기존과 동일, 변경 없음)**: §1-3(raw Arrow 데이터 좌편향
+직접 확인, blocked), map_range_m 12m 전후로 새 production geometry로 재학습,
+재학습 후 `deployment/analysis/*.py`로 오프라인 선검증. **오늘 추가로 확인된 것**:
+이 급커브 실패가 재학습으로도 고쳐지는지 별도로 확인 필요(§1-3과 무관하게 "급커브
+자체를 못 돈다"는 더 일반적인 문제일 수 있음 — bbox_h 가설과 같은 원인인지 다른
+원인인지는 미확정).
+
+**다음 세션 할 일(우선순위)**: (1) 하드웨어 캘리브레이션 가설 확인(순수 teleop 직진
+테스트), (2) pull "절대 지속시간" 상한 추가, (3) dashboard mp4 fragmented 포맷 전환,
+(4) 재학습 트랙은 §1-3 블로킹 해소 대기.
 
 ---
 
