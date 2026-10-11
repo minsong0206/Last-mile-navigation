@@ -437,6 +437,30 @@ DEFAULT_CROSS_TRACK_INTEGRAL_MAX_M_S = 20.0
 # 때만 더함.
 DEFAULT_ANGULAR_TRIM = 0.0
 
+# 2026-10-11 추가 (실측, teleop + 실외 배포 전반): 로봇(또는 펌웨어) 쪽에서 angular
+# 명령이 0.01 단위로 "0 쪽으로 절삭(truncate)"되는 것이 실측으로 확정됨 —
+# -0.05/-0.055/-0.058/-0.059가 전부 동일하게 좌측 주행, -0.06에서만 우측으로 바뀜.
+# 결정적 근거: linear=0.2(실내)와 linear=0.3(실외) 양쪽에서 경계가 똑같이 -0.06이었음
+# (진짜 물리적 균형점이면 속도에 따라 이동해야 하는데 안 움직임 → 물리값이 아니라
+# 양자화 경계). 그래서 진짜 균형점(-0.05와 -0.06 사이)은 상수 트림으로는 도달 불가.
+# 해결: 델타-시그마 디더링 — 매 tick 양자화 잔차를 누적해서 다음 tick 명령에 더하면,
+# 인접한 두 양자화 단계를 섞어 보내서 시간평균이 원하는 값에 수렴한다(제어 루프 3Hz,
+# 로봇 yaw 반응은 그보다 훨씬 느리므로 로봇은 시간평균을 느낌).
+DEFAULT_ANGULAR_QUANTUM = 0.01
+DEFAULT_ENABLE_ANGULAR_DITHER = False  # 기본 꺼짐 — 켜야 디더링 적용(기존 동작 보존)
+
+# 2026-10-11 추가 (오늘 로그 3995틱 전수 분석): 모델이 같은 크기의 회전 요구에 대해
+# 우회전을 좌회전의 41%(요구 10~30°)/72%(30~60°) 세기로만 출력하는 비대칭이 실측됨.
+# 모델 출력이 음수(우회전)일 때만 곱해서 좌우 조향 권한을 맞추는 보정 — 실측 기준
+# 1.4~2.4배가 필요하므로 1.8 전후가 절충값. 기본 1.0 = 무영향(기존 동작).
+DEFAULT_ANGULAR_RIGHT_GAIN = 1.0
+
+# 2026-10-11 추가 (사용자 요청, 데모용): straight_segment override 발동 구간에서
+# route_bearing 기반 조향조차 쓰지 않고 angular를 0으로 못박음 — 경로 폴리라인의
+# 서브미터 꺾임으로 직진 구간에서도 조향이 작게 흔들리는 것까지 제거해서
+# "직진이면 무조건 직진"을 보장한다(남는 조향은 angular_trim뿐). 기본 꺼짐.
+DEFAULT_STRAIGHT_FORCE_ZERO = False
+
 
 def latlon_distance_m(lat1, lon1, lat2, lon2):
     """근거리 등적원통 근사 — 이 파일 전체(estimate_heading_from_track 등)와 동일한
@@ -611,6 +635,10 @@ class OmniVLAEdgeDeployment:
                  cross_track_blend_gain_i=DEFAULT_CROSS_TRACK_BLEND_GAIN_I,
                  cross_track_integral_max_m_s=DEFAULT_CROSS_TRACK_INTEGRAL_MAX_M_S,
                  angular_trim=DEFAULT_ANGULAR_TRIM,
+                 angular_quantum=DEFAULT_ANGULAR_QUANTUM,
+                 enable_angular_dither=DEFAULT_ENABLE_ANGULAR_DITHER,
+                 angular_right_gain=DEFAULT_ANGULAR_RIGHT_GAIN,
+                 straight_force_zero=DEFAULT_STRAIGHT_FORCE_ZERO,
                  heading_anchor_pull_threshold_deg=DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG,
                  heading_anchor_pull_persist_ticks=DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS,
                  enable_off_route_safety=DEFAULT_ENABLE_OFF_ROUTE_SAFETY,
@@ -721,6 +749,11 @@ class OmniVLAEdgeDeployment:
         self._cross_track_integral_m_s = 0.0
         self._cross_track_integral_last_ts = None
         self.angular_trim = angular_trim
+        self.angular_quantum = angular_quantum
+        self.enable_angular_dither = enable_angular_dither
+        self._angular_dither_accum = 0.0
+        self.angular_right_gain = angular_right_gain
+        self.straight_force_zero = straight_force_zero
         self.heading_anchor_pull_threshold_deg = heading_anchor_pull_threshold_deg
         self.heading_anchor_pull_persist_ticks = heading_anchor_pull_persist_ticks
         self.enable_off_route_safety = enable_off_route_safety
@@ -750,7 +783,8 @@ class OmniVLAEdgeDeployment:
         # 이 앵커 + reported speed × 경과시간으로 경로 위 추정 위치를 메꾼다.
         self.enable_route_dead_reckoning = enable_route_dead_reckoning
         self._dr_anchor_latlon = None
-        self._dr_anchor_ts = None
+        self._dr_advance_m = 0.0      # 앵커 이후 누적 전진거리(speed를 dt로 적분) — 실제 GPS 갱신 시 0 리셋
+        self._dr_last_ts = None       # 직전 tick ts (dt 계산용)
 
         # 2026-09-26 추가: INITIAL_HEADING_LOOKAHEAD_M을 CLI로 조절 가능하게 함 —
         # 실제 주행에서 목표 근처(dist_to_goal≈6.9m)에서 정렬 확인을 눌렀더니,
@@ -862,6 +896,10 @@ class OmniVLAEdgeDeployment:
             "cross_track_blend_gain_i": self.cross_track_blend_gain_i,
             "cross_track_integral_max_m_s": self.cross_track_integral_max_m_s,
             "angular_trim": self.angular_trim,
+            "angular_quantum": self.angular_quantum,
+            "enable_angular_dither": self.enable_angular_dither,
+            "angular_right_gain": self.angular_right_gain,
+            "straight_force_zero": self.straight_force_zero,
             "heading_anchor_pull_threshold_deg": self.heading_anchor_pull_threshold_deg,
             "heading_anchor_pull_persist_ticks": self.heading_anchor_pull_persist_ticks,
             "enable_off_route_safety": self.enable_off_route_safety,
@@ -1230,17 +1268,30 @@ class OmniVLAEdgeDeployment:
         # raw 궤적 기반이어야 하므로). route가 아직 없거나(첫 틱) 기능 꺼짐이면 eff=raw.
         eff_lat, eff_lon = lat, lon
         dr_active = False
+        advance_m = None
         if self.enable_route_dead_reckoning and self.map_builder._route_latlon is not None:
             dr_speed_mps = float((raw_data or {}).get("speed") or 0.0)
             dr_now_ts = record["ts"]
+            # dt는 매 tick(동결/비동결 무관) 갱신 — 적분이 연속되게. 긴 공백은 2초로 클램프.
+            dr_dt_s = (max(0.0, min(dr_now_ts - self._dr_last_ts, 2.0))
+                       if self._dr_last_ts is not None else 0.0)
+            self._dr_last_ts = dr_now_ts
             moved = (self._dr_anchor_latlon is None
                      or latlon_distance_m(lat, lon, self._dr_anchor_latlon[0],
                                            self._dr_anchor_latlon[1]) >= self.gps_freeze_min_disp_m)
             if moved:
+                # 실제 GPS 갱신 — 앵커를 현재 위치로 재설정하고 누적 전진거리 리셋.
                 self._dr_anchor_latlon = (lat, lon)
-                self._dr_anchor_ts = dr_now_ts
+                self._dr_advance_m = 0.0
             else:
-                advance_m = dr_speed_mps * max(0.0, dr_now_ts - (self._dr_anchor_ts or dr_now_ts))
+                # 동결 중 — speed를 시간에 대해 "적분"해서 전진거리를 조금씩 누적한다.
+                # 2026-10-11 버그수정(deploy_20261011_152028.jsonl): 원래 advance =
+                # 현재_speed × 총_경과시간으로 계산했는데, speed가 매 tick 출렁이면
+                # (0.2↔0.77) 추정 위치가 경로 앞뒤로 널뛰어서(eff_dist 5.2↔11.9↔2.4)
+                # 지도 빨간경로가 확 짧아졌다 길어졌다 함. 누적 적분(dt)으로 바꿔
+                # 단조 증가하게 함.
+                self._dr_advance_m += dr_speed_mps * dr_dt_s
+                advance_m = self._dr_advance_m
                 ahead = self.map_builder.point_ahead_on_route(
                     self._dr_anchor_latlon[0], self._dr_anchor_latlon[1], advance_m)
                 if ahead is not None:
@@ -1619,6 +1670,17 @@ class OmniVLAEdgeDeployment:
         # 기준으로 렌더링해서 동결 중에도 모델이 "경로를 따라 전진 중"인 입력을 보게 함.
         pred_xy_m = self.predict_waypoints(eff_lat, eff_lon, map_heading_rad, tick_id=tick_id)
         linear, angular = self.waypoint_to_control(pred_xy_m, target_step=self.waypoint_target_step)
+        # 2026-10-11 추가 (오늘 전체 로그 3995틱 분석): 모델의 조향 방향 자체는 올바르지만
+        # (필요회전량 대비 상관계수 r=-0.668, 부호 정상), 같은 크기의 회전 요구에 대해
+        # 우회전 출력이 좌회전의 41%(요구 10~30°) / 72%(30~60°)밖에 안 나오는 비대칭이
+        # 실측됨 — 직진 구간의 좌편향(+0.012)과 같은 뿌리가 회전 구간에서는 "우회전 권한
+        # 부족"으로 나타남. 상수 트림은 전체를 균일하게 옮길 뿐이라 이 비대칭을 못 고치므로,
+        # 모델 출력이 음수(우회전)일 때만 배수로 증폭해서 좌우 권한을 맞춘다. 실측대로면
+        # 1.4~2.4배가 필요하고 1.8 전후가 절충값. 근본 해결은 재학습(학습 데이터 클래스
+        # 불균형)이고 이건 측정 기반 증상 완화임 — 기본값 1.0은 무영향(기존 동작).
+        record["angular_model_raw"] = angular
+        if self.angular_right_gain != 1.0 and angular < 0.0:
+            angular *= self.angular_right_gain
         linear, angular = clip_control(linear, angular)
         linear_before_override, angular_before_override = linear, angular
 
@@ -1718,6 +1780,14 @@ class OmniVLAEdgeDeployment:
                         near_b, ref_heading_rad, target_time_s,
                         cross_track_error_m=cross_track_trusted or 0.0, cross_track_gain=self.cross_track_gain,
                     cross_track_integral_m_s=self._cross_track_integral_m_s, cross_track_gain_i=self.cross_track_gain_i)
+                    # 2026-10-11 추가 (사용자 요청, 데모용 하드코딩): route_bearing 기반
+                    # 조향은 경로 폴리라인의 서브미터 꺾임 때문에 직진 구간에서도 작게
+                    # 흔들릴 수 있음(§1-20 실측). straight_force_zero를 켜면 직진 판정
+                    # 구간에서 angular를 아예 0으로 못박아, 남는 조향은 angular_trim
+                    # (하드웨어 편향 보정)뿐이게 한다 — "직진이면 무조건 직진"을
+                    # 구조적으로 보장하는 가장 강한 형태.
+                    if self.straight_force_zero:
+                        angular = 0.0
                     linear, angular = clip_control(linear, angular)
                     straight_segment_override_applied = True
                     override_reason = "straight_segment"
@@ -1756,6 +1826,27 @@ class OmniVLAEdgeDeployment:
             angular += self.angular_trim
             linear, angular = clip_control(linear, angular)
         record["angular_trim"] = self.angular_trim
+
+        # 2026-10-11 추가 (실측 — 위 DEFAULT_ANGULAR_QUANTUM 설명 참고): 로봇이 angular를
+        # 0.01 단위로 0 쪽으로 절삭하므로, 두 양자화 단계 사이의 값은 그냥 보내면 사라진다
+        # (-0.055를 보내도 -0.05로 깎여서 -0.05와 구분이 안 됨). 양자화 잔차를 누적해서
+        # 다음 tick에 더하는 델타-시그마 방식으로, 인접 두 단계를 섞어 보내 시간평균이
+        # 원하는 값에 수렴하게 한다. 안전 정지(linear=0)에는 적용하지 않고 잔차도 리셋 —
+        # "멈춰라"는 명령이 디더링으로 흔들리면 안 되고, 정지 구간의 잔차를 재출발 때
+        # 끌고 가서 엉뚱한 조향이 나오는 것도 막기 위함.
+        record["angular_desired"] = angular
+        if self.enable_angular_dither and self.angular_quantum > 0 and abs(linear) > 1e-6:
+            q = self.angular_quantum
+            # round()로 부동소수 표현오차를 먼저 제거한 뒤 truncate — 안 하면 -0.06이
+            # -0.059999...로 저장돼 있어 한 단계 손실되는 경우가 생김.
+            steps = math.trunc(round((angular + self._angular_dither_accum) / q, 6))
+            sent = steps * q
+            self._angular_dither_accum = float(np.clip(
+                self._angular_dither_accum + (angular - sent), -2.0 * q, 2.0 * q))
+            angular = sent
+        elif abs(linear) <= 1e-6:
+            self._angular_dither_accum = 0.0
+        record["angular_dither_accum"] = self._angular_dither_accum
 
         # 2026-09-25 추가 디버그 필드: route bearing/heading 차이/지도 회전각/target
         # waypoint — 6번(시각화)에서 합의한 "GO 누르기 전에 확인할 수치들"
@@ -2052,6 +2143,35 @@ if __name__ == "__main__":
                         f"근처). cross_track 보정(경로 오차 기준)과 별개의 '로봇 자체 상수 편향' "
                         f"보정이며, 안전 정지(linear=0) 시엔 더하지 않음. run마다 편차가 커서 "
                         f"완벽 고정값은 아니고 거친 보정용.")
+    p.add_argument("--enable_angular_dither", action="store_true",
+                   help=f"angular 명령의 양자화 디더링(델타-시그마) 활성화. 실측으로 로봇이 "
+                        f"angular를 {DEFAULT_ANGULAR_QUANTUM} 단위로 0 쪽으로 절삭하는 것이 확정됨 "
+                        f"(-0.05/-0.055/-0.058/-0.059 전부 좌측 동일, -0.06만 우측 — linear=0.2와 "
+                        f"0.3 양쪽에서 경계가 똑같이 -0.06이라 물리값이 아니라 양자화 경계). 그래서 "
+                        f"두 단계 사이의 트림값은 그냥 보내면 사라짐. 이 옵션을 켜면 양자화 잔차를 "
+                        f"다음 tick으로 넘겨 인접 두 단계를 섞어 보내서, 시간평균이 요청값에 "
+                        f"수렴함(예: --angular_trim -0.055가 실제로 평균 -0.055로 실현됨). "
+                        f"안전 정지(linear=0)엔 미적용 + 잔차 리셋.")
+    p.add_argument("--angular_quantum", type=float, default=DEFAULT_ANGULAR_QUANTUM,
+                   help=f"위 디더링이 가정하는 로봇 측 angular 양자화 단위 (기본 "
+                        f"{DEFAULT_ANGULAR_QUANTUM}, 실측 근거는 --enable_angular_dither 설명 참고). "
+                        f"로봇/펌웨어가 바뀌어 단위가 달라지면 이 값을 재측정해서 조정할 것.")
+    p.add_argument("--angular_right_gain", type=float, default=DEFAULT_ANGULAR_RIGHT_GAIN,
+                   help=f"모델 출력이 음수(우회전)일 때만 곱하는 증폭 배수 (기본 "
+                        f"{DEFAULT_ANGULAR_RIGHT_GAIN}=무영향). 오늘 로그 3995틱 전수 분석: 모델의 "
+                        f"조향 방향 자체는 올바른데(상관계수 r=-0.668) 같은 크기의 회전 요구에 대해 "
+                        f"우회전 출력이 좌회전의 41%%(요구 10~30도)/72%%(30~60도)밖에 안 나오는 "
+                        f"비대칭이 실측됨. 상수 트림으로는 못 고치는(전체를 균일 이동시킬 뿐) 문제라 "
+                        f"우회전만 선택적으로 증폭함 — 실측 기준 1.4~2.4배 필요, 1.8 전후 권장. "
+                        f"근본 해결은 재학습이고 이건 증상 완화임.")
+    p.add_argument("--straight_force_zero", action="store_true",
+                   help="enable_straight_segment_override와 함께 사용 — 직진 판정 구간에서 "
+                        "route_bearing 기반 조향조차 쓰지 않고 angular를 0으로 못박음. 경로 "
+                        "폴리라인의 서브미터 꺾임 때문에 직진 구간에서도 조향이 작게 흔들리는 것까지 "
+                        "제거해서 '직진이면 무조건 직진'을 보장함(남는 조향은 angular_trim뿐). "
+                        "회전 구간에서는 straight_segment 판정이 자동 해제되므로 모델이 그대로 "
+                        "회전을 맡음 — 단, route_mode=direct면 전 구간이 직진 판정이라 회전이 "
+                        "영구히 막히니 회전이 필요하면 route_mode=osrm과 함께 쓸 것.")
     p.add_argument("--heading_anchor_pull_threshold_deg", type=float,
                    default=DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG,
                    help=f"heading_mode=route_bearing_anchored 전용 — gps_track이 route_bearing과 "
@@ -2164,6 +2284,10 @@ if __name__ == "__main__":
         cross_track_blend_gain_i=args.cross_track_blend_gain_i,
         cross_track_integral_max_m_s=args.cross_track_integral_max_m_s,
         angular_trim=args.angular_trim,
+        angular_quantum=args.angular_quantum,
+        enable_angular_dither=args.enable_angular_dither,
+        angular_right_gain=args.angular_right_gain,
+        straight_force_zero=args.straight_force_zero,
         heading_anchor_pull_threshold_deg=args.heading_anchor_pull_threshold_deg,
         heading_anchor_pull_persist_ticks=args.heading_anchor_pull_persist_ticks,
         enable_off_route_safety=args.enable_off_route_safety,
