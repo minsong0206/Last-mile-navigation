@@ -73,6 +73,7 @@ replay_logger.py 모듈 docstring 참고 (2026-09-18 세션에서 대시보드 �
 """
 
 import sys
+import os
 import time
 import base64
 import io
@@ -97,6 +98,15 @@ sys.path.insert(0, str(REPO_ROOT / "deployment"))
 from model_omnivla_edge_odom import OmniVLA_edge_odom
 from build_live_map import LiveMapBuilder
 from debug_web import DeploymentState, start_debug_server
+
+# 2026-09-26 추가: forodobot_semantic_nav 저장소 경로 기본값. 특정 사용자 홈
+# 디렉터리를 하드코딩하지 않기 위해, 이 저장소(REPO_ROOT) 자신의 위치를 기준으로
+# "같은 상위 디렉터리의 forodobot_semantic_nav"를 가정한다 — 지금 두 저장소가
+# 실제로 그렇게 배치되어 있음(둘 다 unity/ 바로 아래). 다른 배치라면
+# --semantic_repo_path로 덮어쓸 수 있음. import 자체는 SEMANTIC_INIT 진입 시점에
+# 지연 수행(_semantic_init 참고) — MAP_NAV만 쓸 때는 clip/efficientnet_pytorch 등
+# semantic 쪽 의존성이 아예 필요 없게 하기 위함.
+SEMANTIC_REPO_ROOT_DEFAULT = REPO_ROOT.parent / "forodobot_semantic_nav"
 from replay_logger import ReplayLogger
 from dashboard_capture import DashboardRecorder
 
@@ -270,6 +280,37 @@ REROUTE_COOLDOWN_S = 3.0
 # dist_to_goal_m 기반 도착 정지(DEFAULT_GOAL_REACH_THRESHOLD_M)가 곧 작동하므로 경로
 # 재계산이 불필요.
 REROUTE_DISABLE_NEAR_GOAL_M = 10.0
+
+# 2026-09-26 추가: semantic(카메라 기반) 내비게이션으로의 전환 스캐폴딩.
+# nav_mode 상태머신: MAP_NAV → STOPPING → SEMANTIC_INIT → SEMANTIC_NAV.
+#   - SEMANTIC_SWITCH_DISTANCE_M은 아직 최적값이 아니라 "반복 배포 테스트로
+#     실측 결정"할 임시값 — 핵심 내비게이션 로직은 절대 건드리지 않고, CLI
+#     (--semantic_switch_distance_m)로 재배포 없이 바꿀 수 있게만 노출해둠.
+#   - nav_mode는 MAP_NAV에서만 SEMANTIC_SWITCH_DISTANCE_M 조건을 평가하고, 한 번
+#     STOPPING으로 넘어가면 그 자체가 래치가 되어(다음 조건 평가는 nav_mode==
+#     "MAP_NAV"일 때만 일어남) GPS 잡음으로 거리가 다시 늘어나도 절대 MAP_NAV로
+#     되돌아가지 않음.
+#   - SEMANTIC_INIT/SEMANTIC_NAV는 이번 라운드에서는 실제 semantic 모델이 아직
+#     연동되지 않은 스텁 상태다 — 상태 전이 자체(및 그 시점의 대시보드/로그 표시)를
+#     먼저 검증하기 위함. run()의 전송 게이트가 nav_mode=="MAP_NAV"가 아니면 항상
+#     (0,0)만 보내므로, 이 스텁 단계에서도 안전은 그대로 보장됨.
+DEFAULT_SEMANTIC_SWITCH_DISTANCE_M = 8.0  # 임시 테스트 기본값 — 실측으로 조정할 것
+DEFAULT_SEMANTIC_STOP_TICKS = 3  # STOPPING 상태를 최소 이만큼 tick 유지한 뒤 SEMANTIC_INIT으로 진행
+
+# forodobot_semantic_nav/README.md 확인 결과 그대로 재사용하는 안전 캡 기본값
+# (원본 run_autonomy.py의 --linear-cap/--angular-cap 기본값과 동일).
+DEFAULT_SEMANTIC_LINEAR_CAP = 0.5
+DEFAULT_SEMANTIC_ANGULAR_CAP = 0.5
+
+# 2026-09-26 추가: map-only 모델의 실측 좌회전 편향 임시 완화용 상수 보정
+# (angular_computed += 이 값). 근본 원인(CLAUDE.md "알려진 이슈" — 학습 데이터
+# 직진/좌/우 클래스 불균형 추정) 자체를 고치는 게 아니라, 배포 중 값만 빠르게
+# 바꿔가며 시험하기 위한 임시 실험용 상수 — 기본값 0.0(무영향).
+# ⚠ 지금은 "직진 주행 구간만" 테스트하는 용도로 도입한 것 — 실제 회전이 필요한
+# 경로에서 이 상수를 그대로 켜두면 회전량을 부족/과다하게 만들 수 있으므로,
+# 회전 구간 포함 테스트 전에는 반드시 재검토할 것(고정 상수는 회전 각도에 비례하지
+# 않는 단순 오프셋이라, 직진 편향을 상쇄하는 값이 실제 회전에는 안 맞을 수 있음).
+DEFAULT_MAP_ANGULAR_BIAS_RAD_S = 0.0
 
 # ── GPS/IMU 자이로 융합 (실험적, 기본 꺼짐) ──────────────────────────────────
 # GPS-heading을 못 구하는 구간(gps_ema_hold)에서 지금은 마지막 EMA 값을 그냥
@@ -511,7 +552,14 @@ class OmniVLAEdgeDeployment:
                  enable_gps_freeze_guard=DEFAULT_ENABLE_GPS_FREEZE_GUARD,
                  gps_freeze_min_disp_m=DEFAULT_GPS_FREEZE_MIN_DISP_M,
                  gps_freeze_persist_ticks=DEFAULT_GPS_FREEZE_PERSIST_TICKS,
-                 gps_freeze_speed_threshold_mps=DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS):
+                 gps_freeze_speed_threshold_mps=DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS,
+                 semantic_switch_distance_m=DEFAULT_SEMANTIC_SWITCH_DISTANCE_M,
+                 semantic_stop_ticks=DEFAULT_SEMANTIC_STOP_TICKS,
+                 semantic_prompt=None, semantic_repo_path=None, semantic_ckpt_path=None,
+                 semantic_linear_cap=DEFAULT_SEMANTIC_LINEAR_CAP,
+                 semantic_angular_cap=DEFAULT_SEMANTIC_ANGULAR_CAP,
+                 map_angular_bias_rad_s=DEFAULT_MAP_ANGULAR_BIAS_RAD_S,
+                 map_angular_override_rad_s=None):
         # 2026-09-25: --dry_run의 의미가 "이 프로세스는 GO LIVE 자체를 영구히
         # 거부하는 하드 락"으로 바뀜(순수 검증 세션용). 기본(플래그 없음)은
         # DRY_RUN 상태로 시작하되, 대시보드에서 정렬확인→ARM→GO LIVE를 거치면
@@ -636,6 +684,35 @@ class OmniVLAEdgeDeployment:
         # _ensure_route_initialized() 참고.
         self.allow_reroute = allow_reroute
 
+        # 2026-09-26 추가: semantic 전환 상태머신 (모듈 상단 상수 설명 참고).
+        # nav_mode는 control_stage(DRY_RUN/ARMED/LIVE)와 완전히 독립된 축 —
+        # DRY_RUN 중에도 그대로 전이/관찰 가능해야 실측 없이 임계값을 검증할 수 있음.
+        self.semantic_switch_distance_m = semantic_switch_distance_m
+        self.semantic_stop_ticks = semantic_stop_ticks
+        self.nav_mode = "MAP_NAV"  # "MAP_NAV"/"STOPPING"/"SEMANTIC_INIT"/"SEMANTIC_NAV"/"SEMANTIC_ERROR"
+        self._nav_stop_tick_count = 0
+
+        # 2026-09-26 추가: SEMANTIC_NAV 연동 (forodobot_semantic_nav, language-only
+        # modality=7 고정). 실제 import/모델 로드는 SEMANTIC_INIT 진입 시점에 지연
+        # 수행한다(_semantic_init) — MAP_NAV만 도는 동안은 clip/efficientnet_pytorch
+        # 등 semantic 쪽 의존성이 전혀 필요 없게 하기 위함이자, MAP_NAV 단계에서
+        # 굳이 두 번째 모델을 GPU에 올려두지 않기 위함.
+        self.semantic_prompt = semantic_prompt
+        self.semantic_repo_path = Path(semantic_repo_path) if semantic_repo_path else SEMANTIC_REPO_ROOT_DEFAULT
+        self.semantic_ckpt_path = semantic_ckpt_path or str(self.semantic_repo_path / "best.pth")
+        self.semantic_linear_cap = semantic_linear_cap
+        self.semantic_angular_cap = semantic_angular_cap
+        self._semantic_policy = None            # OmniVLAEdgePolicy 인스턴스 (지연 로드)
+        self._semantic_frame_buffer = None       # deque[PIL.Image] — MAP_NAV의 텐서 frame_buffer와 완전히 별개
+        self._semantic_context_len = None        # forodobot_semantic_nav.policy.omnivla_policy.CONTEXT_LEN
+        self._semantic_waypoint_to_velocity = None
+        self._semantic_to_control_command = None
+        self._semantic_waypoint_spacing = None
+        self._semantic_waypoint_index = None
+        self._semantic_max_lin_mps = None
+        self._semantic_max_ang_rps = None
+        self._semantic_calibration_found = None
+
         self.obs_transform = transforms.Compose([
             transforms.Resize((96, 96)),
             transforms.ToTensor(),
@@ -678,6 +755,32 @@ class OmniVLAEdgeDeployment:
 
         # 마지막 재라우팅 시각 (REROUTE_COOLDOWN_S 참고 — 무한 재라우팅 스팸 방지)
         self._last_reroute_ts = 0.0
+
+        # 2026-09-26 추가: 재라우팅 자체를 기본 비활성화. 목표에서 멀리 떨어진
+        # 채(dist_to_goal≈15~16m, REROUTE_DISABLE_NEAR_GOAL_M=10m 밖) 로봇이
+        # 거의 정지해 있는데도 OSRM 재쿼리 결과가 흔들려서 route_bearing_deg가
+        # -14.6°→-105.3°→-92.8°로 요동치며 9회 연속 재라우팅이 발생한 사고가
+        # 실측됨(deploy_20260926_163849.jsonl). 최초 route_init은 이 값과 무관하게
+        # 항상 수행됨 — 그게 없으면 애초에 정렬 확인/주행 자체가 불가.
+        self.allow_reroute = allow_reroute
+
+        # 2026-09-26 추가: map-only 모델 좌회전 편향 임시 보정(모듈 상단 상수 설명 참고).
+        # 기본 0.0(무영향) — 직진 구간 테스트에서만 값을 넣어 쓸 것을 권장(회전 구간
+        # 포함 시 재검토 필요).
+        self.map_angular_bias_rad_s = map_angular_bias_rad_s
+        if self.map_angular_bias_rad_s != 0.0:
+            print(f"[deploy] ⚠ map_angular_bias_rad_s={self.map_angular_bias_rad_s:+.4f} rad/s 적용 중 "
+                  f"— 좌회전 편향 임시 보정(직진 구간 테스트 전용, 회전 구간에서는 재검토 필요)")
+
+        # 2026-09-26 추가: 직진 구간 테스트용 하드 오버라이드(모듈 상단/step() 참고).
+        # None(기본)이면 무영향 — 설정하면 모델이 예측한 angular를 완전히 무시하고
+        # 이 값(보통 0.0)으로 강제 대체함. map_angular_bias_rad_s보다 우선함(둘 다
+        # 설정돼도 override가 이김, step() 참고).
+        self.map_angular_override_rad_s = map_angular_override_rad_s
+        if self.map_angular_override_rad_s is not None:
+            print(f"[deploy] ⚠ map_angular_override_rad_s={self.map_angular_override_rad_s:+.4f} rad/s "
+                  f"강제 적용 중 — 모델의 angular 예측을 완전히 무시함(직진 구간 테스트 전용, "
+                  f"회전이 필요한 구간에서는 반드시 끌 것)")
 
         # 직전 step()의 record ts (USE_GYRO_FUSION 적분용 dt 계산)
         self._prev_step_ts = None
@@ -732,6 +835,15 @@ class OmniVLAEdgeDeployment:
             "gps_freeze_min_disp_m": self.gps_freeze_min_disp_m,
             "gps_freeze_persist_ticks": self.gps_freeze_persist_ticks,
             "gps_freeze_speed_threshold_mps": self.gps_freeze_speed_threshold_mps,
+            "map_angular_bias_rad_s": self.map_angular_bias_rad_s,
+            "map_angular_override_rad_s": self.map_angular_override_rad_s,
+            "semantic_switch_distance_m": self.semantic_switch_distance_m,
+            "semantic_stop_ticks": self.semantic_stop_ticks,
+            "semantic_prompt": self.semantic_prompt,
+            "semantic_repo_path": str(self.semantic_repo_path),
+            "semantic_ckpt_path": self.semantic_ckpt_path,
+            "semantic_linear_cap": self.semantic_linear_cap,
+            "semantic_angular_cap": self.semantic_angular_cap,
             # 2026-09-25: 각 step 레코드의 context_frame_paths/map_replay_path를
             # 어떻게 실제 파일로 바꾸는지 — 별도 코드를 몰라도 이 JSONL 파일 하나만
             # 보고 알 수 있도록 규칙 자체를 데이터로 남겨둔다.
@@ -745,7 +857,9 @@ class OmniVLAEdgeDeployment:
             print("[deploy] DRY_RUN 상태로 시작합니다. 대시보드에서 "
                   "'정렬 확인' → 'ARM' → 'GO LIVE' 순서로 명시적으로 진행해야 "
                   "실제 로봇에 non-zero 명령이 전송됩니다.")
-        self.state.update(dry_run=True, control_stage=self.control_stage, heading_mode=self.heading_mode)
+        self.state.update(dry_run=True, control_stage=self.control_stage, heading_mode=self.heading_mode,
+                           nav_mode=self.nav_mode, semantic_switch_distance_m=self.semantic_switch_distance_m,
+                           semantic_prompt=self.semantic_prompt)
 
     def _log_jsonl(self, record: dict):
         self._log_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -930,6 +1044,168 @@ class OmniVLAEdgeDeployment:
                           "reset_stale_ema": had_stale_ema})
         self.state.update(route_aligned_heading_deg=deg)
 
+    def _set_nav_mode(self, new_mode, tick_id, lat, lon, dist_to_goal_m):
+        """nav_mode 전이를 한 곳에서 일관되게 기록 — 콘솔 로그(사용자가 요청한 정확한
+        포맷), 대시보드 로그, JSONL 이벤트(nav_mode_transition, 실측 테스트 데이터용
+        전체 필드 포함) 세 곳에 동시에 남긴다. 래치: 이 함수를 거쳐야만 nav_mode가
+        바뀌고, step()의 전이 조건은 항상 "현재 nav_mode가 무엇인지"에 따라 분기되므로
+        (예: MAP_NAV 조건은 self.nav_mode=="MAP_NAV"일 때만 평가), GPS 잡음으로
+        dist_to_goal_m이 다시 늘어나도 이미 지나온 단계로는 자동으로 되돌아가지 않는다."""
+        prev_mode = self.nav_mode
+        print("[NAV] Semantic switch threshold reached" if new_mode == "STOPPING" else f"[NAV] {new_mode} 진입")
+        print(f"[NAV] distance_to_goal={dist_to_goal_m:.1f} m")
+        print(f"[NAV] threshold={self.semantic_switch_distance_m:.1f} m")
+        print(f"[NAV] {prev_mode} → {new_mode}")
+        self.nav_mode = new_mode
+        self._nav_stop_tick_count = 0 if new_mode != "STOPPING" else self._nav_stop_tick_count
+        self.state.log(f"[NAV] {prev_mode} → {new_mode} (distance_to_goal={dist_to_goal_m:.1f}m, "
+                        f"threshold={self.semantic_switch_distance_m:.1f}m)")
+        self.state.update(nav_mode=self.nav_mode)
+        self._log_jsonl({
+            "type": "event", "ts": time.time(), "tick_id": tick_id,
+            "event": "nav_mode_transition",
+            "lat": lat, "lon": lon,
+            "goal_lat": self.goal_lat, "goal_lon": self.goal_lon,
+            "dist_to_goal_m": dist_to_goal_m,
+            "semantic_switch_distance_m": self.semantic_switch_distance_m,
+            "prev_nav_mode": prev_mode, "new_nav_mode": new_mode,
+            "control_stage": self.control_stage,
+        })
+
+    def _semantic_init(self, tick_id):
+        """SEMANTIC_INIT 진입 시 1회 수행: forodobot_semantic_nav import, 모델/체크포인트
+        로드, prompt warm-up encoding, 전용 6-frame PIL 버퍼 준비, calibration 확인.
+        실패하면 예외를 삼키지 않고 False를 반환 — 호출부(step())가 MAP_NAV로
+        되돌리지 않고 SEMANTIC_ERROR로 보내서 로봇을 정지 상태로 유지한다(요구사항)."""
+        try:
+            if not self.semantic_prompt:
+                raise RuntimeError(
+                    "--semantic_prompt가 설정되지 않음 — language-only modality(id=7)는 "
+                    "prompt가 필수임(select_modality가 all-False 조합을 지원하지 않음)")
+            if not os.path.exists(self.semantic_ckpt_path):
+                raise FileNotFoundError(f"semantic checkpoint 없음: {self.semantic_ckpt_path}")
+
+            if self._semantic_policy is None:
+                repo_path_str = str(self.semantic_repo_path)
+                if repo_path_str not in sys.path:
+                    sys.path.insert(0, repo_path_str)
+                # 지연 import — MAP_NAV만 쓰는 배포에서는 clip/efficientnet_pytorch 등
+                # semantic 쪽 의존성이 아예 로드되지 않게 함.
+                from policy.omnivla_policy import OmniVLAEdgePolicy, CONTEXT_LEN
+                from policy.control import (
+                    waypoint_to_velocity, to_control_command, load_calibration,
+                    METRIC_WAYPOINT_SPACING, WAYPOINT_INDEX,
+                )
+                self._semantic_waypoint_to_velocity = waypoint_to_velocity
+                self._semantic_to_control_command = to_control_command
+                self._semantic_waypoint_spacing = METRIC_WAYPOINT_SPACING
+                self._semantic_waypoint_index = WAYPOINT_INDEX
+                self._semantic_context_len = CONTEXT_LEN
+
+                print(f"[NAV] semantic 모델 로딩 중: {self.semantic_ckpt_path} (device={self.device})")
+                self._semantic_policy = OmniVLAEdgePolicy(self.semantic_ckpt_path, device=str(self.device))
+
+                # 요구사항: calibration.json을 임의로 새로 만들지 않고, 있으면 그대로 쓰고
+                # 없으면 placeholder(1.0/1.0) 사용을 명확히 경고한다 — 조용히 잘못된 속도로
+                # 주행하는 걸 막기 위함.
+                calib = load_calibration()
+                self._semantic_max_lin_mps = calib.get("max_lin_mps", 1.0)
+                self._semantic_max_ang_rps = calib.get("max_ang_rps", 1.0)
+                self._semantic_calibration_found = bool(calib)
+                if not calib:
+                    self.state.log_error(
+                        "⚠ semantic calibration.json 없음(forodobot_semantic_nav/policy/calibration.json) "
+                        "— placeholder max_lin_mps=1.0, max_ang_rps=1.0 사용. 실제 속도 스케일이 "
+                        "부정확할 수 있음(README의 known limitation과 동일).")
+                print(f"[NAV] semantic calibration: max_lin_mps={self._semantic_max_lin_mps} "
+                      f"max_ang_rps={self._semantic_max_ang_rps} "
+                      f"linear_cap={self.semantic_linear_cap} angular_cap={self.semantic_angular_cap} "
+                      f"waypoint_index={self._semantic_waypoint_index} dt={DT:.4f}")
+
+            # prompt warm-up encoding — OmniVLAEdgePolicy._text_cache에 이미 있는
+            # dict 캐시를 그대로 씀(중복 캐싱 레이어를 새로 만들지 않음). 여기서 미리
+            # 1번 호출해두면 SEMANTIC_NAV 첫 틱에 인코딩 지연이 안 생김(필수는 아님).
+            self._semantic_policy.encode_text(self.semantic_prompt)
+
+            self._semantic_frame_buffer = deque(maxlen=self._semantic_context_len)
+            self.state.log(f"[NAV] SEMANTIC_INIT 완료 — prompt={self.semantic_prompt!r}, "
+                            f"ckpt={self.semantic_ckpt_path}, context_len={self._semantic_context_len}")
+            self._log_jsonl({"type": "event", "ts": time.time(), "tick_id": tick_id,
+                              "event": "semantic_init_ready",
+                              "semantic_prompt": self.semantic_prompt,
+                              "semantic_ckpt_path": self.semantic_ckpt_path,
+                              "semantic_context_len": self._semantic_context_len,
+                              "semantic_max_lin_mps": self._semantic_max_lin_mps,
+                              "semantic_max_ang_rps": self._semantic_max_ang_rps,
+                              "semantic_calibration_found": self._semantic_calibration_found})
+            return True
+        except Exception as e:
+            self.state.log_error(f"[NAV][ERROR] Semantic initialization failed: {e!r}")
+            print(f"[NAV][ERROR] Semantic initialization failed: {e!r}")
+            print("[NAV][SAFETY] Robot remains stopped")
+            self._log_jsonl({"type": "event", "ts": time.time(), "tick_id": tick_id,
+                              "event": "semantic_init_failed", "error": repr(e)})
+            return False
+
+    def _semantic_step(self, tick_id, img, lat, lon, dist_to_goal_m, record):
+        """SEMANTIC_NAV의 매 틱 inference. forodobot_semantic_nav의 원본 함수
+        (OmniVLAEdgePolicy.predict_waypoints / waypoint_to_velocity / to_control_command)를
+        그대로 재사용 — 로직을 복사해서 새로 작성하지 않는다. 실제 로봇 전송은 여기서
+        하지 않고 (linear, angular)만 반환 — run()의 단일 게이트가 그 값을 받아
+        nav_mode/control_stage 조건을 확인한 뒤에만 실제로 전송한다.
+        실패 시 이전 명령을 재사용하지 않고 (0,0)을 반환하며, SEMANTIC_ERROR로
+        전환해 이후 절대 MAP_NAV로 되돌아가지 않는다."""
+        try:
+            self._semantic_frame_buffer.append(img)
+            if len(self._semantic_frame_buffer) < self._semantic_context_len:
+                self.state.log(f"[NAV] SEMANTIC_NAV — camera context 채우는 중 "
+                                f"({len(self._semantic_frame_buffer)}/{self._semantic_context_len})")
+                record.update(linear=0.0, angular=0.0, note="semantic_context_filling")
+                self._log_jsonl(record)
+                return 0.0, 0.0
+
+            context = list(self._semantic_frame_buffer)
+            waypoints, modality_id = self._semantic_policy.predict_waypoints(
+                context, prompt=self.semantic_prompt, goal_pose=None, goal_image=None)
+            v_mps, w_rps = self._semantic_waypoint_to_velocity(
+                waypoints, waypoint_index=self._semantic_waypoint_index, dt=DT)
+            linear, angular = self._semantic_to_control_command(
+                v_mps, w_rps,
+                max_lin_mps=self._semantic_max_lin_mps, max_ang_rps=self._semantic_max_ang_rps,
+                linear_cap=self.semantic_linear_cap, angular_cap=self.semantic_angular_cap)
+
+            # 대시보드 궤적 — MAP_NAV의 pred_xy_m과 동일한 좌표 정의(ego frame,
+            # x=forward m, y=left m)임을 두 저장소 docstring으로 확인한 뒤 그대로 재사용.
+            # 축 swap/부호 반전 없음 — 단위 환산(semantic 자신의 METRIC_WAYPOINT_SPACING)만 적용.
+            semantic_xy_m = waypoints[:, :2].astype(np.float64) * self._semantic_waypoint_spacing
+            self.state.update(pred_xy_m=semantic_xy_m)
+
+            record.update(linear=linear, angular=angular, note="semantic_nav",
+                          semantic_modality_id=int(modality_id),
+                          semantic_v_mps=v_mps, semantic_w_rps=w_rps,
+                          semantic_pred_xy_m=semantic_xy_m.tolist())
+            self._log_jsonl(record)
+            return linear, angular
+        except Exception as e:
+            self.state.log_error(f"[NAV][ERROR] semantic inference 실패: {e!r} — (0,0) 반환")
+            print(f"[NAV][ERROR] semantic inference 실패: {e!r}")
+            print("[NAV][SAFETY] Robot remains stopped")
+            prev_mode = self.nav_mode
+            self.nav_mode = "SEMANTIC_ERROR"
+            self.state.update(nav_mode=self.nav_mode)
+            self._log_jsonl({"type": "event", "ts": time.time(), "tick_id": tick_id,
+                              "event": "semantic_inference_failed", "error": repr(e)})
+            self._log_jsonl({"type": "event", "ts": time.time(), "tick_id": tick_id,
+                              "event": "nav_mode_transition", "lat": lat, "lon": lon,
+                              "goal_lat": self.goal_lat, "goal_lon": self.goal_lon,
+                              "dist_to_goal_m": dist_to_goal_m,
+                              "semantic_switch_distance_m": self.semantic_switch_distance_m,
+                              "prev_nav_mode": prev_mode, "new_nav_mode": "SEMANTIC_ERROR",
+                              "control_stage": self.control_stage})
+            record.update(linear=0.0, angular=0.0, note="semantic_inference_failed")
+            self._log_jsonl(record)
+            return 0.0, 0.0
+
     def _handle_command(self, cmd):
         """대시보드 버튼 → 큐에 쌓인 명령을 제어 루프 스레드에서 순차 처리
         (모든 상태 변경이 이 스레드 하나에서만 일어나므로 락이 필요 없음)."""
@@ -1093,6 +1369,46 @@ class OmniVLAEdgeDeployment:
                               "lat": lat, "lon": lon,
                               "goal_lat": self.goal_lat, "goal_lon": self.goal_lon})
             self.state.update(goal_reached=True)
+
+        # 2026-09-26 추가: MAP_NAV → STOPPING → SEMANTIC_INIT → SEMANTIC_NAV 상태머신.
+        # control_stage(DRY_RUN/ARMED/LIVE)와 무관하게 매 틱 평가/진행되므로, DRY_RUN
+        # 상태에서도(로봇을 실제로 움직이지 않고도) 전이 자체를 관찰/검증할 수 있다.
+        print(f"[NAV] mode={self.nav_mode}")
+        print(f"[NAV] distance_to_goal={dist_to_goal_m:.1f} m")
+        if self.nav_mode == "MAP_NAV":
+            print(f"[NAV] semantic_switch_threshold={self.semantic_switch_distance_m:.1f} m")
+            if dist_to_goal_m <= self.semantic_switch_distance_m:
+                self._set_nav_mode("STOPPING", tick_id, lat, lon, dist_to_goal_m)
+        elif self.nav_mode == "STOPPING":
+            self._nav_stop_tick_count += 1
+            self.state.log(f"[NAV] STOPPING — 정지 확인 중 ({self._nav_stop_tick_count}/"
+                            f"{self.semantic_stop_ticks} tick)")
+            if self._nav_stop_tick_count >= self.semantic_stop_ticks:
+                self._set_nav_mode("SEMANTIC_INIT", tick_id, lat, lon, dist_to_goal_m)
+        elif self.nav_mode == "SEMANTIC_INIT":
+            # 실제 semantic 모델(forodobot_semantic_nav) 로드/준비 — _semantic_init() 참고.
+            # 실패하면 MAP_NAV로 되돌리지 않고 SEMANTIC_ERROR로 보내 로봇을 정지 상태로 유지.
+            if self._semantic_init(tick_id):
+                self._set_nav_mode("SEMANTIC_NAV", tick_id, lat, lon, dist_to_goal_m)
+            else:
+                self.state.log_error("[NAV][SAFETY] semantic 초기화 실패 — 로봇 정지 상태 유지")
+                self._set_nav_mode("SEMANTIC_ERROR", tick_id, lat, lon, dist_to_goal_m)
+        self.state.update(nav_mode=self.nav_mode)
+        record["nav_mode"] = self.nav_mode  # 이 tick의 record가 어느 nav_mode에서 만들어졌는지 JSONL 하나로 판별 가능하게
+
+        if self.nav_mode == "SEMANTIC_NAV":
+            # semantic inference는 여기서 (linear, angular)만 계산해서 반환한다 — 실제
+            # /control 전송은 run()의 단일 게이트가 nav_mode/control_stage를 다시
+            # 확인한 뒤에만 수행한다(요구사항: single control gate 유지).
+            return self._semantic_step(tick_id, img, lat, lon, dist_to_goal_m, record)
+
+        if self.nav_mode != "MAP_NAV":
+            # STOPPING/SEMANTIC_INIT(진행 중)/SEMANTIC_ERROR는 항상 (0,0), MAP 추론도
+            # 안 함 — run()의 전송 게이트도 nav_mode=="MAP_NAV"를 별도로 요구해서
+            # 이중으로 막는다.
+            record.update(linear=0.0, angular=0.0, note=f"nav_mode={self.nav_mode}_no_map_inference")
+            self._log_jsonl(record)
+            return 0.0, 0.0
 
         # 2026-09-25: route(OSRM) 생성을 frame_buffer 준비 상태와 분리 — GPS fix가
         # 유효해지는 즉시 route가 생겨야 대시보드에서 route-aligned 정렬 확인이
@@ -1409,6 +1725,22 @@ class OmniVLAEdgeDeployment:
 
         pred_xy_m = self.predict_waypoints(lat, lon, map_heading_rad, tick_id=tick_id)
         linear, angular = self.waypoint_to_control(pred_xy_m)
+        angular_before_bias = angular
+        if self.map_angular_override_rad_s is not None:
+            # 2026-09-26 추가: 직진 구간 테스트 전용 하드 오버라이드 — 모델이
+            # 예측한 angular를 아예 무시하고 지정된 값(보통 0.0)으로 강제 대체한다.
+            # map_angular_bias_rad_s(모델 값에 소량만 더하는 부분 보정)와 달리,
+            # 이건 "모델이 뭘 예측하든 이 값만 나가야 한다"는 완전 대체이므로
+            # 회전이 필요한 구간에서는 절대 켜두면 안 됨(직진 구간에서만 사용).
+            angular = self.map_angular_override_rad_s
+        else:
+            # 2026-09-26 추가: map-only 모델의 실측 좌회전 편향(CLAUDE.md "알려진 이슈" —
+            # heading_route_diff_deg가 route_aligned_fixed로 이미 ~0인 상태에서도
+            # target_waypoint_xy가 지속적으로 y>0으로 나옴, deploy_20260926_173253.jsonl
+            # 분석으로 재확인) 임시 완화용 단순 상수 보정. 근본 원인(모델 자체의 학습
+            # 데이터 클래스 불균형 등)을 고치는 게 아니라, 배포 중 빠르게 시험해볼 수
+            # 있도록 CLI(--map_angular_bias_rad_s)로만 노출한 임시값 — 기본값 0.0(무영향).
+            angular += self.map_angular_bias_rad_s
         linear, angular = clip_control(linear, angular)
         linear_before_override, angular_before_override = linear, angular
 
@@ -1527,7 +1859,10 @@ class OmniVLAEdgeDeployment:
                        off_route_safety_applied=off_route_safety_applied,
                        gps_freeze_safety_applied=gps_freeze_safety_applied,
                        override_reason=override_reason,
-                       is_off_route=self._is_off_route_now)
+                       is_off_route=self._is_off_route_now,
+                       angular_before_bias=angular_before_bias,
+                       map_angular_bias_rad_s=self.map_angular_bias_rad_s,
+                       map_angular_override_rad_s=self.map_angular_override_rad_s)
         self._log_jsonl(record)
         self.state.update(route_bearing_deg=route_bearing_deg,
                            heading_route_diff_deg=heading_route_diff_deg,
@@ -1592,10 +1927,24 @@ class OmniVLAEdgeDeployment:
                 #      그 자체가 "정렬을 안 하고 GO LIVE를 눌렀다"는 신호.
                 #   3. (2026-09-26 추가) 아직 목표에 도착하지 않았어야 함(_goal_reached
                 #      래치) — 이전엔 목표 근처에 도달해도 계속 명령이 나가던 실제 갭.
+                #   4. (2026-09-26 추가) nav_mode가 실제로 명령을 내는 단계("MAP_NAV" 또는
+                #      "SEMANTIC_NAV")여야 함 — STOPPING/SEMANTIC_INIT/SEMANTIC_ERROR로
+                #      넘어가면 step()이 이미 (0,0)을 반환하지만(위 참고), "실제 로봇에
+                #      보낼 수 있는 조건"을 단일 게이트에 전부 모아두는 원칙에 따라
+                #      여기서도 명시적으로 확인한다.
+                #      ⚠ 2026-09-26 버그 수정: 이 조건이 원래 "MAP_NAV"만 허용해서,
+                #      SEMANTIC_NAV를 실제로 연동한 뒤에도 semantic이 계산한 non-zero
+                #      명령이 여기서 전부 (0,0)으로 막히고 있었음(실제 LIVE 테스트 로그
+                #      deploy_20260926_165850.jsonl에서 확인 — SEMANTIC_NAV 중
+                #      computed linear=0.3 등이었는데 sent는 계속 0,0). MAP_NAV와
+                #      SEMANTIC_NAV 둘 다 "현재 활성 내비게이션 모드가 스스로 계산한
+                #      명령을 보낼 수 있어야 한다"는 원래 의도에 맞게 수정.
                 heading_trustworthy = self._last_map_heading_source != "imu_fallback"
                 is_live = self.control_stage == "LIVE"
+                nav_mode_active = self.nav_mode in ("MAP_NAV", "SEMANTIC_NAV")
                 sent_linear, sent_angular = ((linear, angular)
-                                              if (is_live and heading_trustworthy and not self._goal_reached)
+                                              if (is_live and heading_trustworthy
+                                                  and not self._goal_reached and nav_mode_active)
                                               else (0.0, 0.0))
                 t_ctrl = time.time()
                 try:
@@ -1628,6 +1977,7 @@ class OmniVLAEdgeDeployment:
                                   "control_stage": self.control_stage,
                                   "heading_trustworthy": heading_trustworthy,
                                   "goal_reached": self._goal_reached,
+                                  "nav_mode": self.nav_mode,
                                   "map_heading_source": self._last_map_heading_source,
                                   "dry_run": not is_live,
                                   "computed_linear": linear, "computed_angular": angular})
@@ -1639,7 +1989,8 @@ class OmniVLAEdgeDeployment:
                 self.state.update(linear=sent_linear, angular=sent_angular, loop_hz=loop_hz,
                                    control_latency_ms=round(control_latency_ms, 1),
                                    computed_linear=linear, computed_angular=angular)
-                prefix = "[GOAL REACHED] " if self._goal_reached else ("[LIVE] " if is_live else f"[{self.control_stage}] ")
+                prefix = f"[{self.nav_mode}] " + ("[GOAL REACHED] " if self._goal_reached
+                                                    else ("[LIVE] " if is_live else f"[{self.control_stage}] "))
                 show_computed = not (is_live and not self._goal_reached)
                 print(f"  {prefix}linear={sent_linear:+.3f} m/s  angular={sent_angular:+.3f} rad/s"
                       + (f"  (계산값: linear={linear:+.3f} angular={angular:+.3f})" if show_computed else "")
@@ -1801,6 +2152,48 @@ if __name__ == "__main__":
                         "다른 경로를 반환해 계획 경로 방향이 요동치는 문제가 실측됨(2026-09-26, "
                         "2026-09-18에도 유사 현상 기록). 이 플래그를 주면 기존 동작(경로 이탈 "
                         "감지 시 재계산, REROUTE_DISABLE_NEAR_GOAL_M 보호 포함)으로 되돌림.")
+    p.add_argument("--map_angular_bias_rad_s", type=float, default=DEFAULT_MAP_ANGULAR_BIAS_RAD_S,
+                   help=f"MAP_NAV 계산된 angular(rad/s)에 이 값을 더함 (기본 "
+                        f"{DEFAULT_MAP_ANGULAR_BIAS_RAD_S}, 무영향). 실측 좌회전 편향 "
+                        f"(deploy_20260926_173253.jsonl 분석, angular 평균 +0.03~+0.09 rad/s) "
+                        f"임시 상쇄용 — 음수를 넣으면 좌회전을 줄이는 방향. ⚠ 고정 상수라 "
+                        f"회전 각도에 비례하지 않으므로, **직진 구간 테스트 전용**으로만 쓸 것 "
+                        f"— 실제 회전이 있는 경로에서 켜두면 회전량이 부족/과다해질 수 있음. "
+                        f"근본 수정이 아니라 임시 실험값(모델 재학습/리밸런싱이 근본 해결책).")
+    p.add_argument("--map_angular_override_rad_s", type=float, default=None,
+                   help="지정하면 MAP_NAV에서 모델이 예측한 angular를 완전히 무시하고 이 값으로 "
+                        "강제 대체함(--map_angular_bias_rad_s보다 우선). 직진 구간에서 궤적/조향과 "
+                        "무관하게 '직진만 나오는지'를 그대로 시험하고 싶을 때 0.0으로 설정. "
+                        "⚠ 회전이 필요한 구간에서는 절대 켜두지 말 것 — linear는 그대로 모델값을 "
+                        "쓰므로 속도는 정상, angular만 고정됨.")
+    p.add_argument("--semantic_switch_distance_m", type=float, default=DEFAULT_SEMANTIC_SWITCH_DISTANCE_M,
+                   help=f"목표까지 이 거리(m) 이내가 되면 MAP_NAV → STOPPING → SEMANTIC_INIT → "
+                        f"SEMANTIC_NAV 전환을 시작함 (기본 {DEFAULT_SEMANTIC_SWITCH_DISTANCE_M}m, "
+                        f"아직 실측 검증 전 임시값 — 반복 배포 테스트로 조정할 것).")
+    p.add_argument("--semantic_stop_ticks", type=int, default=DEFAULT_SEMANTIC_STOP_TICKS,
+                   help=f"STOPPING 상태를 최소 이만큼 tick 유지한 뒤 SEMANTIC_INIT으로 진행 "
+                        f"(기본 {DEFAULT_SEMANTIC_STOP_TICKS} tick, 3Hz 기준 {DEFAULT_SEMANTIC_STOP_TICKS/3:.1f}초).")
+    p.add_argument("--semantic_prompt", type=str, default=None,
+                   help="SEMANTIC_NAV의 language-only goal instruction (modality_id=7, "
+                        "forodobot_semantic_nav 재사용). 이 체크포인트는 짧은 영어 명사구로 "
+                        "학습됨(forodobot_semantic_nav/README.md 확인) — 예: \"the red chair\", "
+                        "\"blue trash bin\", \"the red door\". 비권장: \"go to the red chair\", "
+                        "\"please navigate toward the red chair\" 같은 명령형 문장(CLIP이 문장 "
+                        "전체를 벡터 하나로 인코딩하므로 단계별 지시를 해석 못 하고, 학습 분포도 "
+                        "벗어남). 지정하지 않으면 SEMANTIC_INIT에서 에러 처리되어 로봇이 정지 "
+                        "상태로 유지됨(language-only 모달리티엔 prompt가 필수).")
+    p.add_argument("--semantic_repo_path", type=str, default=str(SEMANTIC_REPO_ROOT_DEFAULT),
+                   help=f"forodobot_semantic_nav 저장소 경로 (기본: 이 저장소와 같은 상위 "
+                        f"디렉터리 = {SEMANTIC_REPO_ROOT_DEFAULT}).")
+    p.add_argument("--semantic_ckpt", type=str, default=None,
+                   help="semantic 모델(OmniVLA_edge, forodobot_semantic_nav 소속) 체크포인트 경로. "
+                        "기본값: <semantic_repo_path>/best.pth. MAP_NAV의 --ckpt와는 다른 별도 "
+                        "모델 파일임(재사용 불가).")
+    p.add_argument("--semantic_linear_cap", type=float, default=DEFAULT_SEMANTIC_LINEAR_CAP,
+                   help=f"semantic 정규화 linear 명령 상한 [-cap, cap] (기본 {DEFAULT_SEMANTIC_LINEAR_CAP}, "
+                        f"forodobot_semantic_nav README 기본값과 동일).")
+    p.add_argument("--semantic_angular_cap", type=float, default=DEFAULT_SEMANTIC_ANGULAR_CAP,
+                   help=f"semantic 정규화 angular 명령 상한 [-cap, cap] (기본 {DEFAULT_SEMANTIC_ANGULAR_CAP}).")
 
     if pre_args.config:
         import yaml
@@ -1842,5 +2235,14 @@ if __name__ == "__main__":
         gps_freeze_min_disp_m=args.gps_freeze_min_disp_m,
         gps_freeze_persist_ticks=args.gps_freeze_persist_ticks,
         gps_freeze_speed_threshold_mps=args.gps_freeze_speed_threshold_mps,
+        map_angular_bias_rad_s=args.map_angular_bias_rad_s,
+        map_angular_override_rad_s=args.map_angular_override_rad_s,
+        semantic_prompt=args.semantic_prompt,
+        semantic_repo_path=args.semantic_repo_path,
+        semantic_ckpt_path=args.semantic_ckpt,
+        semantic_linear_cap=args.semantic_linear_cap,
+        semantic_angular_cap=args.semantic_angular_cap,
+        semantic_switch_distance_m=args.semantic_switch_distance_m,
+        semantic_stop_ticks=args.semantic_stop_ticks,
     )
     deployer.run()

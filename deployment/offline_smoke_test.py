@@ -53,6 +53,9 @@ os.environ.setdefault("CARTO_API_KEY", "cb1_2yj0_1_ffcc69174af013089c6c5da6")
 CKPT_PATH = REPO_ROOT / "checkpoints" / "omnivla_edge_rides11_odom_20m_20260910" / "best.pth"
 GOAL_LAT, GOAL_LON = 37.6310081, 127.0760555
 
+# forodobot_semantic_nav/README.md가 명시하는 학습 형식(짧은 영어 명사구) 예시.
+SEMANTIC_TEST_PROMPT = "the red chair"
+
 # Seoul(osrm_port 5011 대역)에 들어가는 좌표 — 기존 스모크 테스트와 동일 기준점
 BASE_LAT, BASE_LON = 37.63118362426758, 127.07622528076172
 
@@ -137,7 +140,12 @@ def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto
                    enable_gps_freeze_guard=False,
                    gps_freeze_min_disp_m=dep.DEFAULT_GPS_FREEZE_MIN_DISP_M,
                    gps_freeze_persist_ticks=dep.DEFAULT_GPS_FREEZE_PERSIST_TICKS,
-                   gps_freeze_speed_threshold_mps=dep.DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS):
+                   gps_freeze_speed_threshold_mps=dep.DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS,
+                   semantic_switch_distance_m=dep.DEFAULT_SEMANTIC_SWITCH_DISTANCE_M,
+                   semantic_stop_ticks=dep.DEFAULT_SEMANTIC_STOP_TICKS,
+                   semantic_prompt=None, semantic_repo_path=None, semantic_ckpt_path=None,
+                   semantic_linear_cap=dep.DEFAULT_SEMANTIC_LINEAR_CAP,
+                   semantic_angular_cap=dep.DEFAULT_SEMANTIC_ANGULAR_CAP):
     # near_goal_override_dist_m/enable_off_route_safety/enable_straight_segment_override/
     # enable_gps_freeze_guard 기본값을 전부 꺼진 상태로 둠 -- 대부분의 기존 테스트는 이
     # 기능들과 무관한 걸 검증하는 거라, 운영 기본값(near_goal_override_dist_m/
@@ -167,6 +175,13 @@ def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto
         gps_freeze_min_disp_m=gps_freeze_min_disp_m,
         gps_freeze_persist_ticks=gps_freeze_persist_ticks,
         gps_freeze_speed_threshold_mps=gps_freeze_speed_threshold_mps,
+        semantic_switch_distance_m=semantic_switch_distance_m,
+        semantic_stop_ticks=semantic_stop_ticks,
+        semantic_prompt=semantic_prompt,
+        semantic_repo_path=semantic_repo_path,
+        semantic_ckpt_path=semantic_ckpt_path,
+        semantic_linear_cap=semantic_linear_cap,
+        semantic_angular_cap=semantic_angular_cap,
     )
     tick_count = [0]
     real_step = deployer.step
@@ -627,6 +642,371 @@ def test_g_reroute_disabled_by_default():
             print(f"[OK] allow_reroute=False(기본값): 경로를 크게 벗어나도 reroute 0회 (최초 route만 유지)")
 
 
+# ── test K: SEMANTIC_SWITCH_DISTANCE_M 전이 — 로봇을 실제로 움직이지 않고 검증 ──
+# (unity 클론 전용 semantic-nav 기능 테스트, 2026-10-11 main repo experiment-heading-dev
+#  동기화 시 문자 충돌 피하려고 g/h/i/k → k/l/m/n으로 재명명, 내용은 그대로)
+def test_k_nav_mode_semantic_switch():
+    """MAP_NAV -> STOPPING -> SEMANTIC_INIT -> SEMANTIC_NAV 상태머신을, 실제 로봇/GPS
+    없이 GPS 시퀀스를 가짜로 흉내내서(test_e와 동일한 방식) 검증한다. 서로 다른
+    --semantic_switch_distance_m 값(10m, 6m)으로 반복해서, 전환 시점이 그 값에
+    맞게 달라지는지 + 정확히 1번만 전환되는지 + 전환 이후 GPS가 노이즈로 다시
+    멀어져도(마지막에 일부러 큰 폭으로 뒤로 점프시킴) MAP_NAV로 되돌아가지
+    않는지(래치) 확인한다."""
+    print("\n========== test_k_nav_mode_semantic_switch ==========")
+    camera_frames = _load_camera_frames() * 3
+
+    for switch_m in (10.0, 6.0):
+        gps_sequence = [_base_gps(1000, 1000)] * 2
+        for _ in range(8):
+            gps_sequence.append(_base_gps(BASE_LAT, BASE_LON))
+        move_points = [(BASE_LAT - (i + 1) * 0.00001, BASE_LON - (i + 1) * 0.000005) for i in range(12)]
+        for lat, lon in move_points:
+            gps_sequence.append(_base_gps(lat, lon))
+        # 노이즈 흉내: 전환 이후 GPS가 잠깐 크게 뒤로(목표에서 멀어지는 쪽) 튀어도
+        # 래치가 유지되는지 확인 (실측에서 본 지그재그/양자화 잡음 정도보다 훨씬
+        # 큰 폭으로 일부러 세게 흔듦 -- 그래도 안 돌아가야 진짜 래치).
+        gps_sequence.append(_base_gps(*move_points[-1]))
+        gps_sequence.append(_base_gps(BASE_LAT, BASE_LON))
+        gps_sequence.append(_base_gps(*move_points[-1]))
+
+        # goal을 이동 경로의 연장선상, move_points[-1]보다 더 먼 지점에 둬서
+        # dist_to_goal_m이 이동 경로 내내 단조 감소(노이즈 구간 제외)하게 만듦 --
+        # switch_m(10m/6m) 문턱을 이동 중간에 정확히 통과하게 하려는 의도.
+        goal_lat = move_points[-1][0] - 0.00003
+        goal_lon = move_points[-1][1] - 0.000015
+
+        fake_get, fake_post, call_state = build_fake_requests(camera_frames, gps_sequence)
+        with mock.patch("requests.get", side_effect=fake_get), \
+             mock.patch("requests.post", side_effect=fake_post):
+            deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=len(gps_sequence),
+                                      goal_lat=goal_lat, goal_lon=goal_lon,
+                                      goal_reach_threshold_m=0.5,  # 이 테스트 범위 안에서 도착 안 하도록 충분히 작게
+                                      semantic_switch_distance_m=switch_m,
+                                      semantic_prompt=SEMANTIC_TEST_PROMPT)
+            deployer.run()
+
+        logs = _read_jsonl(deployer.log_path)
+        transitions = [l for l in logs if l.get("event") == "nav_mode_transition"]
+
+        to_stopping = [t for t in transitions if t["new_nav_mode"] == "STOPPING"]
+        assert len(to_stopping) == 1, \
+            f"switch_m={switch_m}: MAP_NAV->STOPPING 전이가 정확히 1번이어야 함: {len(to_stopping)}"
+        ev = to_stopping[0]
+        assert ev["dist_to_goal_m"] <= switch_m
+        assert ev["semantic_switch_distance_m"] == switch_m
+        assert ev["prev_nav_mode"] == "MAP_NAV" and ev["new_nav_mode"] == "STOPPING"
+        print(f"[OK] switch_m={switch_m}m: MAP_NAV->STOPPING 1회 전이, "
+              f"dist_to_goal_m={ev['dist_to_goal_m']:.2f}m에서 발생 (threshold={switch_m}m), "
+              f"tick_id={ev['tick_id']}, control_stage={ev['control_stage']}")
+
+        seen_new_modes = [t["new_nav_mode"] for t in transitions]
+        assert seen_new_modes == ["STOPPING", "SEMANTIC_INIT", "SEMANTIC_NAV"], \
+            f"switch_m={switch_m}: 예상한 순서로 전이 안 됨(실제 semantic 모델 로딩 성공 시 이 3단계만 있어야 함): {seen_new_modes}"
+        print(f"[OK] switch_m={switch_m}m: MAP_NAV -> STOPPING -> SEMANTIC_INIT -> SEMANTIC_NAV "
+              f"순서 확인 (SEMANTIC_INIT에서 실제 best.pth 로딩 성공)")
+
+        assert "MAP_NAV" not in seen_new_modes, \
+            "노이즈로 GPS가 다시 멀어졌는데 MAP_NAV로 되돌아감 (래치 실패)"
+        print(f"[OK] switch_m={switch_m}m: 전환 이후 GPS가 노이즈로 다시 멀어져도 "
+              f"MAP_NAV로 되돌아가지 않음 (래치 확인)")
+
+        assert all(c == (0.0, 0.0) for c in call_state["control_calls"]), \
+            "DRY_RUN인데 non-zero 명령이 전송됨"
+        print(f"[OK] switch_m={switch_m}m: DRY_RUN 전 구간 {len(call_state['control_calls'])}개 tick "
+              f"전부 (0,0) 전송 (nav_mode 전이와 무관하게 항상 안전)")
+
+    print(f"[OK] 로그 파일: {deployer.log_path}")
+
+
+# ── test L: semantic 통합 (실제 best.pth 로드 + 실제 inference) ─────────────────
+def test_l_semantic_navigation_integration():
+    """SEMANTIC_NAV를 실제 forodobot_semantic_nav/best.pth로 끝까지 돌려서(mock 없이
+    진짜 checkpoint 로드 + 진짜 CLIP 인코딩 + 진짜 forward pass) 다음을 확인한다:
+      - SEMANTIC_INIT에서 실제 모델이 로드되는지 (semantic_init_ready 이벤트)
+      - 6-frame PIL buffer가 다 찰 때까지 대기하는지(semantic_context_filling)
+      - prompt가 실제로 전달되어 modality_id==7이 되는지
+      - semantic trajectory(waypoints)가 (8,2)로 dashboard(pred_xy_m)에 반영되는지
+      - SEMANTIC_NAV 진입 후 MAP 쪽 추론(map_rotation_deg 등)이 완전히 멈추는지
+      - DRY_RUN이므로 계산은 되지만 실제 전송은 전부 (0,0)인지
+      - semantic inference 도중 강제로 예외를 주입했을 때, 그 tick은 (0,0)을 반환하고
+        SEMANTIC_ERROR로 전환되어 이후 MAP_NAV로 절대 돌아가지 않는지."""
+    print("\n========== test_l_semantic_navigation_integration ==========")
+    camera_frames = _load_camera_frames() * 3
+    switch_m = 8.0
+    n_fail_after = 3  # SEMANTIC_NAV에서 이만큼 성공한 뒤 강제로 inference 실패 주입
+
+    gps_sequence = [_base_gps(1000, 1000)] * 2
+    for _ in range(8):
+        gps_sequence.append(_base_gps(BASE_LAT, BASE_LON))
+    move_points = [(BASE_LAT - (i + 1) * 0.00001, BASE_LON - (i + 1) * 0.000005) for i in range(12)]
+    for lat, lon in move_points:
+        gps_sequence.append(_base_gps(lat, lon))
+    # SEMANTIC_NAV 진입 후 6-frame buffer가 찰 시간 + 성공 tick 몇 개 + 실패 주입 확인용 여유
+    for _ in range(10):
+        gps_sequence.append(_base_gps(*move_points[-1]))
+
+    goal_lat = move_points[-1][0] - 0.00003
+    goal_lon = move_points[-1][1] - 0.000015
+
+    fake_get, fake_post, call_state = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), \
+         mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=len(gps_sequence),
+                                  goal_lat=goal_lat, goal_lon=goal_lon,
+                                  goal_reach_threshold_m=0.5,
+                                  semantic_switch_distance_m=switch_m,
+                                  semantic_prompt=SEMANTIC_TEST_PROMPT)
+
+        real_step = deployer.step
+        success_ticks = [0]
+        injected = [False]
+
+        def wrapped():
+            result = real_step()
+            # SEMANTIC_NAV에서 실제 inference(6-frame buffer가 다 찬 뒤)가
+            # n_fail_after번 성공한 뒤부터는 predict_waypoints()가 예외를 던지도록
+            # 몽키패치 -- "실패 시 이전 명령 재사용 없이 (0,0)" + "MAP_NAV로 복귀
+            # 안 함"을 확인하기 위한 의도적 주입. context_filling 중인 tick은
+            # 아직 real inference가 아니므로 카운트에서 제외해야 함(버퍼가 다
+            # 찬 뒤부터만 카운트).
+            buf_ready = (deployer._semantic_frame_buffer is not None
+                         and len(deployer._semantic_frame_buffer) >= (deployer._semantic_context_len or 0))
+            if not injected[0] and deployer.nav_mode == "SEMANTIC_NAV" and buf_ready:
+                success_ticks[0] += 1
+                if success_ticks[0] >= n_fail_after:
+                    injected[0] = True
+
+                    def _boom(*a, **kw):
+                        raise RuntimeError("의도적 테스트 실패 주입")
+                    deployer._semantic_policy.predict_waypoints = _boom
+            return result
+
+        deployer.step = wrapped
+        deployer.run()
+
+    logs = _read_jsonl(deployer.log_path)
+    steps = [l for l in logs if l["type"] == "step"]
+
+    # 1) MAP_NAV 정상 동작 -- 전환 전 tick들은 map 전용 필드가 채워짐
+    map_steps = [s for s in steps if s.get("nav_mode") == "MAP_NAV" and s.get("gps_fix_ok")
+                 and "map_rotation_deg" in s]
+    assert len(map_steps) > 0 and all(s["map_rotation_deg"] is not None for s in map_steps)
+    print(f"[OK] MAP_NAV {len(map_steps)}개 tick 정상 동작 (map_rotation_deg 등 계산됨)")
+
+    # 2) threshold 전까지 semantic control 없음
+    assert all(s.get("note") != "semantic_nav" for s in map_steps)
+    print("[OK] threshold 도달 전에는 semantic_nav note가 붙은 tick이 없음")
+
+    # 3) threshold에서 MAP_NAV -> STOPPING 정확히 1회
+    transitions = [l for l in logs if l.get("event") == "nav_mode_transition"]
+    to_stopping = [t for t in transitions if t["new_nav_mode"] == "STOPPING"]
+    assert len(to_stopping) == 1
+    print(f"[OK] MAP_NAV->STOPPING 1회 전이 (dist={to_stopping[0]['dist_to_goal_m']:.2f}m)")
+
+    # 4) STOPPING 중 (0,0)
+    stopping_steps = [s for s in steps if s.get("nav_mode") == "STOPPING"]
+    assert len(stopping_steps) > 0 and all(s["linear"] == 0.0 and s["angular"] == 0.0 for s in stopping_steps)
+    print(f"[OK] STOPPING {len(stopping_steps)}개 tick 전부 (0,0)")
+
+    # 5) SEMANTIC_INIT 진입 + 6) best.pth 로딩 성공
+    init_ready = [l for l in logs if l.get("event") == "semantic_init_ready"]
+    assert len(init_ready) == 1, f"semantic_init_ready 이벤트가 정확히 1번이어야 함: {len(init_ready)}"
+    assert init_ready[0]["semantic_ckpt_path"].endswith("best.pth")
+    print(f"[OK] SEMANTIC_INIT 진입, 실제 체크포인트 로딩 성공: {init_ready[0]['semantic_ckpt_path']}")
+    print(f"[OK] semantic calibration_found={init_ready[0]['semantic_calibration_found']}, "
+          f"max_lin_mps={init_ready[0]['semantic_max_lin_mps']}, "
+          f"max_ang_rps={init_ready[0]['semantic_max_ang_rps']}")
+
+    # 7) 6-frame buffer가 찰 때까지 대기(semantic_context_filling)했는지
+    context_filling = [s for s in steps if s.get("note") == "semantic_context_filling"]
+    assert len(context_filling) > 0
+    print(f"[OK] SEMANTIC_NAV 진입 직후 {len(context_filling)}개 tick 동안 "
+          f"6-frame buffer 채움(semantic_context_filling)")
+
+    # 8) semantic prompt 전달 + 9) modality_id == 7 확인 + 10) trajectory shape (8,2)
+    semantic_nav_steps = [s for s in steps if s.get("note") == "semantic_nav"]
+    assert len(semantic_nav_steps) > 0, "실제 semantic inference가 성공한 tick이 없음"
+    assert all(s["semantic_modality_id"] == 7 for s in semantic_nav_steps), \
+        f"modality_id가 7(language only)이 아닌 tick 있음: " \
+        f"{set(s['semantic_modality_id'] for s in semantic_nav_steps)}"
+    first = semantic_nav_steps[0]
+    xy = first["semantic_pred_xy_m"]
+    assert len(xy) == 8 and all(len(p) == 2 for p in xy), f"trajectory shape이 (8,2)가 아님: {np.array(xy).shape}"
+    print(f"[OK] semantic inference {len(semantic_nav_steps)}개 tick 성공, 전부 modality_id=7, "
+          f"trajectory shape=(8,2) 확인 (prompt={SEMANTIC_TEST_PROMPT!r} 실제 전달됨)")
+
+    # 11) dashboard(pred_xy_m)에 semantic trajectory가 반영됐는지
+    status = deployer.state.snapshot_status()
+    assert status["nav_mode"] in ("SEMANTIC_NAV", "SEMANTIC_ERROR")
+    assert status["semantic_prompt"] == SEMANTIC_TEST_PROMPT
+    assert status["pred_xy_m"] is not None and len(status["pred_xy_m"]) == 8
+    print(f"[OK] 대시보드 상태: nav_mode={status['nav_mode']}, "
+          f"semantic_prompt={status['semantic_prompt']!r}, pred_xy_m shape=(8,2)")
+
+    # 12) SEMANTIC_NAV 진입 이후 MAP 추론(모델 predict_waypoints 등)이 완전히 차단됐는지
+    after_semantic_init = [s for s in steps if s["tick_id"] >= init_ready[0]["tick_id"]]
+    assert all(s.get("nav_mode") != "MAP_NAV" for s in after_semantic_init), \
+        "SEMANTIC_INIT 이후에도 MAP_NAV로 표시된 tick이 있음"
+    assert all("map_rotation_deg" not in s for s in after_semantic_init), \
+        "SEMANTIC_INIT 이후에도 MAP 전용 필드(map_rotation_deg)가 다시 계산됨 -- MAP 추론이 안 막힘"
+    print(f"[OK] SEMANTIC_INIT 이후 {len(after_semantic_init)}개 tick 전부 MAP 추론 차단 확인")
+
+    # 13) DRY_RUN에서는 semantic control을 계산해도 실제 actuation은 (0,0)
+    assert all(c == (0.0, 0.0) for c in call_state["control_calls"]), \
+        "DRY_RUN인데 non-zero 명령이 실제 전송됨"
+    nonzero_computed = [s for s in semantic_nav_steps if (s["linear"], s["angular"]) != (0.0, 0.0)]
+    print(f"[OK] DRY_RUN: semantic inference로 계산된 명령 중 {len(nonzero_computed)}/"
+          f"{len(semantic_nav_steps)}개가 non-zero였지만, 실제 /control 전송 "
+          f"{len(call_state['control_calls'])}개 전부 (0,0) (계산 O, actuation X 확인)")
+
+    # 14) GPS noise로 MAP_NAV 복귀하지 않음(이 시나리오엔 노이즈 구간 없음 -- 대신
+    #     "MAP_NAV로 가는 전이가 단 한 번도 없다"는 사실 자체로 래치를 재확인)
+    assert not any(t["new_nav_mode"] == "MAP_NAV" for t in transitions)
+    print("[OK] 전체 실행에서 MAP_NAV로 되돌아가는 전이가 한 번도 없음")
+
+    # 15) semantic inference failure -> STOP (이전 명령 재사용 없이 (0,0), SEMANTIC_ERROR로 전환)
+    to_error = [t for t in transitions if t["new_nav_mode"] == "SEMANTIC_ERROR"]
+    assert len(to_error) == 1, f"의도적으로 주입한 semantic 실패인데 SEMANTIC_ERROR 전이가 없음: {len(to_error)}"
+    fail_events = [l for l in logs if l.get("event") == "semantic_inference_failed"]
+    assert len(fail_events) == 1
+    error_steps = [s for s in steps if s.get("nav_mode") == "SEMANTIC_ERROR"]
+    assert len(error_steps) > 0 and all(s["linear"] == 0.0 and s["angular"] == 0.0 for s in error_steps)
+    print(f"[OK] 의도적으로 주입한 semantic inference 실패 → SEMANTIC_ERROR 전이 1회, "
+          f"이후 {len(error_steps)}개 tick 전부 (0,0) 유지 (MAP_NAV로 복귀하지 않음)")
+
+    print(f"[OK] 로그 파일: {deployer.log_path}")
+
+
+# ── test M: semantic_prompt 미설정 시 SEMANTIC_INIT 실패 처리 ───────────────────
+def test_m_semantic_init_missing_prompt():
+    """--semantic_prompt 없이 threshold까지 도달하면 SEMANTIC_INIT이 명확히 실패하고
+    (MAP_NAV로 되돌아가지 않고) SEMANTIC_ERROR로 전환되어 계속 정지 상태를 유지하는지
+    확인한다 (요구사항: 설정 오류도 안전측으로 처리)."""
+    print("\n========== test_m_semantic_init_missing_prompt ==========")
+    camera_frames = _load_camera_frames() * 3
+    n_ticks = 22
+    gps_sequence = [_base_gps(1000, 1000)] * 2
+    for _ in range(8):
+        gps_sequence.append(_base_gps(BASE_LAT, BASE_LON))
+    move_points = [(BASE_LAT - (i + 1) * 0.00001, BASE_LON - (i + 1) * 0.000005) for i in range(12)]
+    for lat, lon in move_points:
+        gps_sequence.append(_base_gps(lat, lon))
+
+    goal_lat, goal_lon = move_points[-1]
+
+    fake_get, fake_post, call_state = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), \
+         mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=True, n_ticks=n_ticks,
+                                  goal_lat=goal_lat, goal_lon=goal_lon,
+                                  goal_reach_threshold_m=0.5,
+                                  semantic_switch_distance_m=10.0,
+                                  semantic_prompt=None)  # 의도적으로 미설정
+        deployer.run()
+
+    logs = _read_jsonl(deployer.log_path)
+    transitions = [l for l in logs if l.get("event") == "nav_mode_transition"]
+    fail_events = [l for l in logs if l.get("event") == "semantic_init_failed"]
+
+    assert len(fail_events) == 1, f"semantic_init_failed 이벤트가 정확히 1번이어야 함: {len(fail_events)}"
+    assert "semantic_prompt" in fail_events[0]["error"]
+    to_error = [t for t in transitions if t["new_nav_mode"] == "SEMANTIC_ERROR"]
+    assert len(to_error) == 1
+    assert not any(t["new_nav_mode"] == "MAP_NAV" for t in transitions)
+    assert deployer.nav_mode == "SEMANTIC_ERROR"
+    print(f"[OK] --semantic_prompt 미설정 → SEMANTIC_INIT 실패({fail_events[0]['error']}) "
+          f"→ SEMANTIC_ERROR로 전환, MAP_NAV 복귀 없음")
+
+    assert all(c == (0.0, 0.0) for c in call_state["control_calls"])
+    print(f"[OK] 전 구간 {len(call_state['control_calls'])}개 tick 전부 (0,0) 전송")
+    print(f"[OK] 로그 파일: {deployer.log_path}")
+
+
+# ── test N: LIVE 상태에서 SEMANTIC_NAV가 실제로 non-zero 명령을 전송하는지 ──────
+def test_n_semantic_nav_sends_nonzero_when_live():
+    """회귀 테스트 — 2026-09-26 실제 LIVE 필드 테스트(deploy_20260926_165850.jsonl)에서
+    발견된 버그를 커버: run()의 단일 전송 게이트가 원래 nav_mode=="MAP_NAV"만 허용해서,
+    SEMANTIC_NAV를 실제로 연동한 뒤에도 LIVE 상태에서 semantic이 계산한 non-zero
+    명령이 계속 (0,0)으로 막히고 있었음(로봇이 SEMANTIC_NAV 동안 전혀 안 움직임).
+    이 테스트는 test_b와 동일하게 confirm_alignment->ARM->GO LIVE를 실제로 거쳐
+    control_stage="LIVE"로 만든 뒤, SEMANTIC_NAV까지 도달했을 때 계산된 non-zero
+    명령이 실제로 (0,0)이 아니게 전송되는지 확인한다 — 이게 실패하면 위 버그가
+    재발한 것."""
+    print("\n========== test_n_semantic_nav_sends_nonzero_when_live ==========")
+    camera_frames = _load_camera_frames() * 3
+    switch_m = 8.0
+    n_ticks = 40
+
+    gps_sequence = [_base_gps(1000, 1000)] * 2  # 0~1: fix 없음
+    for _ in range(8):  # 2~9: 정지(정렬 확인/ARM/GO LIVE는 이 구간에서 진행 -- test_b와 동일 타이밍)
+        gps_sequence.append(_base_gps(BASE_LAT, BASE_LON))
+    move_points = [(BASE_LAT - (i + 1) * 0.00001, BASE_LON - (i + 1) * 0.000005) for i in range(12)]
+    for lat, lon in move_points:
+        gps_sequence.append(_base_gps(lat, lon))
+    for _ in range(15):  # SEMANTIC_NAV에서 6-frame buffer가 찰 시간 + 여유
+        gps_sequence.append(_base_gps(*move_points[-1]))
+
+    goal_lat = move_points[-1][0] - 0.00003
+    goal_lon = move_points[-1][1] - 0.000015
+
+    fake_get, fake_post, call_state = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), \
+         mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=False, n_ticks=n_ticks,
+                                  goal_lat=goal_lat, goal_lon=goal_lon,
+                                  goal_reach_threshold_m=0.5,
+                                  semantic_switch_distance_m=switch_m,
+                                  semantic_prompt=SEMANTIC_TEST_PROMPT)
+        real_step = deployer.step
+        tick_count = [0]
+
+        def wrapped():
+            t = tick_count[0]
+            if t == 4:
+                deployer._pending_commands.put("confirm_alignment")
+            if t == 6:
+                deployer._pending_commands.put("arm")
+            if t == 7:
+                deployer._pending_commands.put("go_live")
+            tick_count[0] += 1
+            return real_step()
+
+        deployer.step = wrapped
+        deployer.run()
+
+    logs = _read_jsonl(deployer.log_path)
+    go_live_events = [l for l in logs if l.get("event") == "go_live"]
+    assert len(go_live_events) == 1, "GO LIVE가 정확히 1번 승인돼야 함(테스트 전제조건)"
+    print("[OK] confirm_alignment -> ARM -> GO LIVE 정상 진행, control_stage=LIVE 도달")
+
+    transitions = [l for l in logs if l.get("event") == "nav_mode_transition"]
+    assert any(t["new_nav_mode"] == "SEMANTIC_NAV" for t in transitions), \
+        "이 시나리오에서 SEMANTIC_NAV까지 도달하지 못함(테스트 전제조건)"
+    print("[OK] LIVE 상태에서 MAP_NAV -> STOPPING -> SEMANTIC_INIT -> SEMANTIC_NAV까지 도달")
+
+    controls = [l for l in logs if l["type"] == "control_sent"]
+    semantic_live_controls = [c for c in controls
+                               if c.get("nav_mode") == "SEMANTIC_NAV" and c["control_stage"] == "LIVE"]
+    assert len(semantic_live_controls) > 0, "SEMANTIC_NAV 동안 LIVE 상태인 control_sent 기록이 없음"
+
+    nonzero = [c for c in semantic_live_controls if (c["linear"], c["angular"]) != (0.0, 0.0)]
+    assert len(nonzero) > 0, (
+        "회귀 발생: LIVE + SEMANTIC_NAV인데도 실제 전송값이 전부 (0,0)임 -- "
+        "run()의 단일 게이트가 SEMANTIC_NAV의 non-zero 명령을 막고 있음 "
+        "(2026-09-26 실제 LIVE 테스트에서 발견된 버그의 재발)"
+    )
+    # 게이트를 통과했다면 실제 전송값이 계산값(computed_linear/angular)과 정확히 같아야 함
+    # (게이트가 값 자체를 변형하지 않고 통과/차단만 해야 하므로).
+    for c in nonzero:
+        assert c["linear"] == c["computed_linear"] and c["angular"] == c["computed_angular"], \
+            f"게이트 통과 후 전송값이 계산값과 다름: sent=({c['linear']},{c['angular']}) " \
+            f"computed=({c['computed_linear']},{c['computed_angular']})"
+    print(f"[OK] SEMANTIC_NAV+LIVE {len(semantic_live_controls)}개 tick 중 {len(nonzero)}개에서 "
+          f"실제 non-zero 명령이 전송됨 (전송값이 계산값과 정확히 일치, 게이트가 값을 왜곡 안 함)")
+
+    print(f"[OK] 로그 파일: {deployer.log_path}")
+
+
 # ── test H: 2026-10-04 신규 메커니즘 3종 (route_bearing_anchored / 직진구간 override /
 #            allow_reroute와 분리된 상시 이탈 감지 안전망) ───────────────────────────
 def test_h_new_mechanisms_2026_10_04():
@@ -799,4 +1179,8 @@ if __name__ == "__main__":
     test_h_new_mechanisms_2026_10_04()
     test_i_gps_freeze_guard()
     test_j_network_retry()
+    test_k_nav_mode_semantic_switch()
+    test_l_semantic_navigation_integration()
+    test_m_semantic_init_missing_prompt()
+    test_n_semantic_nav_sends_nonzero_when_live()
     print("\n모든 오프라인 스모크 테스트 통과.")

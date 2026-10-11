@@ -94,6 +94,9 @@ class DeploymentState:
         # 2026-10-04 추가 (실측 사고, deploy_20261004_123749.jsonl): GPS 위치 동결 감지
         self.gps_freeze_safety_applied = False
         self.gps_frozen = False
+        self.nav_mode = "MAP_NAV"        # 2026-09-26 추가: "MAP_NAV"/"STOPPING"/"SEMANTIC_INIT"/"SEMANTIC_NAV"/"SEMANTIC_ERROR"
+        self.semantic_switch_distance_m = None  # 실행 중 안 바뀜(표시용) — CLI --semantic_switch_distance_m
+        self.semantic_prompt = None       # 실행 중 안 바뀜(표시용) — CLI --semantic_prompt
         self._logs = deque(maxlen=log_maxlen)
         self._errors = deque(maxlen=log_maxlen)
 
@@ -111,7 +114,8 @@ class DeploymentState:
                heading_mode=None, dist_to_goal_m=None, goal_reached=None,
                near_goal_override_applied=None, straight_segment_override_applied=None,
                off_route_safety_applied=None, override_reason=_UNSET, is_off_route=None,
-               gps_freeze_safety_applied=None, gps_frozen=None):
+               gps_freeze_safety_applied=None, gps_frozen=None,
+               nav_mode=None, semantic_switch_distance_m=None, semantic_prompt=None):
         # gps_heading_deg/route_bearing_deg/heading_route_diff_deg는 "이번 틱에
         # 못 구했다"는 의미로 명시적 None이 넘어올 수 있어서, 기본값을 _UNSET으로
         # 두고 "호출에서 아예 안 건드린 경우"와 구분한다 — 그냥 None 기본값을 쓰면
@@ -159,6 +163,9 @@ class DeploymentState:
             if is_off_route is not None: self.is_off_route = is_off_route
             if gps_freeze_safety_applied is not None: self.gps_freeze_safety_applied = gps_freeze_safety_applied
             if gps_frozen is not None: self.gps_frozen = gps_frozen
+            if nav_mode is not None: self.nav_mode = nav_mode
+            if semantic_switch_distance_m is not None: self.semantic_switch_distance_m = semantic_switch_distance_m
+            if semantic_prompt is not None: self.semantic_prompt = semantic_prompt
             self.last_update_ts = time.time()
 
     def log(self, msg):
@@ -215,6 +222,9 @@ class DeploymentState:
                 "is_off_route": self.is_off_route,
                 "gps_freeze_safety_applied": self.gps_freeze_safety_applied,
                 "gps_frozen": self.gps_frozen,
+                "nav_mode": self.nav_mode,
+                "semantic_switch_distance_m": self.semantic_switch_distance_m,
+                "semantic_prompt": self.semantic_prompt,
                 "map_heading_source": self.map_heading_source,
                 "route_aligned_heading_deg": self.route_aligned_heading_deg,
                 "gps_accumulated_path_m": self.gps_accumulated_path_m,
@@ -322,7 +332,7 @@ button:disabled { opacity:0.35; cursor:not-allowed; }
 #btnAbort { background:#333; color:#fff; }
 </style></head>
 <body>
-<h2>OmniVLA-Edge 실시간 배포 모니터 <span id="stageBadge"></span> <span id="headingModeBadge"></span></h2>
+<h2>OmniVLA-Edge 실시간 배포 모니터 <span id="stageBadge"></span> <span id="headingModeBadge"></span> <span id="navModeBadge"></span> <span id="semanticGoalBadge"></span></h2>
 <div class="card" style="margin-bottom:16px;">
   <b>Pre-drive 워크플로</b> — DRY RUN(관찰) → 정렬 확인 → ARM → GO LIVE(사용자 명시 확인 필요)
   <div style="margin-top:8px;">
@@ -429,6 +439,22 @@ async function poll() {
     ? '<span style="background:#048; color:#fff; padding:2px 8px; border-radius:4px; font-size:13px;">heading_mode=route_aligned_fixed (정렬값 고정)</span>'
     : '<span style="background:#333; color:#ccc; padding:2px 8px; border-radius:4px; font-size:13px;">heading_mode=auto (GPS 확보 시 자동 전환)</span>';
 
+  const navBadge = document.querySelector('#navModeBadge');
+  const navInfo = {
+    MAP_NAV:       ['#036', 'NAV MODE: MAP'],
+    STOPPING:      ['#a60', 'NAV MODE: STOPPING'],
+    SEMANTIC_INIT: ['#606', 'NAV MODE: SEMANTIC_INIT'],
+    SEMANTIC_NAV:  ['#066', 'NAV MODE: SEMANTIC'],
+    SEMANTIC_ERROR:['#900', '⚠ NAV MODE: SEMANTIC_ERROR (정지 유지)'],
+  };
+  const [navBg, navLabel] = navInfo[s.nav_mode] || navInfo.MAP_NAV;
+  navBadge.innerHTML = `<span style="background:${navBg}; color:#fff; padding:2px 8px; border-radius:4px; font-size:13px;">${navLabel}</span>`;
+
+  const goalBadge = document.querySelector('#semanticGoalBadge');
+  goalBadge.innerHTML = s.semantic_prompt
+    ? `<span style="background:#222; color:#8cf; padding:2px 8px; border-radius:4px; font-size:13px;">SEMANTIC GOAL: ${s.semantic_prompt}</span>`
+    : `<span style="background:#222; color:#888; padding:2px 8px; border-radius:4px; font-size:13px;">SEMANTIC GOAL: (미설정, --semantic_prompt 필요)</span>`;
+
   document.querySelector('#btnConfirm').disabled = (s.control_stage !== 'DRY_RUN');
   document.querySelector('#btnArm').disabled = (s.control_stage !== 'DRY_RUN' || s.route_aligned_heading_deg === null);
   document.querySelector('#btnGoLive').disabled = (s.control_stage !== 'ARMED');
@@ -467,6 +493,7 @@ async function poll() {
     <tr><td><b>목표까지 거리</b></td><td class="${goalClass}"><b>${fmtNum(s.dist_to_goal_m, 2)}m</b>${s.goal_reached ? ' <span class="ok">🏁 도착 — 영구 정지</span>' : ''}</td></tr>
     <tr><td>경로 이탈 여부(is_off_route)</td><td class="${s.is_off_route ? 'bad' : 'ok'}">${s.is_off_route ? '⚠ 이탈 감지됨' : '정상 범위'}</td></tr>
     <tr><td>적용 중인 override</td><td class="${s.override_reason ? 'warn' : ''}">${s.override_reason ? (OVERRIDE_REASON_LABEL[s.override_reason] || s.override_reason) : '비활성(모델 예측 그대로 사용)'}</td></tr>
+    <tr><td>semantic switch 임계값</td><td>${fmtNum(s.semantic_switch_distance_m, 1)}m ${s.nav_mode === 'MAP_NAV' ? '<span style="color:#888">(MAP_NAV 중, 이 거리 이하가 되면 전환)</span>' : '<span class="ok">(이미 전환됨)</span>'}</td></tr>
   `;
   document.querySelector('#statusModel tbody').innerHTML = `
     <tr><td>target waypoint (x,y)</td><td>${s.target_waypoint_xy ? `(${fmtNum(s.target_waypoint_xy[0],3)}, ${fmtNum(s.target_waypoint_xy[1],3)}) m` : '—'}</td></tr>

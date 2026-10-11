@@ -171,6 +171,12 @@ Step 5. 배포                    deployment/                          → Frodo
   **2026-09-05 세션에서 배포 heading 소스를 GPS궤적 기반으로 전환 완료** — 상세는 `docs/0905.md` 및
   아래 "2026-09-05 세션 변경사항" 참고. **다음 실주행에서 `heading_diff_deg`/좌회전 편향이 실제로
   해소됐는지 재검증 필요 — 아직 실기기 검증 전.**
+  **⚠ 2026-09-26 실주행 재검증 결과: 편향이 그대로 재현됨.** `--heading_mode route_aligned_fixed`로
+  heading을 route bearing과 강제로 일치시킨(`heading_route_diff_deg≈0`) 상태에서도 모델이 예측한
+  `target_waypoint_xy`가 계속 좌측(y>0, 평균 +7.8°)으로 나옴 — **heading 소스 불일치 가설이
+  약화됨**, 데이터 클래스 불균형(위 오프라인 조사 항목) 쪽이 더 유력. 상세: `docs/0926.md` §4.1.
+  임시 완화용 `--map_angular_bias_rad_s`/`--map_angular_override_rad_s` 추가함(근본 수정 아님,
+  직진 구간 테스트 전용).
 
 ## 배포 파이프라인
 
@@ -213,6 +219,29 @@ Step 5. 배포                    deployment/                          → Frodo
 **진단 도구 추가** (좌회전 편향 조사용, 위 "알려진 이슈" 참고): IMU vs GPS궤적 heading 비교 로그,
 `deployment/logs/deploy_<시각>.jsonl`(매 tick GPS/heading/예측/명령/HTTP상태/원본 텔레메트리/OSRM 경로
 전체 기록), 대시보드 지도 위 예측 궤적 오버레이(실제 축척 px/m 일치 + 스케일바).
+
+## 2026-09-26 세션 변경사항 (상세: `docs/0926.md`)
+
+`forodobot_semantic_nav`(카메라+언어지시 기반 semantic navigation)를 이 저장소의 배포
+파이프라인에 통합 — `Last-mile-navigation_merge`가 메인 프로그램 유지, 목표 근접 시
+MAP_NAV → SEMANTIC_NAV로 전환하는 `nav_mode` 상태머신 추가. `forodobot_semantic_nav`는
+한 줄도 수정 안 함(import만). 실제 LIVE 필드 테스트까지 진행함.
+
+- `deployment/omnivla_edge_deploy.py`: `nav_mode`(`MAP_NAV`/`STOPPING`/`SEMANTIC_INIT`/
+  `SEMANTIC_NAV`/`SEMANTIC_ERROR`) 상태머신, `--semantic_switch_distance_m`(임시값, 계속
+  튜닝 중) 도달 시 전환. `_semantic_init()`/`_semantic_step()`이 `forodobot_semantic_nav/
+  policy`의 `OmniVLAEdgePolicy`/`waypoint_to_velocity`/`to_control_command`를 그대로 import해서
+  재사용(재작성 안 함). 실제 `/control` 전송은 여전히 `send_control()` 한 곳뿐(single gate 유지).
+  `--map_angular_bias_rad_s`/`--map_angular_override_rad_s`(좌회전 편향 임시 대응)도 추가.
+- **버그**: 전송 게이트가 `nav_mode=="MAP_NAV"`만 허용하고 있어서 SEMANTIC_NAV 연동 후에도
+  실제 명령이 계속 (0,0)으로 막히던 것 발견·수정(회귀 테스트 `test_k` 추가).
+- `deployment/offline_smoke_test.py`: `test_g`~`test_k` 추가, 실제 `best.pth`+CLIP 로드까지
+  포함해서 mock 없이 검증. 전부 통과(회귀 없음).
+- **미해결**: `_goal_reached`(GPS latch)가 SEMANTIC_NAV에도 그대로 적용됨(semantic이 다른
+  목표를 향해도 원래 GPS 목표 근처면 멈춤), `run()`의 마지막 `send_control()` 호출이 예외
+  처리 밖에 있어 SDK 타임아웃 시 정지 시도 없이 크래시함. 실측 중 GPS가 특정 지점에서
+  얼어붙는 현상, SDK 서버(`hypercorn main:app`) 장시간 미재시작이 `/control` ReadTimeout
+  반복의 원인으로 의심됨(둘 다 코드 버그 아님). 전부 `docs/0926.md` §4/§7 참고.
 
 ## 2026-09-07: RunPod 인프라 전부 삭제함 (비용 문제) — 재개 시 `docs/0906_runpod_setup.md` 참고
 
