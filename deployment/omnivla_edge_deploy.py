@@ -246,6 +246,21 @@ DEFAULT_GPS_FREEZE_MIN_DISP_M = 0.03
 DEFAULT_GPS_FREEZE_PERSIST_TICKS = 10
 DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS = 0.15
 
+# 2026-10-11 추가 (사용자 요청, GPS 동결 dead reckoning): 이 프로젝트 실측에서 LIVE
+# tick의 최대 82%가 "GPS 위치 동결"(로봇 speed는 0.3~1.1인데 lat/lon이 여러 틱 동안
+# 안 바뀜 — GPS 수신 모듈 갱신주기 < 제어루프 3Hz, 또는 건물 사이 홀드)이었음.
+# 동결 중 멈춘 좌표를 그대로 쓰면 dist_to_goal(도착판정)/cross_track/route_bearing/
+# 지도렌더링 위치가 전부 같이 얼어붙고, 멈춘 cross_track에 적분이 쌓여 조향이
+# 폭주(deploy_20261011_132138.jsonl: 와인드업으로 우회전 -0.27)함. 그래서 동결 중엔
+# 로봇의 reported speed로 "캐싱된 route를 따라 speed×경과시간 만큼 전진한 지점"을
+# 추정해서(LiveMapBuilder.point_ahead_on_route) 위치를 메꾼다 — direct 모드면 직선,
+# osrm이면 꺾인 경로를 따라감. 기본 꺼짐(opt-in). GPS 동결 가드(정지)와는 독립 —
+# dead reckoning은 "동결 중에도 계속 간다"는 쪽이라 보통 가드를 끄고(또는 안 켜고)
+# 같이 씀. 트레이드오프: 동결 중엔 "로봇이 경로 위에 있다"고 가정하므로 그 사이의
+# 실제 횡방향 이탈은 못 잡음(어차피 GPS가 멈춰서 감지 불가) — 하드웨어 편향(~0.06
+# rad/s)은 GPS 살아있는 구간에서 보정.
+DEFAULT_ENABLE_ROUTE_DEAD_RECKONING = False
+
 # 2026-10-04 추가: SDK 서버 쪽 헤드리스 브라우저가 1~2초 내로 저절로 회복되는 일시적
 # hiccup(ReadTimeout, 빈 JSON 응답)을 오늘 여러 번 실측(deploy_20261004_123354/
 # 125728/131744.jsonl 등) — 지금까진 이런 일시적 실패도 전체 프로세스를 바로
@@ -350,6 +365,77 @@ DEFAULT_GOAL_REACH_THRESHOLD_M = 2.0  # 이 거리 이내면 도착으로 간주
 # 측정됨, §1-8 표 참고). **다른 map_range_m/체크포인트로 바꾸면 이 값도 재측정 필요**
 # — 공식(px/m 비율)으로 자동 환산하지 않는 이유는 위와 동일(비선형).
 DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M = 8.0
+
+# 2026-10-11 추가 (Harness 1 §1-19 정정, experiment_log.md 참고): waypoint_to_control()의
+# target_step=2(1.8m 앞)는 실측으로 확인됨 — 모델 예측 자체(pred_xy_m 8개 전체)는
+# 급커브에서도 더 먼 waypoint일수록 곡률이 뚜렷해짐(145951 tick100 예: wp2=-1.2°,
+# wp7(4.0m 앞)=-21.6°)인데, target_step=2만 보는 현재 방식이 그 신호를 거의 못 씀.
+# 더 먼 target_step으로 바꿔서(최대 7, N_WAYPOINTS-1) 같은 예측에서 더 큰 신호를
+# 끌어다 쓸 수 있는지 실험하기 위한 CLI 노출 — 기본값 2는 기존 동작과 동일(무변화).
+DEFAULT_WAYPOINT_TARGET_STEP = 2
+
+# 2026-10-11 추가 (Harness 1 실측, deploy_20261011_100941.jsonl): route_bearing_to_control()
+# 가 heading(방향)만 맞추고 cross-track(경로에서 옆으로 벗어난 거리)은 안 고쳐서,
+# 명령 angular가 거의 0인데도 벗어난 거리가 3.0m→8.0m로 계속 커지던 문제 — 사용자가
+# "직진인데 쏠린다"고 체감한 것의 구조적 원인으로 특정됨(하드웨어 휠 편향이 아니라
+# 이 쪾일 가능성이 높다고 판단, 휠 트림은 보류하고 이쪾을 먼저 고침). 단위: rad/s
+# per meter — 보수적인 기본값, 실측으로 튜닝 필요.
+DEFAULT_CROSS_TRACK_GAIN = 0.08
+
+# 2026-10-11 추가 (실측, deploy_20261011_102751.jsonl tick57): 위 cross_track_gain은
+# off_route_safety/near_goal/straight_segment 3개 override에만 적용돼서, override가
+# 전혀 안 걸리는(override_reason=None, 모델이 직접 운전하는) 구간엔 cross-track 보정이
+# 아예 없었음 — 그 결과 tick37~56 동안 cross_track_m이 -1.08m→-1.96m로 무보정으로
+# 쌓이다가, tick57에 off_route_safety_threshold_m(3.0m)을 넘는 순간 쌓인 오차
+# 전체(-3.26m)에 대한 완전 보정(angular=0.08*-3.26≈-0.261)이 한꺼번에 터져서
+# "직진하다가 갑자기 급우회전"으로 체감됨. 이 갭을 메우려고 override_reason=None인
+# 틱에도 작게 상시 보정을 섞음 — override용 게인(0.08)보다 약하게 줘서 모델 자체의
+# 판단을 과하게 누르지 않으면서 오차가 쌓이는 것만 완화.
+DEFAULT_CROSS_TRACK_BLEND_GAIN = 0.03
+
+# 2026-10-11 추가 (실측, deploy_20261011_111241.jsonl): 로봇이 거의 정지해 있던
+# 구간(GPS가 같은 반올림값으로 여러 틱 멈춰있다가 0.5~1m씩 양자화 점프)에서,
+# cross_track_m이 실제 이탈이 아니라 "GPS 양자화 + 경로의 서브미터 꺾임"만으로
+# -2.46m→-4.49m까지 부풀려졌고, off_route_safety가 그 값을 그대로 믿고 30초간
+# 최대 우회전을 유지한 사고 재현됨(cross_track_gain/blend_gain 자체는 무고했음 —
+# 재계산으로 off_route_safety(steer) 보정이 지속적으로 양수 cross_track 오차에
+# 반응하는 게 맞는 동작임을 확인, 입력값이 문제였음). route_bearing_anchored의
+# pull에 이미 쓰는 gps_accumulated_path_m 기반 readiness 게이트(위
+# DEFAULT_HEADING_ANCHOR_PULL_MIN_ACCUM_PATH_M)와 동일한 패턴 재사용 —
+# 이만큼 실제로 움직이기 전에는 cross_track_m/off_route_safety 트리거를 안 믿음.
+DEFAULT_CROSS_TRACK_MIN_ACCUM_PATH_M = 1.5
+
+# 2026-10-11 추가 (실측, deploy_20261011_112241.jsonl, cross_track_gain=0.05 실험):
+# straight_segment override가 93초 내내 걸려서 모델 예측(ang_pre)이 거의 0으로
+# 무력화된 상태였는데도 cross_track_m이 0으로 안 수렴하고 -0.3~-1.7m 사이에서
+# 계속 좌측에 머묾(평균 약 -1~-1.3m) — 순수 비례(P) 보정(angular=gain*오차)은
+# 로봇에 상수 교란(예: 바퀴 좌편향)이 있으면 절대 완전히 상쇄 못 하고 그 오차가
+# 남은 지점에서 평형을 이룸(게인을 낮추면 평형점이 더 왼쪽으로 이동할 뿐 근본
+# 원인은 안 없어짐 — 이번 실험이 그걸 직접 보여줌). 적분(I)항을 추가해서 오차가
+# 한쪽으로 지속되면 보정이 계속 쌓이게 함 — PI 제어로 상수 편향을 결국 0으로 수렴.
+# 단위: rad/s per (m·s) — 적분 상태(m·s)에 곱해짐. anti-windup 클램프는 아래
+# DEFAULT_CROSS_TRACK_INTEGRAL_MAX_M_S 참고.
+DEFAULT_CROSS_TRACK_GAIN_I = 0.01
+
+# override 3개(off_route_safety/near_goal/straight_segment)용 적분 게인보다 약한,
+# override_reason=None(모델이 직접 운전하는) 구간용 — 위 DEFAULT_CROSS_TRACK_BLEND_GAIN이
+# DEFAULT_CROSS_TRACK_GAIN의 약 0.375배인 것과 동일 비율로 설정.
+DEFAULT_CROSS_TRACK_BLEND_GAIN_I = 0.004
+
+# 적분 상태(m·s) 자체의 anti-windup 클램프 — 오차가 오래 지속돼도 적분항이
+# 무한히 커져서 과도/진동을 유발하지 않게 상한을 둠 (gain_i=0.01 기준 최대
+# 기여분 ±0.2 rad/s, clip_control()의 최종 클리핑과 별개의 보호장치).
+DEFAULT_CROSS_TRACK_INTEGRAL_MAX_M_S = 20.0
+
+# 2026-10-11 추가 (실내 teleop 실측, teleop_test_*.jsonl): angular=0.0 순수 직진
+# 명령에도 로봇이 일관되게 좌측으로 드리프트하는 하드웨어 편향(바퀴/모터 쪽). 경로
+# 오차와 무관한 로봇 자체의 상수 조향 편향이라, 최종 명령에 항상 더하는 상수 트림으로
+# 보정함(양수=좌회전/음수=우회전 관례, 좌편향 상쇄엔 음수). 기본 0.0=보정 없음(기존
+# 동작). 실내 육안으로 -0.06 근처에서 대체로 상쇄됐으나 run마다 편차가 커서(배터리/
+# 바닥/초기정렬) 한 값으로 완벽히 고정되진 않음 — "거친 보정"으로만 쓰고 미세 경로
+# 오차는 cross_track 보정에 맡기는 용도. step() 맨 끝에서 안전 정지(linear=0)가 아닐
+# 때만 더함.
+DEFAULT_ANGULAR_TRIM = 0.0
 
 
 def latlon_distance_m(lat1, lon1, lat2, lon2):
@@ -480,16 +566,32 @@ def clip_control(linear_vel, angular_vel, maxv=MAX_V, maxw=MAX_W):
     return maxw * np.sign(linear_vel) * abs(rd), maxw * np.sign(angular_vel)
 
 
-def route_bearing_to_control(route_bearing_rad, map_heading_rad, target_time_s):
+def route_bearing_to_control(route_bearing_rad, map_heading_rad, target_time_s,
+                              cross_track_error_m=0.0, cross_track_gain=DEFAULT_CROSS_TRACK_GAIN,
+                              cross_track_integral_m_s=0.0, cross_track_gain_i=0.0):
     """2026-10-03 추가(Harness 1 §1-8/§3-1 제안) — near-goal 구간(future-route가
     화면상 너무 짧아져서 모델 raw 출력을 못 믿는 구간, DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M
     참고)에서 waypoint_to_control()의 모델 예측 대신 쓰는 대체 조향. "route_bearing
     방향으로 target_time_s 뒤에 도착한다"는 가상 목표를 가정하고 같은 atan2/시간분모
     방식(waypoint_to_control()과 동일한 target_time_s, 보통 target_step=2의 2.1초)으로
     변환 — 모델 추론 없이 route_bearing_rad()(GPS 궤적 기반 목표 방향, 이미 매 틱
-    계산됨)만으로 산출 가능."""
+    계산됨)만으로 산출 가능.
+
+    2026-10-11 추가 (Harness 1 실측, deploy_20261011_100941.jsonl): 위 diff 항은
+    heading(방향)만 맞추고 경로에서 옆으로 벗어난 거리(cross-track)는 전혀 안
+    고쳐서, 명령 angular가 거의 0인데도 벗어난 거리가 3.0m→8.0m로 계속 커지는
+    구조적 공백이 있었음(평행하게 유지/확대) — "직진인데 쏠리는 것처럼 보이는"
+    증상의 원인. cross_track_error_m(양수=경로 오른쪽에 있음, 왼쪽은 음수 —
+    LiveMapBuilder.cross_track_error_m() 참고)에 비례한 보정항을 더해서, 벗어난
+    쪽으로 복귀하는 성분을 추가함.
+
+    2026-10-11 추가(2차, 실측 deploy_20261011_112241.jsonl — 위 DEFAULT_CROSS_TRACK_GAIN_I
+    설명 참고): 위 P항(cross_track_gain)만으로는 로봇의 상수 교란(바퀴 편향 등)을 완전히
+    상쇄 못 하고 오차가 남은 지점에서 평형을 이룸 — cross_track_integral_m_s(호출 측이
+    매 tick 누적하는 적분 상태, m·s)에 비례한 항을 추가해서 P+I 제어로 만듦."""
     diff = (route_bearing_rad - map_heading_rad + math.pi) % (2 * math.pi) - math.pi
-    angular = diff / target_time_s
+    angular = (diff / target_time_s + cross_track_gain * cross_track_error_m
+               + cross_track_gain_i * cross_track_integral_m_s)
     return float(np.clip(MAX_V, 0, MAX_V * 2)), float(np.clip(angular, -MAX_W * 2, MAX_W * 2))
 
 
@@ -500,6 +602,15 @@ class OmniVLAEdgeDeployment:
                  initial_heading_lookahead_m=INITIAL_HEADING_LOOKAHEAD_M,
                  allow_reroute=False,
                  near_goal_override_dist_m=DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M,
+                 waypoint_target_step=DEFAULT_WAYPOINT_TARGET_STEP,
+                 route_mode="osrm",
+                 cross_track_gain=DEFAULT_CROSS_TRACK_GAIN,
+                 cross_track_blend_gain=DEFAULT_CROSS_TRACK_BLEND_GAIN,
+                 cross_track_min_accum_path_m=DEFAULT_CROSS_TRACK_MIN_ACCUM_PATH_M,
+                 cross_track_gain_i=DEFAULT_CROSS_TRACK_GAIN_I,
+                 cross_track_blend_gain_i=DEFAULT_CROSS_TRACK_BLEND_GAIN_I,
+                 cross_track_integral_max_m_s=DEFAULT_CROSS_TRACK_INTEGRAL_MAX_M_S,
+                 angular_trim=DEFAULT_ANGULAR_TRIM,
                  heading_anchor_pull_threshold_deg=DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG,
                  heading_anchor_pull_persist_ticks=DEFAULT_HEADING_ANCHOR_PULL_PERSIST_TICKS,
                  enable_off_route_safety=DEFAULT_ENABLE_OFF_ROUTE_SAFETY,
@@ -512,7 +623,8 @@ class OmniVLAEdgeDeployment:
                  enable_gps_freeze_guard=DEFAULT_ENABLE_GPS_FREEZE_GUARD,
                  gps_freeze_min_disp_m=DEFAULT_GPS_FREEZE_MIN_DISP_M,
                  gps_freeze_persist_ticks=DEFAULT_GPS_FREEZE_PERSIST_TICKS,
-                 gps_freeze_speed_threshold_mps=DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS):
+                 gps_freeze_speed_threshold_mps=DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS,
+                 enable_route_dead_reckoning=DEFAULT_ENABLE_ROUTE_DEAD_RECKONING):
         # 2026-09-25: --dry_run의 의미가 "이 프로세스는 GO LIVE 자체를 영구히
         # 거부하는 하드 락"으로 바뀜(순수 검증 세션용). 기본(플래그 없음)은
         # DRY_RUN 상태로 시작하되, 대시보드에서 정렬확인→ARM→GO LIVE를 거치면
@@ -573,7 +685,8 @@ class OmniVLAEdgeDeployment:
         self.model.to(self.device).eval()
         print(f"[deploy] Loaded checkpoint: {ckpt_path}  (device={self.device})")
 
-        self.map_builder = LiveMapBuilder(map_range_m=map_range_m)
+        self.route_mode = route_mode
+        self.map_builder = LiveMapBuilder(map_range_m=map_range_m, route_mode=route_mode)
         self.goal_lat, self.goal_lon = goal_lat, goal_lon
         # 경로는 배포 시작 시 1번만 계산해서 캐싱 (osmnav 구조 참고 — 매 프레임 재쿼리 안 함).
         # 시작 위치를 아직 모르므로, 첫 poll_frodobot() 이후 run()에서 set_goal() 호출.
@@ -596,6 +709,18 @@ class OmniVLAEdgeDeployment:
         # 2026-10-04 추가 — 전부 docs/experiment_log.md의 Harness 1/사용자 논의 결과를
         # config/CLI로 독립 실험 가능하게 분리한 것 (기본은 전부 꺼짐/기존 동작 유지,
         # 하나씩 켜서 비교 가능).
+        assert 0 <= waypoint_target_step <= 7, \
+            f"waypoint_target_step은 0~7 범위(N_WAYPOINTS=8): {waypoint_target_step!r}"
+        self.waypoint_target_step = waypoint_target_step
+        self.cross_track_gain = cross_track_gain
+        self.cross_track_blend_gain = cross_track_blend_gain
+        self.cross_track_min_accum_path_m = cross_track_min_accum_path_m
+        self.cross_track_gain_i = cross_track_gain_i
+        self.cross_track_blend_gain_i = cross_track_blend_gain_i
+        self.cross_track_integral_max_m_s = cross_track_integral_max_m_s
+        self._cross_track_integral_m_s = 0.0
+        self._cross_track_integral_last_ts = None
+        self.angular_trim = angular_trim
         self.heading_anchor_pull_threshold_deg = heading_anchor_pull_threshold_deg
         self.heading_anchor_pull_persist_ticks = heading_anchor_pull_persist_ticks
         self.enable_off_route_safety = enable_off_route_safety
@@ -619,6 +744,13 @@ class OmniVLAEdgeDeployment:
         self._gps_freeze_last_latlon = None
         self._gps_freeze_any_speed_seen = False
         self._gps_frozen_now = False
+
+        # 2026-10-11 추가 (사용자 요청, GPS 동결 dead reckoning — 위 상수 설명 참고):
+        # 마지막으로 GPS 좌표가 "실제로" 바뀐 시점의 (lat, lon)과 그 ts. 동결 구간에선
+        # 이 앵커 + reported speed × 경과시간으로 경로 위 추정 위치를 메꾼다.
+        self.enable_route_dead_reckoning = enable_route_dead_reckoning
+        self._dr_anchor_latlon = None
+        self._dr_anchor_ts = None
 
         # 2026-09-26 추가: INITIAL_HEADING_LOOKAHEAD_M을 CLI로 조절 가능하게 함 —
         # 실제 주행에서 목표 근처(dist_to_goal≈6.9m)에서 정렬 확인을 눌렀더니,
@@ -721,6 +853,15 @@ class OmniVLAEdgeDeployment:
             "heading_mode": self.heading_mode,
             "goal_reach_threshold_m": self.goal_reach_threshold_m,
             "near_goal_override_dist_m": self.near_goal_override_dist_m,
+            "waypoint_target_step": self.waypoint_target_step,
+            "route_mode": self.route_mode,
+            "cross_track_gain": self.cross_track_gain,
+            "cross_track_blend_gain": self.cross_track_blend_gain,
+            "cross_track_min_accum_path_m": self.cross_track_min_accum_path_m,
+            "cross_track_gain_i": self.cross_track_gain_i,
+            "cross_track_blend_gain_i": self.cross_track_blend_gain_i,
+            "cross_track_integral_max_m_s": self.cross_track_integral_max_m_s,
+            "angular_trim": self.angular_trim,
             "heading_anchor_pull_threshold_deg": self.heading_anchor_pull_threshold_deg,
             "heading_anchor_pull_persist_ticks": self.heading_anchor_pull_persist_ticks,
             "enable_off_route_safety": self.enable_off_route_safety,
@@ -734,6 +875,7 @@ class OmniVLAEdgeDeployment:
             "gps_freeze_min_disp_m": self.gps_freeze_min_disp_m,
             "gps_freeze_persist_ticks": self.gps_freeze_persist_ticks,
             "gps_freeze_speed_threshold_mps": self.gps_freeze_speed_threshold_mps,
+            "enable_route_dead_reckoning": self.enable_route_dead_reckoning,
             # 2026-09-25: 각 step 레코드의 context_frame_paths/map_replay_path를
             # 어떻게 실제 파일로 바꾸는지 — 별도 코드를 몰라도 이 JSONL 파일 하나만
             # 보고 알 수 있도록 규칙 자체를 데이터로 남겨둔다.
@@ -1079,11 +1221,42 @@ class OmniVLAEdgeDeployment:
             return 0.0, 0.0
         record["gps_fix_ok"] = True
 
+        # 2026-10-11 추가 (사용자 요청, GPS 동결 dead reckoning — DEFAULT_ENABLE_ROUTE_DEAD_RECKONING
+        # 상수 설명 참고): raw GPS가 직전 "실제 변화" 지점에서 gps_freeze_min_disp_m 이상
+        # 안 움직였으면(=동결) 로봇 speed로 경로 위 추정 위치를 계산해서 eff_lat/eff_lon을
+        # 만든다. 이후 거리/도착판정/route_bearing/cross_track/지도렌더링은 전부 이
+        # eff 위치를 씀 — 단 raw lat/lon은 로깅(record["lat"])/past_track/동결감지/최초
+        # route 생성에는 그대로 유지(동결 감지가 raw 기준이어야 하고, 학습 heading 추정도
+        # raw 궤적 기반이어야 하므로). route가 아직 없거나(첫 틱) 기능 꺼짐이면 eff=raw.
+        eff_lat, eff_lon = lat, lon
+        dr_active = False
+        if self.enable_route_dead_reckoning and self.map_builder._route_latlon is not None:
+            dr_speed_mps = float((raw_data or {}).get("speed") or 0.0)
+            dr_now_ts = record["ts"]
+            moved = (self._dr_anchor_latlon is None
+                     or latlon_distance_m(lat, lon, self._dr_anchor_latlon[0],
+                                           self._dr_anchor_latlon[1]) >= self.gps_freeze_min_disp_m)
+            if moved:
+                self._dr_anchor_latlon = (lat, lon)
+                self._dr_anchor_ts = dr_now_ts
+            else:
+                advance_m = dr_speed_mps * max(0.0, dr_now_ts - (self._dr_anchor_ts or dr_now_ts))
+                ahead = self.map_builder.point_ahead_on_route(
+                    self._dr_anchor_latlon[0], self._dr_anchor_latlon[1], advance_m)
+                if ahead is not None:
+                    eff_lat, eff_lon = ahead
+                    dr_active = True
+        record["dead_reckoning_active"] = dr_active
+        if dr_active:
+            record["dr_eff_lat"], record["dr_eff_lon"] = eff_lat, eff_lon
+            record["dr_advance_m"] = advance_m
+
         # 2026-09-26 추가: goal 도착 감지 — route/heading/모델 계산과 무관하게
         # GPS만으로 바로 확인 가능해서 여기서 가장 먼저 체크한다. 한 번 도착하면
         # 절대 다시 안 풀림(latched) — 도착 후 GPS 잡음으로 threshold를 들락날락
-        # 해도 다시 움직이기 시작하지 않도록.
-        dist_to_goal_m = latlon_distance_m(lat, lon, self.goal_lat, self.goal_lon)
+        # 해도 다시 움직이기 시작하지 않도록. (dead reckoning 켜져 있으면 eff 위치로
+        # 계산 — 동결 중에도 dist가 줄어들어 도착 판정이 멈추지 않게.)
+        dist_to_goal_m = latlon_distance_m(eff_lat, eff_lon, self.goal_lat, self.goal_lon)
         record["dist_to_goal_m"] = dist_to_goal_m
         self.state.update(dist_to_goal_m=dist_to_goal_m)
         if not self._goal_reached and dist_to_goal_m <= self.goal_reach_threshold_m:
@@ -1172,7 +1345,40 @@ class OmniVLAEdgeDeployment:
         # 저장하지만(디버그 필드용), 그건 heading 선택 이후에 호출되는 거라 여기서 따로
         # 한 번 더 구해야 이번 tick의 heading 보정에 쓸 수 있음. route_bearing_rad() 자체는
         # heading과 무관하게 (lat, lon)+캐싱된 route만 쓰는 순수 조회라 중복 호출 비용 작음.
-        route_bearing_rad_now = self.map_builder.route_bearing_rad(lat, lon)
+        # (eff_lat/eff_lon: dead reckoning 켜져 동결 중이면 경로 위 추정 위치, 아니면 raw)
+        route_bearing_rad_now = self.map_builder.route_bearing_rad(eff_lat, eff_lon)
+        # 2026-10-11 추가 (Harness 1 실측, deploy_20261011_100941.jsonl 참고, 위
+        # DEFAULT_CROSS_TRACK_GAIN 설명) — route_bearing_to_control()의 heading-only
+        # 보정에 빠져있던 횡방향(cross-track) 오차. route_bearing_rad_now와 마찬가지로
+        # 순수 위치 조회라 매 tick 다시 구해도 비용 작음. 경로가 아직 없으면 None.
+        cross_track_m = self.map_builder.cross_track_error_m(eff_lat, eff_lon)
+        record["cross_track_m"] = cross_track_m
+        # 2026-10-11 추가 (실측 사고 deploy_20261011_111241.jsonl, 위
+        # DEFAULT_CROSS_TRACK_MIN_ACCUM_PATH_M 설명 참고): gps_accumulated_path_m이
+        # 이 거리만큼 쌓이기 전에는 cross_track_m을 못 믿음(거의 정지 상태의 GPS
+        # 양자화+경로 서브미터 꺾임으로 부풀려질 수 있음) — off_route_safety 트리거/
+        # cross_track 보정(override 3개 + 아래 상시 blend) 전부 이 cross_track_trusted를
+        # 통해서만 cross_track_m을 참조하도록 통일.
+        cross_track_ready = gps_accumulated_path_m >= self.cross_track_min_accum_path_m
+        cross_track_trusted = cross_track_m if (cross_track_m is not None and cross_track_ready) else None
+        record["cross_track_ready"] = cross_track_ready
+
+        # 2026-10-11 추가 (실측, deploy_20261011_112241.jsonl — 위 DEFAULT_CROSS_TRACK_GAIN_I
+        # 설명 참고): cross_track_trusted를 시간에 대해 적분(m·s 단위)해서 PI 제어의 I항으로
+        # 씀. cross_track_trusted가 None(신뢰 불가/GPS 동결)인 틱에는 누적을 보류(계속
+        # 쌓이지도, 리셋되지도 않음 — 신뢰 회복 시 이전 적분 그대로 이어감). anti-windup
+        # 클램프로 과도한 누적/진동을 방지.
+        now_ts = record["ts"]
+        if self._cross_track_integral_last_ts is not None:
+            dt_s = max(0.0, min(now_ts - self._cross_track_integral_last_ts, 2.0))
+        else:
+            dt_s = 0.0
+        self._cross_track_integral_last_ts = now_ts
+        if cross_track_trusted is not None and not self._gps_frozen_now:
+            self._cross_track_integral_m_s = float(np.clip(
+                self._cross_track_integral_m_s + cross_track_trusted * dt_s,
+                -self.cross_track_integral_max_m_s, self.cross_track_integral_max_m_s))
+        record["cross_track_integral_m_s"] = self._cross_track_integral_m_s
 
         if self.heading_mode == "route_bearing_anchored" and route_bearing_rad_now is not None:
             # 2026-10-04 추가 (Harness 1 제안) — route_bearing을 기본값으로 매 tick
@@ -1409,8 +1615,10 @@ class OmniVLAEdgeDeployment:
             self._log_jsonl(record)
             return 0.0, 0.0
 
-        pred_xy_m = self.predict_waypoints(lat, lon, map_heading_rad, tick_id=tick_id)
-        linear, angular = self.waypoint_to_control(pred_xy_m)
+        # eff_lat/eff_lon: dead reckoning 활성 시 경로 위 추정 위치 — 지도도 그 위치
+        # 기준으로 렌더링해서 동결 중에도 모델이 "경로를 따라 전진 중"인 입력을 보게 함.
+        pred_xy_m = self.predict_waypoints(eff_lat, eff_lon, map_heading_rad, tick_id=tick_id)
+        linear, angular = self.waypoint_to_control(pred_xy_m, target_step=self.waypoint_target_step)
         linear, angular = clip_control(linear, angular)
         linear_before_override, angular_before_override = linear, angular
 
@@ -1430,13 +1638,17 @@ class OmniVLAEdgeDeployment:
             gps_freeze_safety_applied = True
             override_reason = "gps_freeze_safety"
             linear, angular = 0.0, 0.0
-        elif self.enable_off_route_safety and self._is_off_route_now:
+        elif self.enable_off_route_safety and self._is_off_route_now and cross_track_ready:
             # 2026-10-04 추가 (Harness 1 제안): is_off_route()는 allow_reroute와
             # 무관하게 항상 평가됨(_ensure_route_initialized() 참고) — 여기서는 그
             # 결과로 "가벼운" 조치만 취함(무거운 전체 재라우팅은 여전히 allow_reroute
             # 쪽에서만). deploy_20261004_111807.jsonl(실측 4.85m 이동·목표쪽 진행
             # 0.38m=약 85도 이탈)처럼 heading만으로는 못 잡는 "진짜 위치 이탈"의
             # 안전망 — heading_mode와 완전히 무관하게 작동.
+            # 2026-10-11 추가 (실측 사고 deploy_20261011_111241.jsonl): cross_track_ready
+            # 조건 추가 — is_off_route()도 cross_track_m과 같은 closest_route_idx 기반이라
+            # 같은 노이즈(거의 정지 + GPS 양자화 + 경로 서브미터 꺾임)에 취약함. 로봇이
+            # 충분히 움직이기 전까지는 이 안전망 자체를 안 믿고 모델/다른 override에 맡김.
             off_route_safety_applied = True
             override_reason = "off_route_safety"
             if self.off_route_safety_action == "stop":
@@ -1452,7 +1664,9 @@ class OmniVLAEdgeDeployment:
                 # map_heading_rad로 폴백.
                 ref_heading_rad = route_bearing_rad_now if route_bearing_rad_now is not None else map_heading_rad
                 linear, angular = route_bearing_to_control(
-                    self._last_route_bearing_rad, ref_heading_rad, target_time_s)
+                    self._last_route_bearing_rad, ref_heading_rad, target_time_s,
+                    cross_track_error_m=cross_track_trusted or 0.0, cross_track_gain=self.cross_track_gain,
+                    cross_track_integral_m_s=self._cross_track_integral_m_s, cross_track_gain_i=self.cross_track_gain_i)
                 linear, angular = clip_control(linear, angular)
                 self.state.log(f"⚠ 경로 이탈 감지(안전망, {self.off_route_safety_threshold_m:.1f}m 초과) — "
                                 f"route_bearing 기반 조향으로 전환")
@@ -1468,7 +1682,9 @@ class OmniVLAEdgeDeployment:
             # 가능) 대신 route_bearing_rad_now를 기준으로 씀.
             ref_heading_rad = route_bearing_rad_now if route_bearing_rad_now is not None else map_heading_rad
             linear, angular = route_bearing_to_control(
-                self._last_route_bearing_rad, ref_heading_rad, target_time_s)
+                self._last_route_bearing_rad, ref_heading_rad, target_time_s,
+                cross_track_error_m=cross_track_trusted or 0.0, cross_track_gain=self.cross_track_gain,
+                    cross_track_integral_m_s=self._cross_track_integral_m_s, cross_track_gain_i=self.cross_track_gain_i)
             linear, angular = clip_control(linear, angular)
             near_goal_override_applied = True
             override_reason = "near_goal"
@@ -1498,7 +1714,10 @@ class OmniVLAEdgeDeployment:
                     # 냈던 버그 — near_b/far_b처럼 이 tick에 새로 구한 오염 없는
                     # route_bearing_rad_now를 기준으로 써서 노이즈에 면역되게 함.
                     ref_heading_rad = route_bearing_rad_now if route_bearing_rad_now is not None else map_heading_rad
-                    linear, angular = route_bearing_to_control(near_b, ref_heading_rad, target_time_s)
+                    linear, angular = route_bearing_to_control(
+                        near_b, ref_heading_rad, target_time_s,
+                        cross_track_error_m=cross_track_trusted or 0.0, cross_track_gain=self.cross_track_gain,
+                    cross_track_integral_m_s=self._cross_track_integral_m_s, cross_track_gain_i=self.cross_track_gain_i)
                     linear, angular = clip_control(linear, angular)
                     straight_segment_override_applied = True
                     override_reason = "straight_segment"
@@ -1506,6 +1725,37 @@ class OmniVLAEdgeDeployment:
                                     f"{straight_diff_deg:.1f}° ≤ {self.straight_angle_threshold_deg:.0f}°): "
                                     f"모델 예측 angular={angular_before_override:+.3f} 대신 "
                                     f"route_bearing 기반 angular={angular:+.3f} 사용")
+
+        if override_reason is None and cross_track_trusted is not None:
+            # 2026-10-11 추가 (실측, deploy_20261011_102751.jsonl tick57 — 위
+            # DEFAULT_CROSS_TRACK_BLEND_GAIN 설명 참고): override가 하나도 안 걸려서
+            # 모델 예측 그대로 쓰는 틱에도 cross-track 오차가 쌓이지 않도록 약하게
+            # 상시 보정. override 3개의 완전 보정(cross_track_gain)과는 별개의
+            # (더 약한) 게인을 씀 — 모델 자체의 조향 판단을 deploy 상시 덮어쓰지
+            # 않으면서 오차 누적만 완화하는 목적. cross_track_trusted(위
+            # DEFAULT_CROSS_TRACK_MIN_ACCUM_PATH_M 게이트 통과분만)만 씀 — 안 그러면
+            # 거의 정지 상태의 노이즈에도 상시 보정이 반응함(deploy_20261011_111241.jsonl).
+            # 2026-10-11 추가(2차, 실측 deploy_20261011_112241.jsonl — 위
+            # DEFAULT_CROSS_TRACK_BLEND_GAIN_I 설명 참고): P항(blend_gain)만으로는
+            # 상수 교란을 못 없애므로 여기도 I항을 섞음(override 3개보다 약한 게인).
+            angular += (self.cross_track_blend_gain * cross_track_trusted
+                        + self.cross_track_blend_gain_i * self._cross_track_integral_m_s)
+            linear, angular = clip_control(linear, angular)
+
+        # 2026-10-11 추가 (실내 teleop 실측, teleop_test_*.jsonl): angular=0.0 순수 직진
+        # 명령인데도 로봇이 일관되게 좌측으로 드리프트하는 하드웨어 편향이 3회 반복
+        # 확인됨(실내 바닥 기준선 대비 육안, -0.06 근처에서 상쇄). 이건 경로 오차(cross_track)
+        # 와 무관한 "로봇 자체의 상수 조향 편향"이라, cross_track 보정(P/I, 경로 기준)과는
+        # 별개로 최종 명령에 항상 더하는 상수 트림으로 보정해야 함 — 안 그러면 모델/보정이
+        # 매 틱 이 편향부터 이겨내야 해서, 결국 cross_track이 계속 커지다가 off_route_safety가
+        # 모델을 하이재킹해서 급우회전하는 사고로 이어짐(deploy_20261011_130404.jsonl에서
+        # 직접 확인: 모델은 내내 직진 예측(+0.04)인데 로봇은 좌로 밀려 3m 이탈 → 최대
+        # 우회전 포화). 단, 안전 정지(gps_freeze/off_route stop로 linear=angular=0)일 때는
+        # 트림을 더하지 않음 — "멈춰라"는 명령은 진짜 완전 정지여야 함.
+        if self.angular_trim != 0.0 and abs(linear) > 1e-6:
+            angular += self.angular_trim
+            linear, angular = clip_control(linear, angular)
+        record["angular_trim"] = self.angular_trim
 
         # 2026-09-25 추가 디버그 필드: route bearing/heading 차이/지도 회전각/target
         # waypoint — 6번(시각화)에서 합의한 "GO 누르기 전에 확인할 수치들"
@@ -1737,6 +1987,71 @@ if __name__ == "__main__":
                         f"조향으로 대체 (기본 {DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M}m — 27m 체크포인트 "
                         f"기준 실측 보정값, 다른 체크포인트/map_range면 재측정 필요, "
                         f"docs/experiment_log.md §1-8 참고). 0 이하로 주면 비활성화(비교 테스트용).")
+    p.add_argument("--waypoint_target_step", type=int, default=DEFAULT_WAYPOINT_TARGET_STEP,
+                   help=f"waypoint_to_control()이 조향 계산에 쓰는 예측 waypoint 인덱스 "
+                        f"(0~7, 기본 {DEFAULT_WAYPOINT_TARGET_STEP} — 1.8m 앞). 급커브에서 모델 "
+                        f"예측(pred_xy_m) 자체는 먼 waypoint일수록 곡률이 뚜렷한데 target_step=2는 "
+                        f"그 신호를 거의 못 씀(실측: wp2=-1.2° vs wp7(4.0m앞)=-21.6°, "
+                        f"docs/experiment_log.md §1-19 정정 참고) — 5~7로 올려서 더 먼 예측을 "
+                        f"조향에 반영하는 실험용.")
+    p.add_argument("--route_mode", type=str, default="osrm", choices=["osrm", "direct"],
+                   help="경로 생성 방식 (기본 osrm). osrm=보도망에 스냅 후 OSRM foot 라우팅"
+                        "(기존 동작, south-korea-latest.osm.pbf 실데이터 기반). "
+                        "direct=스냅/라우팅 전부 건너뛰고 시작↔목표 GPS 원좌표를 직선으로 "
+                        "연결(2026-10-11 사용자 요청) — 그 지역 보도가 OSM에 "
+                        "없거나 부정확해서 라우팅 방향이 실제 의도와 다르게 나올 때의 "
+                        "대안. ⚠ 직선이 실제로 걸을 수 있는 경로와 거의 일치함을 미리 "
+                        "확인한 경우에만 쓸 것 — 학습 데이터는 항상 실제 보행 경로 모양이라, "
+                        "직선이 건물/장애물을 가로지르면 모델이 분포 밖 입력을 보게 됨.")
+    p.add_argument("--cross_track_gain", type=float, default=DEFAULT_CROSS_TRACK_GAIN,
+                   help=f"off_route_safety(steer)/near_goal/straight_segment가 쓰는 "
+                        f"route_bearing_to_control()에 추가되는 cross-track(경로에서 옆으로 "
+                        f"벗어난 거리) 보정 게인, rad/s per meter (기본 {DEFAULT_CROSS_TRACK_GAIN} "
+                        f"— heading만 맞추고 횡방향 오차는 안 고치던 공백을 메움, "
+                        f"deploy_20261011_100941.jsonl 실측: 벗어난 거리가 3.0m→8.0m로 계속 "
+                        f"커짐). 0으로 주면 기존 동작(cross-track 보정 없음)으로 복귀.")
+    p.add_argument("--cross_track_blend_gain", type=float, default=DEFAULT_CROSS_TRACK_BLEND_GAIN,
+                   help=f"위 3개 override가 전혀 안 걸려서(override_reason=None) 모델 예측을 "
+                        f"그대로 쓰는 틱에도 섞는, 더 약한 상시 cross-track 보정 게인 (기본 "
+                        f"{DEFAULT_CROSS_TRACK_BLEND_GAIN}, rad/s per meter) — "
+                        f"deploy_20261011_102751.jsonl tick57 실측: override 전까지 cross_track_m이 "
+                        f"무보정으로 쌓이다가(-1.08m→-1.96m) 임계값(3.0m)을 넘는 순간 쌓인 오차 전체에 "
+                        f"대한 완전 보정(angular≈-0.261)이 한꺼번에 터져서 '직진 중 갑작스런 급회전'으로 "
+                        f"체감된 문제의 수정. 0으로 주면 기존 동작(override_reason=None 구간 무보정)으로 복귀.")
+    p.add_argument("--cross_track_min_accum_path_m", type=float,
+                   default=DEFAULT_CROSS_TRACK_MIN_ACCUM_PATH_M,
+                   help=f"cross_track_m/off_route_safety 트리거를 믿기 전에 gps_accumulated_path_m이 "
+                        f"쌓여 있어야 하는 최소 실제 이동거리, m (기본 {DEFAULT_CROSS_TRACK_MIN_ACCUM_PATH_M}m "
+                        f"— route_bearing_anchored pull의 readiness 게이트와 동일값 재사용). "
+                        f"deploy_20261011_111241.jsonl 실측: 로봇이 거의 정지(총 이동 ~5m/62초)한 "
+                        f"상태에서 GPS 양자화+경로 서브미터 꺾임만으로 cross_track_m이 -4.49m까지 "
+                        f"부풀려졌고 off_route_safety가 그걸 믿고 30초간 최대 우회전을 유지한 사고 수정. "
+                        f"0으로 주면 게이트 비활성화(기존 동작).")
+    p.add_argument("--cross_track_gain_i", type=float, default=DEFAULT_CROSS_TRACK_GAIN_I,
+                   help=f"off_route_safety(steer)/near_goal/straight_segment용 cross-track 적분(I) "
+                        f"게인, rad/s per (m·s) (기본 {DEFAULT_CROSS_TRACK_GAIN_I}). "
+                        f"deploy_20261011_112241.jsonl 실측: cross_track_gain(P)만으로는 로봇의 상수 "
+                        f"교란(바퀴 편향 등)을 완전히 상쇄 못 하고 오차가 -1~-1.3m 선에서 평형을 이룸 "
+                        f"(게인을 낮춰봐도 평형점만 이동, 근본 해결 안 됨) — I항으로 지속되는 오차를 "
+                        f"끝까지 상쇄. 0으로 주면 기존 P-only 동작으로 복귀.")
+    p.add_argument("--cross_track_blend_gain_i", type=float, default=DEFAULT_CROSS_TRACK_BLEND_GAIN_I,
+                   help=f"override_reason=None(모델이 직접 운전) 구간용 cross-track 적분 게인, "
+                        f"rad/s per (m·s) (기본 {DEFAULT_CROSS_TRACK_BLEND_GAIN_I} — 위 "
+                        f"cross_track_gain_i보다 약함, cross_track_blend_gain/cross_track_gain과 동일 "
+                        f"비율). 0으로 주면 기존 P-only 동작으로 복귀.")
+    p.add_argument("--cross_track_integral_max_m_s", type=float,
+                   default=DEFAULT_CROSS_TRACK_INTEGRAL_MAX_M_S,
+                   help=f"cross-track 적분 상태(m·s)의 anti-windup 클램프 (기본 "
+                        f"{DEFAULT_CROSS_TRACK_INTEGRAL_MAX_M_S}) — 오차가 오래 지속돼도 적분항이 "
+                        f"무한히 커지지 않게 상한을 둠.")
+    p.add_argument("--angular_trim", type=float, default=DEFAULT_ANGULAR_TRIM,
+                   help=f"최종 angular 명령에 항상 더하는 하드웨어 상수 조향 트림, rad/s "
+                        f"(기본 {DEFAULT_ANGULAR_TRIM}=보정 없음). 양수=좌회전/음수=우회전 관례. "
+                        f"실내 teleop 실측(teleop_test_*.jsonl): angular=0.0 직진 명령에도 로봇이 "
+                        f"일관되게 좌로 드리프트하는 하드웨어 편향 확인 — 좌편향 상쇄엔 음수(-0.06 "
+                        f"근처). cross_track 보정(경로 오차 기준)과 별개의 '로봇 자체 상수 편향' "
+                        f"보정이며, 안전 정지(linear=0) 시엔 더하지 않음. run마다 편차가 커서 "
+                        f"완벽 고정값은 아니고 거친 보정용.")
     p.add_argument("--heading_anchor_pull_threshold_deg", type=float,
                    default=DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG,
                    help=f"heading_mode=route_bearing_anchored 전용 — gps_track이 route_bearing과 "
@@ -1796,6 +2111,15 @@ if __name__ == "__main__":
                    help=f"이 속도(m/s) 이상을 로봇이 자기보고하는 동안에만 '동결'로 판정 — 로봇이 "
                         f"실제로 정지해 있어서 위치가 안 바뀌는 정상 상황은 제외 (기본 "
                         f"{DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS}m/s).")
+    p.add_argument("--enable_route_dead_reckoning", action="store_true",
+                   help="GPS 위치 동결 중(이 프로젝트 실측 최대 82%% tick) 로봇 speed로 "
+                        "캐싱된 route 위 추정 위치를 메꿈 (기본 꺼짐, 2026-10-11 사용자 요청). "
+                        "dist_to_goal(도착판정)/cross_track/route_bearing/지도렌더링이 동결 중에도 "
+                        "부드럽게 진행 — 멈춘 좌표로 조향이 폭주(적분 와인드업)하던 문제 완화. "
+                        "route_mode=direct면 직선, osrm이면 꺾인 경로 따라 전진. GPS 동결 가드"
+                        "(정지)와 독립 — dead reckoning은 '동결 중에도 계속 간다'는 쪽이라 보통 "
+                        "--disable_gps_freeze_guard와 같이 씀. ⚠ 동결 중엔 '경로 위에 있다'고 "
+                        "가정하므로 그 사이 실제 횡방향 이탈은 못 잡음(GPS 멈춰서 어차피 감지 불가).")
     p.add_argument("--allow_reroute", action="store_true",
                    help="기본은 재라우팅 완전 비활성화(최초 route_init 경로만 런 내내 그대로 "
                         "사용). 목표에서 멀리 떨어진 거의 정지 상태에서도 is_off_route()가 "
@@ -1831,6 +2155,15 @@ if __name__ == "__main__":
         initial_heading_lookahead_m=args.initial_heading_lookahead_m,
         allow_reroute=args.allow_reroute,
         near_goal_override_dist_m=args.near_goal_override_dist_m,
+        waypoint_target_step=args.waypoint_target_step,
+        route_mode=args.route_mode,
+        cross_track_gain=args.cross_track_gain,
+        cross_track_blend_gain=args.cross_track_blend_gain,
+        cross_track_min_accum_path_m=args.cross_track_min_accum_path_m,
+        cross_track_gain_i=args.cross_track_gain_i,
+        cross_track_blend_gain_i=args.cross_track_blend_gain_i,
+        cross_track_integral_max_m_s=args.cross_track_integral_max_m_s,
+        angular_trim=args.angular_trim,
         heading_anchor_pull_threshold_deg=args.heading_anchor_pull_threshold_deg,
         heading_anchor_pull_persist_ticks=args.heading_anchor_pull_persist_ticks,
         enable_off_route_safety=args.enable_off_route_safety,
@@ -1844,5 +2177,6 @@ if __name__ == "__main__":
         gps_freeze_min_disp_m=args.gps_freeze_min_disp_m,
         gps_freeze_persist_ticks=args.gps_freeze_persist_ticks,
         gps_freeze_speed_threshold_mps=args.gps_freeze_speed_threshold_mps,
+        enable_route_dead_reckoning=args.enable_route_dead_reckoning,
     )
     deployer.run()

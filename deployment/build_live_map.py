@@ -144,14 +144,27 @@ def query_osrm_route(start_lat, start_lon, goal_lat, goal_lon, port,
 
 class LiveMapBuilder:
     def __init__(self, map_range_m: float = TRAIN_MAP_RANGE_M, zoom: int = TRAIN_ZOOM,
-                 out_size: int = MAP_SIZE_PX, model_input_size: int = 96):
+                 out_size: int = MAP_SIZE_PX, model_input_size: int = 96,
+                 route_mode: str = "osrm"):
         """
         map_range_m: 학습 때 쓴 것과 반드시 동일해야 함 (예: 20m 재학습 체크포인트를
                      쓴다면 여기도 20.0으로 맞출 것 — 다르면 학습-추론 분포 불일치).
                      2026-09 기준 이 값은 "전방 reach(m)"이지 half-width가 아님
                      (osm_map_generator.py::render_frame, REAR_RATIO 참고) — ego는
                      이미지 정중앙이 아니라 앵커(전방:후방=1:REAR_RATIO)에 위치함.
+        route_mode: "osrm"(기본) = 보도망에 스냅 후 OSRM foot 라우팅(기존 동작).
+                    "direct"(2026-10-11 추가, 사용자 요청) = 스냅/라우팅 전부
+                    건너뛰고 시작↔목표 GPS 원좌표를 그대로 직선으로 잇는다 — OSM
+                    보도 매핑이 그 지역에서 부정확/누락돼서 라우팅이 사용자가 실제
+                    걸으려는 방향과 다르게 나올 때(오늘 실측, §1-?? 참고)의 대안.
+                    **주의**: 학습 데이터의 future-route는 항상 실제로 걸을 수 있는
+                    길 모양이었음 — 직선이 건물/장애물을 가로지르면 모델이 한 번도
+                    못 본 입력이 됨. 사용자가 그 직선이 실제로 걸을 수 있는 경로와
+                    거의 일치함을 미리 확인한 경우에만 쓸 것(장애물 회피는 이
+                    프로젝트 범위 밖이라는 전제와 같은 맥락).
         """
+        assert route_mode in ("osrm", "direct"), f"알 수 없는 route_mode: {route_mode!r}"
+        self.route_mode = route_mode
         self.map_range_m = map_range_m
         self.zoom = zoom
         self.out_size = out_size
@@ -172,11 +185,35 @@ class LiveMapBuilder:
     def set_goal(self, start_lat, start_lon, goal_lat, goal_lon):
         """경로를 1번 계산해서 캐싱. 배포 시작 시(또는 경로 이탈 재계산 시)만 호출.
         get_map_image()는 이후 이 캐싱된 경로만 사용하고 네트워크 요청을 하지 않음."""
+        if self.route_mode == "direct":
+            # 2026-10-11 추가 (사용자 요청): 보도망 스냅/OSRM 라우팅을 완전히
+            # 건너뛰고 원좌표 그대로 직선 — query_osrm_route()의 폴백과 동일한
+            # 보간 로직 재사용(새 수학 없음). 네트워크 요청 자체가 없음.
+            self._route_latlon = _densify_route(
+                np.array([[start_lat, start_lon], [goal_lat, goal_lon]]), 1.0)
+            self._canvas = build_canvas(self._route_latlon[:, 0], self._route_latlon[:, 1],
+                                         self.zoom, self.session)
+            self.last_osrm_fallback = False
+            self.last_start_snap_m = None
+            self.last_goal_snap_m = None
+            print(f"[LiveMapBuilder] route_mode=direct — 보도망 무시, 직선 경로 "
+                  f"{len(self._route_latlon)}개 포인트 캐싱 완료 (출발=({start_lat:.5f},"
+                  f"{start_lon:.5f}) → 목표=({goal_lat:.5f},{goal_lon:.5f}))")
+            return
         port = osrm_port(start_lat, start_lon)
         snapped_start_lat, snapped_start_lon, start_snap_m = snap_to_nearest_road(start_lat, start_lon, port)
         snapped_goal_lat, snapped_goal_lon, goal_snap_m = snap_to_nearest_road(goal_lat, goal_lon, port)
         self._route_latlon, used_fallback = query_osrm_route(
             snapped_start_lat, snapped_start_lon, snapped_goal_lat, snapped_goal_lon, port)
+        # 2026-10-11 추가 (사용자 요청): 라우팅 자체는 보도망(스냅된 점) 기준이지만,
+        # 캐싱된 경로의 맨 앞엔 실제 로봇 출발 위치를 이어붙임 -- 안 그러면 start_snap_m이
+        # 클 때(실측 16m+) is_off_route()/route_bearing_rad()가 "로봇이 시작부터 이미
+        # 경로를 벗어나 있다"고 오판함(실제로는 아직 보도까지 가는 중일 뿐).
+        # start_snap_m이 작을 때도 _densify_route()가 자연히 거의 영향 없는
+        # 보간점 1개만 추가해서 끝남(세그먼트가 짧아도 n_steps>=1 보장).
+        bridge = _densify_route(np.array([[start_lat, start_lon],
+                                            [snapped_start_lat, snapped_start_lon]]), 1.0)
+        self._route_latlon = np.vstack([bridge[:-1], self._route_latlon])
         self._canvas = build_canvas(self._route_latlon[:, 0], self._route_latlon[:, 1],
                                      self.zoom, self.session)
         self.last_osrm_fallback = used_fallback
@@ -243,6 +280,62 @@ class LiveMapBuilder:
         if math.hypot(dlat, dlon) < 1e-6:
             return None
         return math.atan2(dlat, dlon)
+
+    def cross_track_error_m(self, lat, lon, lookahead_m=5.0):
+        """2026-10-11 추가 (Harness 1 실측, deploy_20261011_100941.jsonl): 경로
+        진행방향 기준 현재 위치가 오른쪽(+)/왼쪽(-)으로 몇 m 벗어났는지. 그 run에서
+        off_route_safety/straight_segment가 쓰는 route_bearing_to_control()이
+        heading(방향)만 맞추고 이 횡방향(cross-track) 오차는 전혀 안 고쳐서,
+        명령 angular가 거의 0인데도 벗어난 거리가 3.0m→8.0m로 계속 커지는 게
+        확인됨(평행하게 유지/확대) — "직진인데 쏠리는 것처럼 보이는" 증상의
+        구조적 원인. route_bearing_rad()와 동일한 East=0/North=90 CCW
+        (atan2(dlat, dlon)) 각도 규약을 그대로 씀.
+
+        부호: 로봇이 경로 오른쪽에 있으면 +(angular 양수=좌회전으로 복귀해야 함),
+        왼쪽에 있으면 -(angular 음수=우회전으로 복귀). route_bearing_to_control()의
+        diff 부호 규약과 일치하도록 맞춰서, 그 출력에 그대로 더해 쓸 수 있게 함."""
+        if self._route_latlon is None:
+            return None
+        idx, _ = self._closest_route_idx(lat, lon)
+        theta = self.route_bearing_rad(lat, lon, lookahead_m=lookahead_m)
+        if theta is None:
+            return None
+        closest_lat, closest_lon = self._route_latlon[idx]
+        east_m = (lon - closest_lon) * LAT_M * math.cos(math.radians(lat))
+        north_m = (lat - closest_lat) * LAT_M
+        right_m = east_m * math.sin(theta) - north_m * math.cos(theta)
+        return float(right_m)
+
+    def point_ahead_on_route(self, lat, lon, dist_m):
+        """2026-10-11 추가 (GPS 동결 dead reckoning용, 사용자 요청): (lat,lon)에서
+        캐싱된 route를 따라 앞으로 dist_m 진행한 지점의 (lat, lon)을 반환. GPS가
+        여러 틱 동안 멈춰 있을 때(이 프로젝트 실측 82%까지) 로봇의 reported speed로
+        "경로 위 어디쯤일 것이다"를 추정하는 데 씀 — route_mode=direct면 직선,
+        osrm이면 꺾인 경로를 그대로 따라감.
+
+        route가 없으면 None. dist_m<=0이면 현재 경로 위 가장 가까운 점. dist_m이
+        남은 경로 길이보다 길면 마지막 점(goal) 반환. route_bearing_rad()/
+        cross_track_error_m()와 동일한 LAT_M 근사를 그대로 씀(새 거리식 도입 안 함)."""
+        if self._route_latlon is None:
+            return None
+        route = self._route_latlon
+        idx, _ = self._closest_route_idx(lat, lon)
+        if dist_m <= 0:
+            return float(route[idx][0]), float(route[idx][1])
+        cum = 0.0
+        j = idx
+        while j < len(route) - 1:
+            la0, lo0 = route[j]
+            la1, lo1 = route[j + 1]
+            dnorth = (la1 - la0) * LAT_M
+            deast = (lo1 - lo0) * LAT_M * math.cos(math.radians(la0))
+            seg = math.hypot(dnorth, deast)
+            if cum + seg >= dist_m:
+                t = (dist_m - cum) / seg if seg > 1e-9 else 0.0
+                return float(la0 + (la1 - la0) * t), float(lo0 + (lo1 - lo0) * t)
+            cum += seg
+            j += 1
+        return float(route[-1][0]), float(route[-1][1])
 
     def get_northup_preview_image(self, lat, lon, heading_rad=None, out_size=None):
         """2026-09-25 추가 — North-up(heading-up 회전 전) 미리보기.
