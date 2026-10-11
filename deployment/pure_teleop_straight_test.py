@@ -55,6 +55,16 @@ def main():
                         "좌측 드리프트를 상쇄하려면 음수 값(예: -0.05)을 줄 것. 이 값을 주면 "
                         "더는 '순수' 테스트가 아니라 '하드웨어 트림 보정값 탐색' 테스트가 됨 — "
                         "로그의 run_start.angular_bias로 항상 구분 가능.")
+    p.add_argument("--enable_angular_dither", action="store_true",
+                   help="angular 양자화 디더링(델타-시그마) 활성화. 로봇이 angular를 "
+                        "--angular_quantum 단위로 0 쪽으로 절삭하는 것이 실측으로 확정됨 "
+                        "(-0.05/-0.055/-0.058/-0.059가 전부 동일하게 동작, -0.06만 달라짐). "
+                        "그래서 두 양자화 단계 사이의 트림값은 그냥 보내면 사라지고, 하드웨어 "
+                        "편향의 진짜 균형점을 못 찾는다. 이 옵션을 켜면 양자화 잔차를 다음 tick에 "
+                        "넘겨 인접 두 단계를 섞어 보내서 시간평균이 요청값에 수렴함 — "
+                        "0.001 해상도로 하드웨어 트림을 실측할 수 있게 됨.")
+    p.add_argument("--angular_quantum", type=float, default=0.01,
+                   help="위 디더링이 가정하는 로봇 측 angular 양자화 단위 (기본 0.01, 실측값).")
     p.add_argument("--duration", type=float, default=15.0, help="주행 시간(초), 기본 15초")
     p.add_argument("--rate_hz", type=float, default=3.0, help="명령 전송 주기 (기본 3Hz, 배포 루프와 동일)")
     p.add_argument("--skip_gps", action="store_true",
@@ -79,7 +89,9 @@ def main():
     log_jsonl({"type": "run_start", "ts": time.time(), "run_id": run_id,
                "linear": args.linear, "angular_bias": args.angular_bias,
                "duration": args.duration, "rate_hz": args.rate_hz,
-               "skip_gps": args.skip_gps})
+               "skip_gps": args.skip_gps,
+               "enable_angular_dither": args.enable_angular_dither,
+               "angular_quantum": args.angular_quantum})
     print(f"[teleop_test] 로그 저장 경로: {log_path}")
 
     # 2026-10-11 추가: SDK 서버의 헤드리스 브라우저(pyppeteer)는 첫 요청에서 Chrome 실행+
@@ -110,13 +122,31 @@ def main():
     period_s = 1.0 / args.rate_hz
     t_start = time.time()
     tick_id = 0
+    dither_accum = 0.0
+    sent_history = []
     try:
         while time.time() - t_start < args.duration:
             tick_t0 = time.time()
-            status = send_control(args.linear, args.angular_bias)
+            # 델타-시그마 디더링: 양자화 잔차를 다음 tick에 넘겨 인접 두 단계를 섞어
+            # 보내면 시간평균이 요청값에 수렴한다 — 안 하면 요청값이 절삭돼 사라져서
+            # 0.001 단위 트림 탐색이 아예 불가능함(--enable_angular_dither 설명 참고).
+            if args.enable_angular_dither and args.angular_quantum > 0:
+                q = args.angular_quantum
+                # round()로 부동소수 표현오차 제거 후 truncate — 안 하면 -0.06이
+                # -0.059999...로 저장돼 한 단계 손실됨.
+                steps = math.trunc(round((args.angular_bias + dither_accum) / q, 6))
+                angular_sent = steps * q
+                dither_accum = max(-2.0 * q, min(2.0 * q,
+                                                 dither_accum + (args.angular_bias - angular_sent)))
+            else:
+                angular_sent = args.angular_bias
+            sent_history.append(angular_sent)
+            status = send_control(args.linear, angular_sent)
             elapsed = time.time() - t_start
             record = {"type": "step", "ts": time.time(), "tick_id": tick_id,
-                      "elapsed_s": elapsed, "linear": args.linear, "angular": args.angular_bias,
+                      "elapsed_s": elapsed, "linear": args.linear,
+                      "angular": angular_sent, "angular_desired": args.angular_bias,
+                      "angular_dither_accum": dither_accum,
                       "control_status": status}
             try:
                 data = get_data()
@@ -127,8 +157,9 @@ def main():
             except Exception as e:
                 record["telemetry_error"] = repr(e)
             log_jsonl(record)
-            print(f"  t={elapsed:5.1f}s linear={args.linear:+.3f} angular={args.angular_bias:+.4f} "
-                  f"[/control {status}] orientation={record.get('orientation_deg_raw')}")
+            print(f"  t={elapsed:5.1f}s linear={args.linear:+.3f} angular={angular_sent:+.3f}"
+                  f"(목표 {args.angular_bias:+.4f}) [/control {status}] "
+                  f"orientation={record.get('orientation_deg_raw')}")
             tick_id += 1
             sleep_s = period_s - (time.time() - tick_t0)
             if sleep_s > 0:
@@ -142,6 +173,20 @@ def main():
             send_control(0.0, 0.0)
         except Exception as e:
             print(f"[teleop_test] ⚠ 정지 명령 전송 실패 (서버 연결 확인 필요): {e!r}")
+
+    # 디더링이 실제로 요청값을 실현했는지 검증 — 평균이 목표와 다르면 측정 자체를
+    # 신뢰할 수 없으므로 여기서 바로 드러나게 한다.
+    if sent_history:
+        avg = sum(sent_history) / len(sent_history)
+        steps_used = sorted(set(round(v, 4) for v in sent_history))
+        print(f"[teleop_test] 전송된 angular: 평균={avg:+.5f} (목표 {args.angular_bias:+.4f}, "
+              f"오차 {avg - args.angular_bias:+.5f}), 사용된 단계={steps_used}")
+        if args.enable_angular_dither and abs(avg - args.angular_bias) > 0.002:
+            print("[teleop_test] ⚠ 평균이 목표와 0.002 이상 차이남 — tick 수가 너무 적을 수 있음"
+                  "(duration을 늘리면 수렴). 이 run의 트림 판정은 신뢰도가 낮음.")
+        log_jsonl({"type": "dither_summary", "ts": time.time(), "n_ticks": len(sent_history),
+                   "angular_desired": args.angular_bias, "angular_sent_avg": avg,
+                   "steps_used": steps_used})
 
     if args.skip_gps:
         if args.angular_bias != 0.0:
