@@ -104,7 +104,8 @@ FRODOBOT_BASE = "http://127.0.0.1:8000"
 
 # 2026-10-03 추가: GO LIVE 시점에 보이는 웹 대시보드를 자동으로 스크린샷해서 남기는
 # 폴더 — 발표/기록용(디버그 재현용은 아님, 그건 replay_logger.py가 이미 더 정확하게 함).
-DASHBOARD_CAPTURE_DIR = REPO_ROOT / "1003"
+# 날짜 폴더 관례(MMDD) — 2026-10-11 세션은 "1011"로 분리.
+DASHBOARD_CAPTURE_DIR = REPO_ROOT / "1011"
 
 # rides11_dataset.py와 동일한 학습 시 상수
 N_CTX = 5
@@ -697,7 +698,8 @@ class OmniVLAEdgeDeployment:
 
         # ── 데이터분석용 로그 (JSONL, 실행마다 날짜시간별 파일) ──
         # run_id는 __init__ 맨 위에서 이미 만들어둠(대시보드 녹화 파일명과 공유).
-        log_dir = REPO_ROOT / "deployment" / "logs"
+        # 날짜 폴더 관례(MMDD, 위 DASHBOARD_CAPTURE_DIR과 동일) — 2026-10-11 세션은 "1011"로 분리.
+        log_dir = REPO_ROOT / "deployment" / "logs" / "1011"
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = log_dir / f"deploy_{run_id}.jsonl"
         self._log_fp = open(self.log_path, "a", buffering=1, encoding="utf-8")
