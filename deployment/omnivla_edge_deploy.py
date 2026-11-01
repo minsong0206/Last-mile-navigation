@@ -675,7 +675,8 @@ class OmniVLAEdgeDeployment:
                  gps_freeze_min_disp_m=DEFAULT_GPS_FREEZE_MIN_DISP_M,
                  gps_freeze_persist_ticks=DEFAULT_GPS_FREEZE_PERSIST_TICKS,
                  gps_freeze_speed_threshold_mps=DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS,
-                 enable_route_dead_reckoning=DEFAULT_ENABLE_ROUTE_DEAD_RECKONING):
+                 enable_route_dead_reckoning=DEFAULT_ENABLE_ROUTE_DEAD_RECKONING,
+                 observe_only=False):
         # 2026-09-25: --dry_run의 의미가 "이 프로세스는 GO LIVE 자체를 영구히
         # 거부하는 하드 락"으로 바뀜(순수 검증 세션용). 기본(플래그 없음)은
         # DRY_RUN 상태로 시작하되, 대시보드에서 정렬확인→ARM→GO LIVE를 거치면
@@ -683,6 +684,17 @@ class OmniVLAEdgeDeployment:
         # heading EMA/route가 전부 그대로 유지됨(재시작 시 전부 날아가던
         # 이전 구조의 핵심 문제를 해결하기 위함).
         self.dry_run_lock = dry_run
+        # 2026-11-01 추가: 관측 전용 모드(--observe_only). --dry_run은 매 틱 /control에
+        # (0,0)을 "보내기" 때문에, 사람이 원격조종(teleop)하는 동안 같이 돌리면 그
+        # 명령을 계속 덮어써서 로봇이 멈춤. 관측 전용은 /control을 아예 호출하지 않는다
+        # (send_control()이 요청 없이 반환 — 정지 명령 경로 포함 모든 호출 지점에 적용).
+        # 용도: 사람이 경로를 몰고, 모델은 같은 입력으로 예측만 기록 → 오프라인에서
+        # "모델 예측 vs 사람이 실제로 간 경로" 비교(제어 쪽 지연/트림/절삭과 분리된
+        # 모델 단독 평가). GO LIVE도 영구 잠금(dry_run_lock 강제).
+        # ⚠ 이 프로세스는 로봇을 절대 멈추지 않는다 — 정지는 teleop 쪽 책임.
+        self.observe_only = observe_only
+        if observe_only:
+            self.dry_run_lock = True
         self.control_stage = "DRY_RUN"  # "DRY_RUN" / "ARMED" / "LIVE"
         self._armed_ts = None
         self._pending_commands = queue.Queue()
@@ -905,6 +917,7 @@ class OmniVLAEdgeDeployment:
             "type": "run_start", "ts": time.time(), "run_id": run_id,
             "ckpt_path": str(ckpt_path), "map_range_m": map_range_m,
             "goal_lat": goal_lat, "goal_lon": goal_lon, "dry_run_lock": self.dry_run_lock,
+            "observe_only": self.observe_only,
             "initial_heading_lookahead_m": self.initial_heading_lookahead_m,
             "allow_reroute": self.allow_reroute,
             "heading_mode": self.heading_mode,
@@ -943,7 +956,11 @@ class OmniVLAEdgeDeployment:
             "replay_path_convention": "step 레코드의 context_frame_paths/map_replay_path는 "
                                        "이 .jsonl 파일이 들어있는 디렉토리 기준 상대경로",
         })
-        if self.dry_run_lock:
+        if self.observe_only:
+            print("[deploy] ⚠ --observe_only 관측 전용 모드 — /control을 한 번도 호출하지 "
+                  "않습니다(정지 명령 포함). 로봇 조종과 정지는 teleop 쪽에서 직접 하세요. "
+                  "모델 예측은 평소처럼 계산·기록됩니다.")
+        elif self.dry_run_lock:
             print("[deploy] ⚠ --dry_run 잠금 모드 — 이 프로세스에서는 GO LIVE를 눌러도 "
                   "거부되고 실제 로봇에는 항상 (0,0)만 전송됩니다 (순수 검증 세션용)")
         else:
@@ -998,6 +1015,9 @@ class OmniVLAEdgeDeployment:
         # 멈추고 정지 명령이 강제되도록 함(에러를 삼키고 계속 움직이는 건 안전상
         # 절대 금지 — step()과 동일한 원칙). linear/angular는 절대 속도 명령이라
         # 재시도로 같은 값이 중복 전송돼도 안전함(상대/누적 명령이 아님).
+        if self.observe_only:
+            # 관측 전용: 로봇에 아무것도 보내지 않음(teleop 명령을 덮어쓰지 않기 위해).
+            return "observe_only"
         r = self._request_with_retry(lambda: requests.post(
             f"{FRODOBOT_BASE}/control",
             json={"command": {"linear": linear, "angular": angular}}, timeout=5.0))
@@ -2079,6 +2099,11 @@ if __name__ == "__main__":
                         "DRY_RUN 상태로 시작하며, 실제 로봇에 명령이 나가려면 대시보드에서 "
                         "'정렬 확인' → 'ARM' → 'GO LIVE'를 명시적으로 눌러야 함 (재시작 불필요, "
                         "같은 프로세스 안에서 frame_buffer/GPS 궤적/heading 상태 그대로 유지).")
+    p.add_argument("--observe_only", action="store_true",
+                   help="관측 전용(2026-11-01 추가): /control을 한 번도 호출하지 않음(정지 명령 "
+                        "포함). 사람이 teleop으로 경로를 몰고 모델은 예측만 기록할 때 사용 — "
+                        "--dry_run은 매 틱 (0,0)을 보내서 teleop을 덮어쓰므로 이 용도에 못 씀. "
+                        "GO LIVE도 영구 잠금. ⚠ 이 프로세스는 로봇을 멈추지 않으니 정지는 teleop 쪽에서.")
     p.add_argument("--heading_mode", type=str, default="auto",
                    choices=["auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored"],
                    help="auto(기본) = 정렬 확인은 실측 GPS heading이 잡히기 전까지의 "
@@ -2328,5 +2353,6 @@ if __name__ == "__main__":
         gps_freeze_persist_ticks=args.gps_freeze_persist_ticks,
         gps_freeze_speed_threshold_mps=args.gps_freeze_speed_threshold_mps,
         enable_route_dead_reckoning=args.enable_route_dead_reckoning,
+        observe_only=args.observe_only,
     )
     deployer.run()

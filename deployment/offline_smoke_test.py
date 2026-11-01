@@ -137,7 +137,8 @@ def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto
                    enable_gps_freeze_guard=False,
                    gps_freeze_min_disp_m=dep.DEFAULT_GPS_FREEZE_MIN_DISP_M,
                    gps_freeze_persist_ticks=dep.DEFAULT_GPS_FREEZE_PERSIST_TICKS,
-                   gps_freeze_speed_threshold_mps=dep.DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS):
+                   gps_freeze_speed_threshold_mps=dep.DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS,
+                   observe_only=False):
     # near_goal_override_dist_m/enable_off_route_safety/enable_straight_segment_override/
     # enable_gps_freeze_guard 기본값을 전부 꺼진 상태로 둠 -- 대부분의 기존 테스트는 이
     # 기능들과 무관한 걸 검증하는 거라, 운영 기본값(near_goal_override_dist_m/
@@ -167,6 +168,7 @@ def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto
         gps_freeze_min_disp_m=gps_freeze_min_disp_m,
         gps_freeze_persist_ticks=gps_freeze_persist_ticks,
         gps_freeze_speed_threshold_mps=gps_freeze_speed_threshold_mps,
+        observe_only=observe_only,
     )
     tick_count = [0]
     real_step = deployer.step
@@ -788,6 +790,55 @@ def test_j_network_retry():
           f"(총 시도 {calls2['n']}회) -- '통신 불능이면 멈춘다' 안전 원칙 유지 확인")
 
 
+# ── test K: 관측 전용 모드(2026-11-01) ─────────────────────────────────────
+def test_k_observe_only():
+    """--observe_only: /control을 한 번도 호출하지 않아야 함(정지 명령 경로 포함 —
+    여기선 KeyboardInterrupt 종료 경로까지 탐). GO LIVE를 눌러도 거부, 모델 예측은
+    평소처럼 기록."""
+    print("\n========== test_k_observe_only ==========")
+    camera_frames = _load_camera_frames() * 3
+    n_ticks = 12
+    gps_sequence = [_base_gps(BASE_LAT - i * 0.00003, BASE_LON - i * 0.000015)
+                    for i in range(n_ticks + 2)]
+    fake_get, fake_post, call_state = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), \
+         mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=False, n_ticks=n_ticks,
+                                 observe_only=True)
+        assert deployer.dry_run_lock, "observe_only인데 dry_run_lock이 강제되지 않음"
+        real_step = deployer.step
+        cnt = [0]
+
+        def wrapped():
+            if cnt[0] == 3:
+                deployer._pending_commands.put("confirm_alignment")
+            if cnt[0] == 4:
+                deployer._pending_commands.put("arm")
+            if cnt[0] == 5:
+                deployer._pending_commands.put("go_live")
+            cnt[0] += 1
+            return real_step()
+
+        deployer.step = wrapped
+        deployer.run()
+
+    assert len(call_state["control_calls"]) == 0, \
+        f"observe_only인데 /control이 {len(call_state['control_calls'])}번 호출됨"
+    print("[OK] /control 호출 0회 (종료 시 정지 명령 경로 포함)")
+    status = deployer.state.snapshot_status()
+    assert status["control_stage"] != "LIVE"
+    print(f"[OK] GO LIVE 거부됨 (control_stage={status['control_stage']})")
+    logs = _read_jsonl(deployer.log_path)
+    run_start = [l for l in logs if l.get("type") == "run_start"][0]
+    assert run_start.get("observe_only") is True
+    sent = [l for l in logs if l.get("type") == "control_sent"]
+    assert sent and all(l["http_status"] == "observe_only" for l in sent)
+    preds = [l for l in logs if l.get("type") == "step" and l.get("pred_xy_m")]
+    assert preds, "observe_only인데 모델 예측(pred_xy_m)이 기록되지 않음"
+    print(f"[OK] run_start.observe_only=True, control_sent {len(sent)}개 전부 http_status=observe_only, "
+          f"모델 예측 기록 {len(preds)}틱")
+
+
 if __name__ == "__main__":
     test_a_dry_run_lock()
     test_b_full_workflow()
@@ -799,4 +850,5 @@ if __name__ == "__main__":
     test_h_new_mechanisms_2026_10_04()
     test_i_gps_freeze_guard()
     test_j_network_retry()
+    test_k_observe_only()
     print("\n모든 오프라인 스모크 테스트 통과.")

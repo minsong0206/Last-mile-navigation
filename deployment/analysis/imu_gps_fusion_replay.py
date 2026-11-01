@@ -76,6 +76,8 @@ def load_run(path):
                 "speed": float(raw.get("speed") or 0.0),
                 "gyros": raw.get("gyros") or [], "rpms": raw.get("rpms") or [],
                 "gps_fix_ok": d.get("gps_fix_ok"),
+                "logged_heading_deg": d.get("smoothed_heading_deg"),
+                "logged_gps_heading_deg": d.get("gps_heading_deg"),
                 "sent_lin": 0.0, "sent_ang": 0.0, "live": False,
             }
             ticks.append(pending)
@@ -500,15 +502,548 @@ def plot_audit(out_dir, P, mask, corr, unit_pts, scale_pts, freeze_all, best_pai
     plt.close(fig)
 
 
+# ═══════════════════════════ Phase B/C: 추정기 비교 ═══════════════════════════
+#
+# Phase A 결과(audit_summary.json)를 그대로 상수로 반영:
+#   - 거리: rpm × 0.329 m/rev (rpm 없으면 직전 값 유지)
+#   - rpm 배치: ch0/ch2 = 왼쪽, ch1/ch3 = 오른쪽
+#   - 자이로 z 양수 = 좌회전(CCW). 단위 미확정 → GYRO_SCALES를 튜닝 split에서 고름
+# 좌표: ENU(m), heading = atan2(북, 동) rad, CCW 양수 — 배포 코드/학습 데이터와 동일.
+#
+# 추정기:
+#   B0_hold      : GPS 마지막 값 유지(DR 꺼짐 = 현재 기본 배포)  [위치만]
+#   B0_routeDR   : 배포 DR 알고리즘(속도 단위 수정판) — GPS 앵커에서 경로 따라 전진  [위치만]
+#   B0_logged    : 배포 당시 로그의 smoothed_heading_deg  [heading만]
+#   B1_odom      : rpm 오도메트리. 위치는 새 GPS마다 하드리셋, heading은 rpm 좌우차 적분만
+#   B2_comp      : complementary. 예측 = rpm 거리 + (자이로, 없으면 rpm) 회전,
+#                  새 GPS마다 위치 β만큼, GPS course(≥1.5m)로 heading α만큼 당김
+#   B3_ekf       : EKF, 상태 [x, y, θ, ω_bias]. 예측 동일, 업데이트 = 새 GPS 위치만
+#
+# 평가(정답 궤적이 없으므로 대리 지표):
+#   1) GPS 가림: 정상 GPS 구간에서 T초(5/10/20) 동안 GPS를 숨기고, 다시 들어온 첫 GPS와의
+#      위치 오차. "GPS 동결 중 얼마나 버티나"를 직접 측정.
+#   2) heading 오차: 사후(non-causal) 기준 heading = 해당 틱 ±6초 GPS 갱신점의 현(chord)
+#      방향(현 ≥3m, 거의 직선일 때만). 전체/회전 구간(기준 heading이 ±3초에 15°+ 변화) 별 MAE.
+#   3) 직진 안정성: |명령|≤0.02 구간에서 틱당 heading 변화량 표준편차.
+# 튜닝 split = 2026-10-04 이전 run, 평가 split = 2026-10-11 run (다른 날·다른 설정).
+
+GPS_MASK_WINDOWS_S = (5.0, 10.0, 20.0)
+INIT_COURSE_DISP_M = 3.0
+GYRO_SCALES = {"deg/s": math.pi / 180.0, "1/28(audit ratio)": 1.0 / 28.0}
+RPM_TRACK_WIDTHS_M = (0.25, 0.4, 0.6)   # 스키드 스티어 유효 윤거(미확정 → 튜닝)
+WHEEL_M_PER_REV_B = 0.329
+
+
+def wrap(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def load_route(path):
+    for line in open(path):
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("type") == "event" and d.get("event") == "route_init" and d.get("route_latlon"):
+            return d["route_latlon"]
+    return None
+
+
+def prepare_run(path):
+    """틱 단위 입력 배열 생성. 반환 dict 또는 None(주행 부족)."""
+    ticks = load_run(path)
+    ticks = [tk for tk in ticks if tk["lat"] is not None and abs(tk["lat"]) <= 90]
+    if sum(tk["moving"] for tk in ticks) < MIN_MOVING_TICKS:
+        return None
+    g_tick, _ = dedupe_samples(ticks, "gyros", 3)
+    r_tick, _ = dedupe_samples(ticks, "rpms", 4)
+    n = len(ticks)
+    lat0, lon0 = ticks[0]["lat"], ticks[0]["lon"]
+    xy = np.array([to_enu(tk["lat"], tk["lon"], lat0, lon0) for tk in ticks])
+    fresh = np.zeros(n, bool)
+    for i in range(1, n):
+        fresh[i] = (ticks[i]["lat"], ticks[i]["lon"]) != (ticks[i - 1]["lat"], ticks[i - 1]["lon"])
+    fresh[0] = True
+    vL = np.full(n, np.nan)
+    vR = np.full(n, np.nan)
+    gz = np.full(n, np.nan)
+    for i in range(n):
+        if len(r_tick[i]):
+            m = r_tick[i].mean(axis=0)
+            vL[i] = (m[0] + m[2]) / 2 / 60.0 * WHEEL_M_PER_REV_B
+            vR[i] = (m[1] + m[3]) / 2 / 60.0 * WHEEL_M_PER_REV_B
+        if len(g_tick[i]):
+            gz[i] = g_tick[i][:, 2].mean()
+    # rpm 없는 틱은 직전 값 유지(rpm은 거의 정상상태 값이라 홀드가 합리적)
+    for arr in (vL, vR):
+        last = 0.0
+        for i in range(n):
+            if np.isfinite(arr[i]):
+                last = arr[i]
+            else:
+                arr[i] = last
+    moving = np.array([tk["moving"] for tk in ticks])
+    v = np.where(moving, (vL + vR) / 2, 0.0)
+    ts = np.array([tk["ts"] for tk in ticks])
+    route = load_route(path)
+    route_xy = np.array([to_enu(p[0], p[1], lat0, lon0) for p in route]) if route else None
+    logged = np.array([math.radians(tk["logged_heading_deg"]) if tk["logged_heading_deg"] is not None
+                       else np.nan for tk in ticks])
+    return {
+        "id": Path(path).stem.replace("deploy_", ""), "ts": ts,
+        "dt": np.clip(np.diff(ts, prepend=ts[0]), 0, 2.0), "xy": xy, "fresh": fresh,
+        "v": v, "vL": vL, "vR": vR, "gz": gz, "moving": moving,
+        "cmd": np.array([tk["eff_ang"] for tk in ticks]), "logged_heading": logged,
+        "route_xy": route_xy,
+    }
+
+
+def reference_heading(run, half_win_s=6.0, min_chord_m=3.0, straightness=0.9):
+    """사후 기준 heading(non-causal). 기준 없는 틱은 nan."""
+    ts, xy, fresh = run["ts"], run["xy"], run["fresh"]
+    fi = np.where(fresh)[0]
+    ref = np.full(len(ts), np.nan)
+    for i in range(len(ts)):
+        sel = fi[(ts[fi] >= ts[i] - half_win_s) & (ts[fi] <= ts[i] + half_win_s)]
+        if len(sel) < 3:
+            continue
+        p = xy[sel]
+        chord = np.hypot(*(p[-1] - p[0]))
+        path = np.sum(np.hypot(*np.diff(p, axis=0).T))
+        if chord >= min_chord_m and chord / max(path, 1e-6) >= straightness:
+            ref[i] = math.atan2(p[-1, 1] - p[0, 1], p[-1, 0] - p[0, 0])
+    return ref
+
+
+def turn_mask(run, ref, back_lo_s=3.0, back_hi_s=8.0, thresh_deg=20.0):
+    """"회전 직후" 틱: 기준 heading이 3~8초 전 기준 heading과 20°+ 다른 틱.
+    (기준 heading은 거의 직선 구간에서만 정의되므로 회전 '중' 대신 회전 '직후'의
+    추정 지연/오차를 본다 — 1.5m 창 GPS heading의 지연 문제가 바로 이 구간.)"""
+    ts = run["ts"]
+    out = np.zeros(len(ts), bool)
+    for i in range(len(ts)):
+        if not np.isfinite(ref[i]):
+            continue
+        j0 = np.searchsorted(ts, ts[i] - back_hi_s)
+        j1 = np.searchsorted(ts, ts[i] - back_lo_s)
+        prev = ref[j0:j1]
+        prev = prev[np.isfinite(prev)]
+        if len(prev) and np.max(np.abs([wrap(ref[i] - a) for a in prev])) >= math.radians(thresh_deg):
+            out[i] = True
+    return out
+
+
+class _Base:
+    """공통: 첫 GPS 위치 + 첫 3m 변위 course로 초기화(causal). 초기화 전 heading = nan."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.x = self.y = None
+        self.th = None
+        self.init_anchor = None
+
+    def omega(self, run, i):
+        W = self.cfg["W"]
+        w_rpm = (run["vR"][i] - run["vL"][i]) / W
+        g = run["gz"][i]
+        if self.cfg.get("use_gyro", True) and np.isfinite(g):
+            return g * self.cfg["gscale"], True
+        return w_rpm, False
+
+    def try_init(self, gx, gy):
+        if self.init_anchor is None:
+            self.init_anchor = (gx, gy)
+            self.x, self.y = gx, gy
+            return
+        dx, dy = gx - self.init_anchor[0], gy - self.init_anchor[1]
+        if math.hypot(dx, dy) >= INIT_COURSE_DISP_M:
+            self.th = math.atan2(dy, dx)
+            self.x, self.y = gx, gy
+            self.on_init()
+
+    def on_init(self):
+        pass
+
+
+class B1Odom(_Base):
+    def step(self, run, i, gps):
+        if self.th is None:
+            if gps is not None:
+                self.try_init(*gps)
+            return
+        dt, v = run["dt"][i], run["v"][i]
+        w = (run["vR"][i] - run["vL"][i]) / self.cfg["W"] if run["moving"][i] else 0.0
+        self.th = wrap(self.th + w * dt)
+        self.x += v * math.cos(self.th) * dt
+        self.y += v * math.sin(self.th) * dt
+        if gps is not None:
+            self.x, self.y = gps
+
+
+class B2Comp(_Base):
+    def on_init(self):
+        self.anchor = (self.x, self.y)
+
+    def step(self, run, i, gps):
+        if self.th is None:
+            if gps is not None:
+                self.try_init(*gps)
+            return
+        dt, v = run["dt"][i], run["v"][i]
+        w, _ = self.omega(run, i)
+        if not run["moving"][i]:
+            w = 0.0
+        self.th = wrap(self.th + w * dt)
+        self.x += v * math.cos(self.th) * dt
+        self.y += v * math.sin(self.th) * dt
+        if gps is not None:
+            b = self.cfg["beta"]
+            self.x += b * (gps[0] - self.x)
+            self.y += b * (gps[1] - self.y)
+            dx, dy = gps[0] - self.anchor[0], gps[1] - self.anchor[1]
+            if math.hypot(dx, dy) >= 1.5:
+                c = math.atan2(dy, dx)
+                self.th = wrap(self.th + self.cfg["alpha"] * wrap(c - self.th))
+                self.anchor = gps
+
+
+class B3EKF(_Base):
+    def on_init(self):
+        self.P = np.diag([1.0, 1.0, math.radians(20) ** 2, 0.05 ** 2])
+        self.b = 0.0
+
+    def step(self, run, i, gps):
+        if self.th is None:
+            if gps is not None:
+                self.try_init(*gps)
+            return
+        c = self.cfg
+        dt, v = run["dt"][i], run["v"][i]
+        w, from_gyro = self.omega(run, i)
+        if not run["moving"][i]:
+            w = 0.0
+        q_w = c["q_gyro"] if from_gyro else c["q_rpm"]
+        th = self.th
+        self.x += v * math.cos(th) * dt
+        self.y += v * math.sin(th) * dt
+        self.th = wrap(th + (w - self.b) * dt)
+        F = np.eye(4)
+        F[0, 2] = -v * math.sin(th) * dt
+        F[1, 2] = v * math.cos(th) * dt
+        F[2, 3] = -dt
+        sv = c["q_v_frac"] * max(v, 0.05)      # 속도 잡음(rpm 스케일 ±15%)
+        Q = np.diag([(sv * dt) ** 2 + 1e-4, (sv * dt) ** 2 + 1e-4,
+                     (q_w * dt) ** 2 + 1e-6, (c["q_bias"] ** 2) * dt])
+        self.P = F @ self.P @ F.T + Q
+        if gps is not None:
+            H = np.zeros((2, 4))
+            H[0, 0] = H[1, 1] = 1.0
+            R = np.eye(2) * c["sigma_gps"] ** 2
+            z = np.array(gps) - np.array([self.x, self.y])
+            # 이상치 게이트(마할라노비스, 99%): GPS 점프는 무시
+            S = H @ self.P @ H.T + R
+            if z @ np.linalg.solve(S, z) > 9.21:
+                # 연속 거부가 쌓이면 필터 쪽이 틀린 것(예: 출발 직후 50~84m GPS 점프로
+                # 잘못 초기화 — 1011 run 102751/135025 실측) → GPS로 위치 재초기화.
+                self.n_reject = getattr(self, "n_reject", 0) + 1
+                if self.n_reject >= 3:
+                    self.x, self.y = gps
+                    self.P[0:2, :] = 0.0
+                    self.P[:, 0:2] = 0.0
+                    self.P[0, 0] = self.P[1, 1] = c["sigma_gps"] ** 2
+                    self.n_reject = 0
+                return
+            self.n_reject = 0
+            K = self.P @ H.T @ np.linalg.inv(S)
+            dxs = K @ z
+            self.x += dxs[0]
+            self.y += dxs[1]
+            self.th = wrap(self.th + dxs[2])
+            self.b += dxs[3]
+            self.P = (np.eye(4) - K @ H) @ self.P
+
+
+ESTIMATORS = {"B1_odom": B1Odom, "B2_comp": B2Comp, "B3_ekf": B3EKF}
+
+
+def run_estimator(cls, cfg, run, mask_from=None, mask_to=None):
+    """GPS를 (mask_from, mask_to) 틱 구간에서 숨기고 실행. 각 틱 '업데이트 전' 예측 위치와
+    업데이트 후 heading을 반환."""
+    est = cls(cfg)
+    n = len(run["ts"])
+    pred_xy = np.full((n, 2), np.nan)
+    th = np.full(n, np.nan)
+    for i in range(n):
+        gps = tuple(run["xy"][i]) if run["fresh"][i] else None
+        if mask_from is not None and mask_from < i < mask_to:
+            gps = None
+        if mask_to is not None and i == mask_to:
+            # 가림 종료 틱: 이 틱의 GPS를 쓰기 전 예측 위치 기록.
+            # 가림 시작 시점에 아직 초기화 전이었으면 평가 불가(nan) — 이전엔 여기서 GPS로
+            # 초기화되며 오차 0이 기록되는 버그가 있었음.
+            if est.th is None:
+                break
+            est.step(run, i, None)
+            pred_xy[i] = (est.x, est.y)
+            th[i] = est.th
+            continue
+        est.step(run, i, gps)
+        if est.th is not None:
+            pred_xy[i] = (est.x, est.y)
+            th[i] = est.th
+    return pred_xy, th
+
+
+def route_dr_position(run, i0, i1):
+    """배포 DR(수정판) 재현: 틱 i0의 GPS를 앵커로, 경로 위 가장 가까운 점에서
+    Σv·dt만큼 경로를 따라 전진한 위치. 경로 없으면 None."""
+    R = run["route_xy"]
+    if R is None or len(R) < 2:
+        return None
+    adv = float(np.sum(run["v"][i0 + 1:i1 + 1] * run["dt"][i0 + 1:i1 + 1]))
+    seg = np.hypot(*np.diff(R, axis=0).T)
+    cum = np.concatenate([[0], np.cumsum(seg)])
+    k = int(np.argmin(np.hypot(*(R - run["xy"][i0]).T)))
+    target = cum[k] + adv
+    if target >= cum[-1]:
+        return tuple(R[-1])
+    j = int(np.searchsorted(cum, target) - 1)
+    f = (target - cum[j]) / max(seg[j], 1e-9)
+    return tuple(R[j] + f * (R[j + 1] - R[j]))
+
+
+def mask_windows(run, T):
+    """(i0, i1): i0 = 새 GPS 틱(초기화 충분히 이후), i1 = ts ≥ ts[i0]+T 인 첫 새 GPS 틱.
+    구간 전체 주행 중일 것. 겹치지 않게."""
+    ts, fresh, moving = run["ts"], run["fresh"], run["moving"]
+    out, i = [], 0
+    warm_ts = ts[0] + 15.0
+    n = len(ts)
+    while i < n:
+        if fresh[i] and moving[i] and ts[i] >= warm_ts:
+            j = i + 1
+            while j < n and not (fresh[j] and ts[j] >= ts[i] + T):
+                j += 1
+            if j < n and np.all(moving[i:j + 1]) and ts[j] - ts[i] <= T + 4.0:
+                out.append((i, j))
+                i = j
+                continue
+        i += 1
+    return out
+
+
+def eval_run(run, est_cfgs, ref, tmask):
+    """한 run에 대해 모든 추정기 지표 계산."""
+    res = {"mask": {T: {} for T in GPS_MASK_WINDOWS_S}, "heading": {}}
+    wins = {T: mask_windows(run, T) for T in GPS_MASK_WINDOWS_S}
+    for T, ws in wins.items():
+        for (i0, i1) in ws:
+            # 모든 추정기가 같은 창 집합에서 비교되도록, 하나라도 평가 불가면 창 전체 제외
+            truth = run["xy"][i1]
+            errs = {}
+            for name, (cls, cfg) in est_cfgs.items():
+                pxy, _ = run_estimator(cls, cfg, run, i0, i1)
+                if not np.all(np.isfinite(pxy[i1])):
+                    break
+                errs[name] = float(np.hypot(*(pxy[i1] - truth)))
+            else:
+                p = route_dr_position(run, i0, i1)
+                if p is None:
+                    continue
+                errs["B0_hold"] = float(np.hypot(*(run["xy"][i0] - truth)))
+                errs["B0_routeDR"] = float(np.hypot(*(np.array(p) - truth)))
+                for name, v in errs.items():
+                    res["mask"][T].setdefault(name, []).append(v)
+    # heading (가림 없음, 정상 운용)
+    ths = {"B0_logged": run["logged_heading"]}
+    for name, (cls, cfg) in est_cfgs.items():
+        _, ths[name] = run_estimator(cls, cfg, run)
+    valid = np.isfinite(ref)
+    for th in ths.values():
+        valid &= np.isfinite(th)
+    straight = valid & run["moving"] & (np.abs(run["cmd"]) <= 0.02)
+    for name, th in ths.items():
+        err = np.abs([wrap(a - b) for a, b in zip(th, ref)])
+        dth = np.abs([wrap(th[k] - th[k - 1]) for k in range(1, len(th))] + [np.nan])
+        res["heading"][name] = {
+            "err_all": err[valid].tolist(),
+            "err_turn": err[valid & tmask].tolist(),
+            "dth_straight": dth[straight & np.isfinite(dth)].tolist(),
+        }
+    return res
+
+
+def aggregate(results, names):
+    out = {"mask_err_m": {}, "heading_deg": {}}
+    for T in GPS_MASK_WINDOWS_S:
+        out["mask_err_m"][f"{int(T)}s"] = {}
+        for nm in ["B0_hold", "B0_routeDR"] + names:
+            v = [x for r in results for x in r["mask"][T].get(nm, [])]
+            if v:
+                out["mask_err_m"][f"{int(T)}s"][nm] = {
+                    "n": len(v), "median": float(np.median(v)), "p90": float(np.percentile(v, 90))}
+    for nm in ["B0_logged"] + names:
+        ea = np.degrees([x for r in results for x in r["heading"][nm]["err_all"]])
+        et = np.degrees([x for r in results for x in r["heading"][nm]["err_turn"]])
+        ds = np.degrees([x for r in results for x in r["heading"][nm]["dth_straight"]])
+        out["heading_deg"][nm] = {
+            "n_all": len(ea), "mae_all": float(np.mean(ea)) if len(ea) else None,
+            "p90_all": float(np.percentile(ea, 90)) if len(ea) else None,
+            "n_turn": len(et), "mae_turn": float(np.mean(et)) if len(et) else None,
+            "straight_dtheta_std": float(np.std(ds)) if len(ds) else None,
+        }
+    return out
+
+
+def score(agg, name):
+    """튜닝 목적함수: 10초 가림 위치 오차 중앙값(m) + heading MAE(deg)/10."""
+    m = agg["mask_err_m"]["10s"].get(name)
+    h = agg["heading_deg"][name]["mae_all"]
+    if m is None or h is None:
+        return float("inf")
+    return m["median"] + h / 10.0
+
+
+def compare(out_dir):
+    files = sorted(set(f for g in LOG_GLOBS for f in glob.glob(g)))
+    runs = [r for r in (prepare_run(f) for f in files) if r is not None]
+    tune = [r for r in runs if not r["id"].startswith("20261011")]
+    evals = [r for r in runs if r["id"].startswith("20261011")]
+    print(f"[load] run {len(runs)}개: 튜닝 {len(tune)} / 평가 {len(evals)}")
+    for r in runs:
+        r["ref"] = reference_heading(r)
+        r["tmask"] = turn_mask(r, r["ref"])
+
+    # ── 튜닝 (estimator별 독립 grid) ──
+    grids = {
+        "B1_odom": [{"W": W} for W in RPM_TRACK_WIDTHS_M],
+        "B2_comp": [{"W": W, "gscale": g, "alpha": a, "beta": b}
+                    for W in RPM_TRACK_WIDTHS_M for g in GYRO_SCALES.values()
+                    for a in (0.3, 0.6) for b in (0.5, 0.9)],
+        "B3_ekf": [{"W": W, "gscale": g, "sigma_gps": s, "q_gyro": qg, "q_rpm": qr,
+                    "q_v_frac": 0.15, "q_bias": 0.01}
+                   for W in RPM_TRACK_WIDTHS_M for g in GYRO_SCALES.values()
+                   for s in (0.5, 1.0) for qg in (0.05, 0.2) for qr in (0.2, 0.5)],
+    }
+    best = {}
+    tuning_log = {}
+    for name, grid in grids.items():
+        t0 = time.time()
+        scored = []
+        for cfg in grid:
+            res = [eval_run(r, {name: (ESTIMATORS[name], cfg)}, r["ref"], r["tmask"]) for r in tune]
+            agg = aggregate(res, [name])
+            scored.append((score(agg, name), cfg, agg["mask_err_m"]["10s"].get(name),
+                           agg["heading_deg"][name]["mae_all"]))
+        scored.sort(key=lambda x: x[0])
+        best[name] = scored[0][1]
+        tuning_log[name] = [{"score": s, "cfg": c, "mask10": m, "heading_mae": h} for s, c, m, h in scored]
+        print(f"[tune] {name}: {len(grid)} configs, {time.time() - t0:.0f}s, best={scored[0][1]} "
+              f"score={scored[0][0]:.3f}")
+
+    # 자이로 끈 EKF(rpm만)도 같이 평가 — 자이로 기여도 분리
+    best["B3_ekf_noGyro"] = dict(best["B3_ekf"], use_gyro=False)
+    est_cfgs = {nm: (ESTIMATORS[nm if nm in ESTIMATORS else "B3_ekf"], cfg) for nm, cfg in best.items()}
+    names = list(est_cfgs)
+
+    summary = {"n_tune_runs": len(tune), "n_eval_runs": len(evals), "best_cfg": best}
+    per_run_eval = {}
+    for split, rs in (("tune", tune), ("eval", evals)):
+        res = []
+        for r in rs:
+            rr = eval_run(r, est_cfgs, r["ref"], r["tmask"])
+            res.append(rr)
+            if split == "eval":
+                per_run_eval[r["id"]] = rr
+        summary[split] = aggregate(res, names)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "compare_summary.json", "w") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    with open(out_dir / "compare_tuning.json", "w") as f:
+        json.dump(tuning_log, f, indent=1, ensure_ascii=False)
+    plot_compare(out_dir, summary, evals, est_cfgs)
+    print(json.dumps({k: summary[k] for k in ("best_cfg", "eval")}, indent=2, ensure_ascii=False))
+    print(f"[done] {out_dir}")
+
+
+def plot_compare(out_dir, summary, evals, est_cfgs):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ev = summary["eval"]
+    fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+    ax = axs[0]
+    names = ["B0_hold", "B0_routeDR"] + list(est_cfgs)
+    Ts = list(ev["mask_err_m"].keys())
+    w = 0.8 / len(names)
+    for k, nm in enumerate(names):
+        vals = [ev["mask_err_m"][T].get(nm, {}).get("median", np.nan) for T in Ts]
+        ax.bar(np.arange(len(Ts)) + k * w, vals, w, label=nm)
+    ax.set_xticks(np.arange(len(Ts)) + 0.4 - w / 2)
+    ax.set_xticklabels([f"GPS masked {T}" for T in Ts])
+    ax.set_ylabel("position error at GPS return (m, median)")
+    ax.set_title("eval split (2026-10-11): GPS masking test")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, axis="y")
+    ax = axs[1]
+    hn = ["B0_logged"] + list(est_cfgs)
+    ax.bar(np.arange(len(hn)) - 0.2, [ev["heading_deg"][n]["mae_all"] or np.nan for n in hn], 0.4, label="all")
+    ax.bar(np.arange(len(hn)) + 0.2, [ev["heading_deg"][n]["mae_turn"] or np.nan for n in hn], 0.4, label="turns")
+    ax.set_xticks(np.arange(len(hn)))
+    ax.set_xticklabels(hn, rotation=20, fontsize=8)
+    ax.set_ylabel("heading MAE vs non-causal GPS reference (deg)")
+    ax.set_title("eval split: heading error")
+    ax.legend()
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_dir / "compare_overview.png", dpi=110)
+    plt.close(fig)
+
+    # 예시 run: 가장 긴 평가 run의 궤적 + heading
+    r = max(evals, key=lambda r: len(r["ts"]))
+    fig, axs = plt.subplots(1, 2, figsize=(15, 6))
+    ax = axs[0]
+    ax.plot(*r["xy"][r["fresh"]].T, "k.", ms=4, label="GPS (fresh)")
+    if r["route_xy"] is not None:
+        ax.plot(*r["route_xy"].T, color="#bbbbbb", lw=3, label="route", zorder=0)
+    for nm, (cls, cfg) in est_cfgs.items():
+        _, th = run_estimator(cls, cfg, r)
+        pxy, _ = run_estimator(cls, cfg, r)
+        ax.plot(*pxy.T, lw=1.2, label=nm)
+    ax.set_aspect("equal")
+    ax.set_title(f"{r['id']}: trajectories (ENU m)")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    ax = axs[1]
+    t = r["ts"] - r["ts"][0]
+    ax.plot(t, np.degrees(r["ref"]), "k-", lw=3, alpha=0.4, label="reference (non-causal)")
+    ax.plot(t, np.degrees(r["logged_heading"]), lw=1, label="B0_logged")
+    for nm, (cls, cfg) in est_cfgs.items():
+        _, th = run_estimator(cls, cfg, r)
+        ax.plot(t, np.degrees(th), lw=1, label=nm)
+    ax.set_xlabel("s")
+    ax.set_ylabel("heading (deg, ENU)")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / "compare_example_run.png", dpi=110)
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["audit"], help="현재 Phase A(audit)만 구현")
+    ap.add_argument("phase", choices=["audit", "compare"],
+                    help="audit = Phase A 센서 감사, compare = Phase B/C 추정기 비교")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     out = Path(args.out) if args.out else REPO_ROOT / "deployment/analysis/results" / \
         f"fusion_replay_{time.strftime('%Y%m%d')}"
     if args.phase == "audit":
         audit(out)
+    elif args.phase == "compare":
+        compare(out)
 
 
 if __name__ == "__main__":
