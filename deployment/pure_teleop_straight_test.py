@@ -154,12 +154,23 @@ def main():
                 record["lon"] = data.get("longitude")
                 record["orientation_deg_raw"] = data.get("orientation")
                 record["fix_quality"] = data.get("fix_quality")
+                # 2026-11-01 추가: 원본 센서 버스트(자이로/rpm/가속도)와 speed, 로봇 측
+                # timestamp를 그대로 기록 — "서서히 휘었나 / 갑자기 꺾였나"를 자이로로,
+                # 이동거리를 rpm(0.329 m/rev)으로 사후 검증하기 위함. 샘플은 틱 간에
+                # 중복될 수 있으니 분석 시 timestamp(각 샘플 마지막 원소)로 중복 제거할 것.
+                for k in ("gyros", "rpms", "accels", "speed", "timestamp"):
+                    record[k] = data.get(k)
             except Exception as e:
                 record["telemetry_error"] = repr(e)
             log_jsonl(record)
+            gz = [g[2] for g in (record.get("gyros") or []) if isinstance(g, list) and len(g) >= 4]
+            rp = [r for r in (record.get("rpms") or []) if isinstance(r, list) and len(r) >= 5]
+            gz_txt = f"{sum(gz) / len(gz):+6.1f}" if gz else "   n/a"
+            rpm_txt = (f"L{sum((r[0] + r[2]) / 2 for r in rp) / len(rp):5.1f} "
+                       f"R{sum((r[1] + r[3]) / 2 for r in rp) / len(rp):5.1f}") if rp else "n/a"
             print(f"  t={elapsed:5.1f}s linear={args.linear:+.3f} angular={angular_sent:+.3f}"
                   f"(목표 {args.angular_bias:+.4f}) [/control {status}] "
-                  f"orientation={record.get('orientation_deg_raw')}")
+                  f"orientation={record.get('orientation_deg_raw')} gyro_z={gz_txt} rpm {rpm_txt}")
             tick_id += 1
             sleep_s = period_s - (time.time() - tick_t0)
             if sleep_s > 0:

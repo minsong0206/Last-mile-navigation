@@ -472,6 +472,47 @@ DEFAULT_ANGULAR_TRIM = 0.0
 DEFAULT_ANGULAR_QUANTUM = 0.01
 DEFAULT_ENABLE_ANGULAR_DITHER = False  # 기본 꺼짐 — 켜야 디더링 적용(기존 동작 보존)
 
+# ── 2026-11-01 추가: 명령 변환 보정(actuation calibration, --enable_actuation_calibration) ──
+# 실내 teleop 실측(deployment/logs/1101/teleop_test_*.jsonl, 자이로 deg/s·rpm 기록,
+# docs/1101_test_A_actuation.md)으로 확인한 로봇의 명령→동작 관계:
+#   - |angular| ≤ 0.05 : 좌우 바퀴 rpm 동일 → 직진(반응 없음 구간, deadband).
+#     기존 실외 로그 6,000여 틱에서도 -0.05~+0.05 구간 바퀴 차이 ≈ 0 확인.
+#   - |angular| ≥ 0.06 : yaw rate ≈ 95 deg/s × angular ≈ 1.66 rad/s × angular, 좌우 대칭
+#     (±0.06 → ±4.5~5.4, ±0.10 → ±10, ±0.20 → ±19 deg/s). 0에서 비례값으로 바로 점프.
+#   - linear 0.3 → 실제 약 0.36 m/s(rpm × 0.329 m/rev, 줄자 실측과 3.5% 일치) → 약 1.2배.
+# 기존 배포는 모델이 낸 rad/s·m/s를 그대로 정규화 명령으로 보내서, 작은 조향은 deadband에
+# 사라지고 큰 조향은 의도보다 1.66/1.2 ≈ 1.4배 급하게 꺾였음. 트림 -0.051 + 0.01 디더링은
+# 이 구조를 모른 채 "10% 틱만 -0.06"을 보내던 것(트림 -0.0537에서 벽 충돌 재현).
+# 보정: (1) 원하는 값 ÷ 게인으로 단위 변환, (2) 0과 ±0.06 사이는 델타-시그마로 "0"과
+# "±0.06"을 시간 비율로 섞음(반응이 비례 구조라 평균 yaw rate가 정확히 원하는 값),
+# 0.06 이상은 0.01 단위로 반올림해 보내고 잔차는 같은 누적기로 넘김.
+# ⚠ 실내 값. 기존 실외 로그에선 -0.06의 바퀴 차이가 4%(실내 11%)라 실외 반응이 약할 수
+# 있음 — 실외 재측정 후 아래 상수 갱신할 것. 표본: run당 정상속도 13~22틱.
+ACT_ANGULAR_GAIN_RAD_S = 1.66   # 명령 1.0당 실제 yaw rate(rad/s)
+ACT_LINEAR_GAIN_M_S = 1.2       # 명령 1.0당 실제 전진속도(m/s)
+ACT_MIN_EFFECTIVE_CMD = 0.06    # deadband 밖 최소 유효 명령
+ACT_CMD_QUANTUM = 0.01          # 펌웨어 절삭 단위(DEFAULT_ANGULAR_QUANTUM과 동일 실측)
+DEFAULT_ENABLE_ACTUATION_CALIBRATION = False
+
+
+def actuation_calibrate(linear_mps, angular_rad_s, accum,
+                        ang_gain=ACT_ANGULAR_GAIN_RAD_S, lin_gain=ACT_LINEAR_GAIN_M_S,
+                        min_cmd=ACT_MIN_EFFECTIVE_CMD, q=ACT_CMD_QUANTUM):
+    """원하는 (m/s, rad/s) → 로봇에 보낼 정규화 명령. 반환 (linear_cmd, angular_cmd, accum).
+    angular_cmd는 항상 0 또는 |값| ≥ min_cmd인 q의 정수배(펌웨어가 그대로 받는 값)."""
+    linear_cmd = linear_mps / lin_gain
+    need = angular_rad_s / ang_gain
+    v = need + accum
+    if abs(v) < min_cmd / 2.0:
+        sent = 0.0
+    elif abs(v) < min_cmd:
+        sent = math.copysign(min_cmd, v)
+    else:
+        sent = math.copysign(round(round(abs(v) / q, 6)) * q, v)
+    sent = round(sent, 4)
+    accum = float(np.clip(accum + (need - sent), -min_cmd, min_cmd))
+    return linear_cmd, sent, accum
+
 # 2026-10-11 추가 (오늘 로그 3995틱 전수 분석): 모델이 같은 크기의 회전 요구에 대해
 # 우회전을 좌회전의 41%(요구 10~30°)/72%(30~60°) 세기로만 출력하는 비대칭이 실측됨.
 # 모델 출력이 음수(우회전)일 때만 곱해서 좌우 조향 권한을 맞추는 보정 — 실측 기준
@@ -660,6 +701,7 @@ class OmniVLAEdgeDeployment:
                  angular_trim=DEFAULT_ANGULAR_TRIM,
                  angular_quantum=DEFAULT_ANGULAR_QUANTUM,
                  enable_angular_dither=DEFAULT_ENABLE_ANGULAR_DITHER,
+                 enable_actuation_calibration=DEFAULT_ENABLE_ACTUATION_CALIBRATION,
                  angular_right_gain=DEFAULT_ANGULAR_RIGHT_GAIN,
                  straight_force_zero=DEFAULT_STRAIGHT_FORCE_ZERO,
                  heading_anchor_pull_threshold_deg=DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG,
@@ -787,6 +829,16 @@ class OmniVLAEdgeDeployment:
         self.angular_quantum = angular_quantum
         self.enable_angular_dither = enable_angular_dither
         self._angular_dither_accum = 0.0
+        self.enable_actuation_calibration = enable_actuation_calibration
+        self._act_cal_accum = 0.0
+        if enable_actuation_calibration:
+            if enable_angular_dither:
+                print("[deploy] ⚠ --enable_actuation_calibration이 켜져 있어 "
+                      "--enable_angular_dither는 무시됩니다(보정이 deadband/양자화를 직접 처리).")
+            if angular_trim != 0.0 or angular_right_gain != 1.0:
+                print(f"[deploy] ⚠ 명령 변환 보정과 트림({angular_trim})/우회전 게인"
+                      f"({angular_right_gain})을 같이 쓰고 있음 — 둘 다 보정 없는 명령 단위 기준으로 "
+                      f"만든 값이라 보통 0.0 / 1.0으로 두는 게 맞음.")
         self.angular_right_gain = angular_right_gain
         self.straight_force_zero = straight_force_zero
         self.heading_anchor_pull_threshold_deg = heading_anchor_pull_threshold_deg
@@ -934,6 +986,10 @@ class OmniVLAEdgeDeployment:
             "angular_trim": self.angular_trim,
             "angular_quantum": self.angular_quantum,
             "enable_angular_dither": self.enable_angular_dither,
+            "enable_actuation_calibration": self.enable_actuation_calibration,
+            "act_angular_gain_rad_s": ACT_ANGULAR_GAIN_RAD_S,
+            "act_linear_gain_m_s": ACT_LINEAR_GAIN_M_S,
+            "act_min_effective_cmd": ACT_MIN_EFFECTIVE_CMD,
             "angular_right_gain": self.angular_right_gain,
             "straight_force_zero": self.straight_force_zero,
             "heading_anchor_pull_threshold_deg": self.heading_anchor_pull_threshold_deg,
@@ -1881,7 +1937,17 @@ class OmniVLAEdgeDeployment:
         # "멈춰라"는 명령이 디더링으로 흔들리면 안 되고, 정지 구간의 잔차를 재출발 때
         # 끌고 가서 엉뚱한 조향이 나오는 것도 막기 위함.
         record["angular_desired"] = angular
-        if self.enable_angular_dither and self.angular_quantum > 0 and abs(linear) > 1e-6:
+        if self.enable_actuation_calibration:
+            # 2026-11-01: 명령 변환 보정(ACT_* 상수 설명 참고). 기존 디더링 대체.
+            record["linear_desired_mps"] = linear
+            if abs(linear) > 1e-6:
+                linear, angular, self._act_cal_accum = actuation_calibrate(
+                    linear, angular, self._act_cal_accum)
+            else:
+                # 안전 정지는 진짜 (0,0) — 누적 잔차도 버림(재출발 시 엉뚱한 조향 방지).
+                linear, angular, self._act_cal_accum = 0.0, 0.0, 0.0
+            record["act_cal_accum"] = self._act_cal_accum
+        elif self.enable_angular_dither and self.angular_quantum > 0 and abs(linear) > 1e-6:
             q = self.angular_quantum
             # round()로 부동소수 표현오차를 먼저 제거한 뒤 truncate — 안 하면 -0.06이
             # -0.059999...로 저장돼 있어 한 단계 손실되는 경우가 생김.
@@ -2203,6 +2269,12 @@ if __name__ == "__main__":
                         f"다음 tick으로 넘겨 인접 두 단계를 섞어 보내서, 시간평균이 요청값에 "
                         f"수렴함(예: --angular_trim -0.055가 실제로 평균 -0.055로 실현됨). "
                         f"안전 정지(linear=0)엔 미적용 + 잔차 리셋.")
+    p.add_argument("--enable_actuation_calibration", action="store_true",
+                   help="명령 변환 보정(2026-11-01 실내 실측 기반, 기본 꺼짐): 모델이 원하는 "
+                        "m/s·rad/s를 실측 게인(linear ×1/1.2, angular ×1/1.66)으로 변환하고, "
+                        "|angular|≤0.05 반응 없음 구간은 0과 ±0.06을 시간 비율로 섞어 보상. "
+                        "--enable_angular_dither를 대체함. 보통 --angular_trim 0, "
+                        "--angular_right_gain 1.0(기본값)과 함께 쓸 것. ⚠ 실외 게인 미검증.")
     p.add_argument("--angular_quantum", type=float, default=DEFAULT_ANGULAR_QUANTUM,
                    help=f"위 디더링이 가정하는 로봇 측 angular 양자화 단위 (기본 "
                         f"{DEFAULT_ANGULAR_QUANTUM}, 실측 근거는 --enable_angular_dither 설명 참고). "
@@ -2337,6 +2409,7 @@ if __name__ == "__main__":
         angular_trim=args.angular_trim,
         angular_quantum=args.angular_quantum,
         enable_angular_dither=args.enable_angular_dither,
+        enable_actuation_calibration=args.enable_actuation_calibration,
         angular_right_gain=args.angular_right_gain,
         straight_force_zero=args.straight_force_zero,
         heading_anchor_pull_threshold_deg=args.heading_anchor_pull_threshold_deg,

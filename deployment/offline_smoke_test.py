@@ -138,7 +138,7 @@ def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto
                    gps_freeze_min_disp_m=dep.DEFAULT_GPS_FREEZE_MIN_DISP_M,
                    gps_freeze_persist_ticks=dep.DEFAULT_GPS_FREEZE_PERSIST_TICKS,
                    gps_freeze_speed_threshold_mps=dep.DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS,
-                   observe_only=False):
+                   observe_only=False, enable_actuation_calibration=False):
     # near_goal_override_dist_m/enable_off_route_safety/enable_straight_segment_override/
     # enable_gps_freeze_guard 기본값을 전부 꺼진 상태로 둠 -- 대부분의 기존 테스트는 이
     # 기능들과 무관한 걸 검증하는 거라, 운영 기본값(near_goal_override_dist_m/
@@ -169,6 +169,7 @@ def make_deployer(fake_get, fake_post, dry_run_lock, n_ticks, heading_mode="auto
         gps_freeze_persist_ticks=gps_freeze_persist_ticks,
         gps_freeze_speed_threshold_mps=gps_freeze_speed_threshold_mps,
         observe_only=observe_only,
+        enable_actuation_calibration=enable_actuation_calibration,
     )
     tick_count = [0]
     real_step = deployer.step
@@ -839,6 +840,66 @@ def test_k_observe_only():
           f"모델 예측 기록 {len(preds)}틱")
 
 
+# ── test L: 명령 변환 보정(2026-11-01) ──────────────────────────────────────
+def test_l_actuation_calibration():
+    """(1) 순수 함수: 원하는 yaw rate 상수 입력 시 보낸 명령 × 게인의 시간평균이 원하는
+    값에 수렴하는지, 보낸 명령이 항상 0 또는 |값|≥0.06인 0.01 정수배인지(deadband 안
+    값을 절대 안 보냄). (2) 실제 루프: 플래그 켜고 돌렸을 때 /control로 나간 angular가
+    전부 허용 집합에 들어가는지, run_start에 게인이 기록되는지."""
+    print("\n========== test_l_actuation_calibration ==========")
+    G = dep.ACT_ANGULAR_GAIN_RAD_S
+    for want in (0.0, 0.01, -0.03, 0.05, -0.08, 0.12, -0.25):
+        acc, sent_hist = 0.0, []
+        for _ in range(90):
+            lin, a, acc = dep.actuation_calibrate(0.3, want, acc)
+            sent_hist.append(a)
+        bad = [a for a in sent_hist if a != 0.0 and (abs(a) < 0.06 - 1e-9
+                                                     or abs(round(a / 0.01) * 0.01 - a) > 1e-9)]
+        assert not bad, f"want={want}: deadband 안/양자화 어긋난 값 전송 {bad[:3]}"
+        mean_w = sum(sent_hist) / len(sent_hist) * G
+        assert abs(mean_w - want) < 0.004, f"want={want} rad/s, 실현 평균 {mean_w:.4f}"
+        assert abs(lin - 0.3 / dep.ACT_LINEAR_GAIN_M_S) < 1e-9
+        print(f"[OK] 원하는 {want:+.3f} rad/s → 실현 평균 {mean_w:+.4f}, "
+              f"사용 단계 {sorted(set(sent_hist))}")
+
+    camera_frames = _load_camera_frames() * 3
+    n_ticks = 12
+    gps_sequence = [_base_gps(BASE_LAT - i * 0.00003, BASE_LON - i * 0.000015)
+                    for i in range(n_ticks + 2)]
+    fake_get, fake_post, call_state = build_fake_requests(camera_frames, gps_sequence)
+    with mock.patch("requests.get", side_effect=fake_get), \
+         mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=False, n_ticks=n_ticks,
+                                 enable_actuation_calibration=True)
+        real_step = deployer.step
+        cnt = [0]
+
+        def wrapped():
+            if cnt[0] == 3:
+                deployer._pending_commands.put("confirm_alignment")
+            if cnt[0] == 4:
+                deployer._pending_commands.put("arm")
+            if cnt[0] == 5:
+                deployer._pending_commands.put("go_live")
+            cnt[0] += 1
+            return real_step()
+
+        deployer.step = wrapped
+        deployer.run()
+    sent = call_state["control_calls"]
+    nonzero = [(l, a) for l, a in sent if (l, a) != (0.0, 0.0)]
+    assert nonzero, "LIVE 이후 non-zero 명령이 하나도 안 나감 — 테스트 시나리오 확인 필요"
+    bad = [a for _, a in sent if a != 0.0 and abs(a) < 0.06 - 1e-9]
+    assert not bad, f"deadband 안 angular가 실제 전송됨: {bad[:5]}"
+    print(f"[OK] 실제 루프 /control {len(sent)}개(non-zero {len(nonzero)}) — angular 전부 0 또는 |a|≥0.06")
+    logs = _read_jsonl(deployer.log_path)
+    rs = [l for l in logs if l.get("type") == "run_start"][0]
+    cfg = rs.get("config", rs)
+    flat = json.dumps(rs)
+    assert '"enable_actuation_calibration": true' in flat and "act_angular_gain_rad_s" in flat
+    print("[OK] run_start에 enable_actuation_calibration=True와 게인 상수 기록됨")
+
+
 if __name__ == "__main__":
     test_a_dry_run_lock()
     test_b_full_workflow()
@@ -851,4 +912,5 @@ if __name__ == "__main__":
     test_i_gps_freeze_guard()
     test_j_network_retry()
     test_k_observe_only()
+    test_l_actuation_calibration()
     print("\n모든 오프라인 스모크 테스트 통과.")
