@@ -261,6 +261,29 @@ DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS = 0.15
 # rad/s)은 GPS 살아있는 구간에서 보정.
 DEFAULT_ENABLE_ROUTE_DEAD_RECKONING = False
 
+# 2026-11-01 버그수정: dead reckoning이 frodobot_raw["speed"]를 m/s로 그대로 적분하고
+# 있었는데, speed 필드는 m/s가 아니라 바퀴 rpm에 비례하는 값(speed = 0.0170 × rpm,
+# r=0.997)임. 실주행 70 run에서 15~30초 직진 구간의 GPS 거리 vs 바퀴 회전수로 실측한
+# 거리 스케일은 0.33 m/rev(바퀴 반경 ≈5.3cm, 상관 0.74~0.82) → 실제 m/s ≈ speed × 0.32.
+# 즉 기존 DR은 동결 중 전진거리를 ~3배 과대 추정했음(docs/1011.md의 "linear=0.3에서
+# 실측 0.11~0.20 m/s, speed 필드는 0.3~1.1"과도 비율 일치).
+# 근거: deployment/analysis/imu_gps_fusion_replay.py audit
+#       → deployment/analysis/results/fusion_replay_20261101/audit_summary.json
+# rpm 샘플이 있으면 rpm(좌우 4채널 |값| 평균)으로, 없으면 speed × 환산계수로 계산.
+WHEEL_M_PER_REV = 0.329
+SPEED_FIELD_TO_MPS = WHEEL_M_PER_REV / 60.0 / 0.01696   # ≈ 0.323
+
+
+def wheel_speed_mps(raw_data):
+    """frodobot_raw → 실제 전진 속도(m/s) 추정. 반환 (mps, source)."""
+    raw_data = raw_data or {}
+    rpms = [s for s in (raw_data.get("rpms") or [])
+            if isinstance(s, (list, tuple)) and len(s) >= 4]
+    if rpms:
+        mean_rpm = sum(abs(float(v)) for s in rpms for v in s[:4]) / (4 * len(rpms))
+        return mean_rpm / 60.0 * WHEEL_M_PER_REV, "rpm"
+    return float(raw_data.get("speed") or 0.0) * SPEED_FIELD_TO_MPS, "speed_field"
+
 # 2026-10-04 추가: SDK 서버 쪽 헤드리스 브라우저가 1~2초 내로 저절로 회복되는 일시적
 # hiccup(ReadTimeout, 빈 JSON 응답)을 오늘 여러 번 실측(deploy_20261004_123354/
 # 125728/131744.jsonl 등) — 지금까진 이런 일시적 실패도 전체 프로세스를 바로
@@ -1270,7 +1293,10 @@ class OmniVLAEdgeDeployment:
         dr_active = False
         advance_m = None
         if self.enable_route_dead_reckoning and self.map_builder._route_latlon is not None:
-            dr_speed_mps = float((raw_data or {}).get("speed") or 0.0)
+            # 2026-11-01: speed 필드는 m/s가 아님(WHEEL_M_PER_REV 설명 참고) — 환산해서 사용.
+            dr_speed_mps, dr_speed_source = wheel_speed_mps(raw_data)
+            record["dr_speed_mps"] = round(dr_speed_mps, 4)
+            record["dr_speed_source"] = dr_speed_source
             dr_now_ts = record["ts"]
             # dt는 매 tick(동결/비동결 무관) 갱신 — 적분이 연속되게. 긴 공백은 2초로 클램프.
             dr_dt_s = (max(0.0, min(dr_now_ts - self._dr_last_ts, 2.0))
