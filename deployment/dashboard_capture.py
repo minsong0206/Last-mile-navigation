@@ -104,10 +104,18 @@ class DashboardRecorder:
                 if ffmpeg_proc is None:
                     h, w = frame_bgr.shape[:2]
                     fps = 1.0 / self.interval_s
+                    # 2026-11-06: +faststart(moov를 파일 끝에 한 번에 씀)는 Ctrl+C 등으로
+                    # 프로세스가 중간에 죽으면 moov가 안 써져 파일 전체가 복구 불가로 깨짐
+                    # (실제로 20261106_173511/173644/174107 dashboard가 48바이트 껍데기로 소실).
+                    # → fragmented mp4(+frag_keyframe+empty_moov)로 전환: empty_moov를 시작에
+                    # 즉시 쓰고 프레임을 fragment 단위로 흘려보내므로, 중간에 죽어도 그 시점까지
+                    # 재생 가능. -g를 작게 줘서(키프레임=fragment 경계) 크래시 시 손실 구간을 줄임.
+                    # fMP4는 표준(DASH/HLS)이라 Notion/브라우저 재생에도 문제없음.
                     ffmpeg_proc = subprocess.Popen(
                         ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
                          "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
-                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "5",
+                         "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                          str(self.out_path)],
                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     )
