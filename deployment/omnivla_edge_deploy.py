@@ -2357,22 +2357,38 @@ class OmniVLAEdgeDeployment:
             self._log_jsonl({"type": "event", "ts": time.time(), "event": "run_end",
                               "reason": "keyboard_interrupt"})
         finally:
+            # 2026-11-07 변경: 종료 정리 순서를 "중요한 것 먼저 + 각 단계 격리"로 바꿈.
+            # 기존 버그: 대시보드 stop()을 먼저 부른 뒤 영상 컴파일을 했는데, stop()의
+            # join(최대 10초) 대기 중 사용자가 두 번째 Ctrl+C를 누르면 그 KeyboardInterrupt가
+            # finally를 통째로 빠져나가 compile_videos()가 아예 안 돌았음(run 20261107_143154에서
+            # context/map 영상이 안 생긴 원인). frames(ctx_*.jpg/map_*.png)는 매 틱 디스크에
+            # 저장돼 있으므로, 주행을 Ctrl+C로 멈춰도 "그때까지 분량"을 영상으로 남길 수 있다.
+            # (1) 가장 중요한 것 먼저: 저장된 frames를 영상으로 컴파일. 느리고 간혹 멈추는
+            #     대시보드 종료보다 앞에 두고, BaseException(두 번째 Ctrl+C 포함)까지 잡아
+            #     이 단계가 다른 정리를 막거나 통째로 날리지 않게 한다.
+            try:
+                print("[deploy] frames 영상 컴파일 중...")
+                video_results = self.replay_logger.compile_videos()
+                for label, (ok, info) in video_results.items():
+                    print(f"[deploy]   {label}: {info}" if ok
+                          else f"[deploy]   {label} 생략/실패: {info}")
+            except BaseException as e:
+                print(f"[deploy] frames 영상 컴파일 건너뜀: {type(e).__name__}: {e} "
+                      f"(frames는 남아있으니 process_field_run.py로 복구 가능)")
+            # (2) 대시보드 녹화 종료 — best-effort. fragmented mp4라 여기까지 찍힌 분량은
+            #     이미 재생 가능. stop()이 멈추거나 Ctrl+C가 또 들어와도 로그 닫기까지는 간다.
             if self._dashboard_recorder is not None:
-                print("[deploy] 대시보드 녹화 마무리 중 (최대 10초)...")
-                self._dashboard_recorder.stop()
-            # 2026-10-03 추가: logs/frames/<run_id>/의 ctx_*.jpg(카메라)/map_*.png(모델
-            # 입력 지도) 시퀀스를 각각 mp4로 컴파일 — 개별 파일 수백 장 대신 영상으로
-            # 훑어볼 수 있게. 제어 루프가 이미 끝난 뒤의 post-processing이라 안전하게
-            # 동기 호출(최대 각 60초, ReplayLogger.compile_videos() 자체 타임아웃).
-            print("[deploy] frames 영상 컴파일 중...")
-            video_results = self.replay_logger.compile_videos()
-            for label, (ok, info) in video_results.items():
-                if ok:
-                    print(f"[deploy]   {label}: {info}")
-                else:
-                    print(f"[deploy]   {label} 생략/실패: {info}")
-            print(f"[deploy] 로그 저장 완료: {self.log_path}")
-            self._log_fp.close()
+                try:
+                    print("[deploy] 대시보드 녹화 마무리 중 (최대 10초)...")
+                    self._dashboard_recorder.stop()
+                except BaseException as e:
+                    print(f"[deploy] 대시보드 종료 건너뜀: {type(e).__name__}: {e}")
+            # (3) 로그 파일 닫기 — 무슨 일이 있어도 마지막에.
+            try:
+                print(f"[deploy] 로그 저장 완료: {self.log_path}")
+                self._log_fp.close()
+            except BaseException:
+                pass
 
 
 if __name__ == "__main__":
