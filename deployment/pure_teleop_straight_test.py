@@ -66,6 +66,13 @@ def main():
     p.add_argument("--angular_quantum", type=float, default=0.01,
                    help="위 디더링이 가정하는 로봇 측 angular 양자화 단위 (기본 0.01, 실측값).")
     p.add_argument("--duration", type=float, default=15.0, help="주행 시간(초), 기본 15초")
+    p.add_argument("--pulse_on", type=int, default=0,
+                   help="펄스 모드(2026-11-06 추가): angular_bias를 N틱 보내고 --pulse_off틱은 0을 "
+                        "보내는 패턴을 반복. 0(기본)=끔(angular_bias 계속 전송). 실외에서 명령 변환 "
+                        "보정이 한 틱짜리 -0.06에는 바퀴가 거의 반응하지 않은 원인 확인용 — 켜고 "
+                        "끄는 길이별로 실제 회전량을 비교한다. 디더링과 같이 쓰면 디더링은 무시됨.")
+    p.add_argument("--pulse_off", type=int, default=0,
+                   help="펄스 모드에서 0을 보내는 틱 수 (--pulse_on과 같이 사용)")
     p.add_argument("--rate_hz", type=float, default=3.0, help="명령 전송 주기 (기본 3Hz, 배포 루프와 동일)")
     p.add_argument("--skip_gps", action="store_true",
                    help="실내 테스트용 — GPS fix가 없거나 불안정한 곳에서는 시작/종료 GPS 비교가 "
@@ -91,6 +98,7 @@ def main():
                "duration": args.duration, "rate_hz": args.rate_hz,
                "skip_gps": args.skip_gps,
                "enable_angular_dither": args.enable_angular_dither,
+               "pulse_on": args.pulse_on, "pulse_off": args.pulse_off,
                "angular_quantum": args.angular_quantum})
     print(f"[teleop_test] 로그 저장 경로: {log_path}")
 
@@ -130,7 +138,11 @@ def main():
             # 델타-시그마 디더링: 양자화 잔차를 다음 tick에 넘겨 인접 두 단계를 섞어
             # 보내면 시간평균이 요청값에 수렴한다 — 안 하면 요청값이 절삭돼 사라져서
             # 0.001 단위 트림 탐색이 아예 불가능함(--enable_angular_dither 설명 참고).
-            if args.enable_angular_dither and args.angular_quantum > 0:
+            pulse_period = args.pulse_on + args.pulse_off
+            if args.pulse_on > 0 and pulse_period > 0:
+                # 펄스 모드: 주기 앞 pulse_on틱만 angular_bias, 나머지는 0
+                angular_sent = args.angular_bias if (tick_id % pulse_period) < args.pulse_on else 0.0
+            elif args.enable_angular_dither and args.angular_quantum > 0:
                 q = args.angular_quantum
                 # round()로 부동소수 표현오차 제거 후 truncate — 안 하면 -0.06이
                 # -0.059999...로 저장돼 한 단계 손실됨.
@@ -158,7 +170,10 @@ def main():
                 # timestamp를 그대로 기록 — "서서히 휘었나 / 갑자기 꺾였나"를 자이로로,
                 # 이동거리를 rpm(0.329 m/rev)으로 사후 검증하기 위함. 샘플은 틱 간에
                 # 중복될 수 있으니 분석 시 timestamp(각 샘플 마지막 원소)로 중복 제거할 것.
-                for k in ("gyros", "rpms", "accels", "speed", "timestamp"):
+                # 2026-11-06: 배터리/전원 상태도 기록 — 실내외 바퀴 반응 차이가 로봇 상태
+                # (전압 등) 때문인지 가리기 위함.
+                for k in ("gyros", "rpms", "accels", "speed", "timestamp",
+                          "battery", "voltage", "current", "power", "signal_level"):
                     record[k] = data.get(k)
             except Exception as e:
                 record["telemetry_error"] = repr(e)
@@ -170,7 +185,8 @@ def main():
                        f"R{sum((r[1] + r[3]) / 2 for r in rp) / len(rp):5.1f}") if rp else "n/a"
             print(f"  t={elapsed:5.1f}s linear={args.linear:+.3f} angular={angular_sent:+.3f}"
                   f"(목표 {args.angular_bias:+.4f}) [/control {status}] "
-                  f"orientation={record.get('orientation_deg_raw')} gyro_z={gz_txt} rpm {rpm_txt}")
+                  f"orientation={record.get('orientation_deg_raw')} gyro_z={gz_txt} rpm {rpm_txt} "
+                  f"bat={record.get('battery')}% V={record.get('voltage')}")
             tick_id += 1
             sleep_s = period_s - (time.time() - tick_t0)
             if sleep_s > 0:

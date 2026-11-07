@@ -350,6 +350,112 @@ INITIAL_HEADING_LOOKAHEAD_M = 2.0
 ARM_TIMEOUT_S = 30.0
 
 
+# ── 2026-11-01 추가: 자이로 기반 heading 모드 (--heading_mode gyro) ──────────────
+# 배경(2026-11-06 실외, deploy_20261106_144422.jsonl): auto 모드는 로봇이 정지해 있어도
+# GPS가 제자리에서 1.1~1.4m 떠돌면 그걸 이동으로 착각해 heading을 -128°/0°/-52° 등으로
+# 덮어써서 지도가 기울어졌음. 정지 상태에서는 진짜 방향을 알려주는 센서가 없으므로
+# (나침반 오차 +11~+169°, GPS는 움직여야 방향이 나옴) 초기 heading은 "사람이 로봇을
+# 경로 방향으로 놓고 정렬 확인" 값으로 정하고, 이후는 자이로로 잰 상대 회전만 더한다.
+#   heading = 정렬 확인 시 경로 방향 + ∫(자이로 z − 정지 중 측정한 오프셋) dt
+# 근거(2026-11-01 실내 teleop, docs/1101_report.md): 자이로 z는 deg/s, 양수=좌회전(CCW,
+# ENU heading과 같은 부호). 직진 run 3회에서 자이로 적분 ±2° 이내, ±0.10/±0.20 회전에서
+# 원호 기하와 일치. rpm 좌우차 적분은 직진에서도 8~12° 누적(정수 rpm 양자화) → 자이로
+# 샘플이 빈 틱에서만 보조로 사용.
+# 바퀴가 안 돌 때(정지)는 heading을 적분하지 않고 오프셋만 갱신 → 정지 중 GPS 떠돌기·
+# 자이로 오프셋 어느 쪽도 지도를 돌리지 못함.
+GYRO_HEADING_STATIONARY_RPM = 1.0      # 좌우 평균 |rpm|이 이 미만이면 정지로 간주
+GYRO_HEADING_BIAS_ALPHA = 0.05         # 정지 중 오프셋 EMA 계수(틱당)
+GYRO_HEADING_HOLD_S = 1.0              # 새 자이로 샘플이 없을 때 직전 회전속도를 유지할 최대 시간
+GYRO_HEADING_RPM_TRACK_W_M = 0.32      # rpm 좌우차 → yaw rate 변환용 유효 윤거(실내 실측 근사)
+DEFAULT_GYRO_HEADING_GPS_GAIN = 0.0    # GPS 진행방향 보정 계수(틱당). 기본 0 = 끔(자이로만)
+GYRO_HEADING_GPS_MIN_PATH_M = 1.5      # GPS 보정은 이만큼 실제 이동이 쌓인 뒤에만
+
+
+class GyroHeadingTracker:
+    """정렬 확인 heading + 자이로 적분. 순수 로직(네트워크/모델 없음)이라 단독 테스트 가능."""
+
+    def __init__(self, gps_gain=DEFAULT_GYRO_HEADING_GPS_GAIN):
+        self.gps_gain = gps_gain
+        self.heading_rad = None
+        self.bias_deg_s = None
+        self._seen = deque(maxlen=400)
+        self._seen_set = set()
+        self._last_ts = None
+        self._last_rate_deg_s = None
+        self._last_rate_ts = None
+
+    def reset(self, heading_rad):
+        """정렬 확인 시 호출: 경로 방향을 초기 heading으로. 오프셋 추정은 유지."""
+        self.heading_rad = heading_rad
+        self._last_rate_deg_s = None
+        self._last_rate_ts = None
+
+    def _new_gyro_z(self, raw_data):
+        out = []
+        for g in (raw_data or {}).get("gyros") or []:
+            if not isinstance(g, (list, tuple)) or len(g) < 4:
+                continue
+            key = round(float(g[3]), 4)
+            if key in self._seen_set:
+                continue
+            if len(self._seen) == self._seen.maxlen:
+                self._seen_set.discard(self._seen[0])
+            self._seen.append(key)
+            self._seen_set.add(key)
+            out.append(float(g[2]))
+        return out
+
+    @staticmethod
+    def _wheel_speeds(raw_data):
+        rp = [r for r in (raw_data or {}).get("rpms") or []
+              if isinstance(r, (list, tuple)) and len(r) >= 4]
+        if not rp:
+            return None, None
+        left = sum((r[0] + r[2]) / 2.0 for r in rp) / len(rp)
+        right = sum((r[1] + r[3]) / 2.0 for r in rp) / len(rp)
+        return left, right
+
+    def update(self, raw_data, ts, gps_heading_rad=None, gps_path_m=0.0, gps_frozen=False):
+        """한 틱 갱신. 반환: 진단 dict(rate_deg_s, rate_src, moving, bias_deg_s, gps_applied)."""
+        dt = 0.0 if self._last_ts is None else max(0.0, min(ts - self._last_ts, 2.0))
+        self._last_ts = ts
+        zs = self._new_gyro_z(raw_data)
+        raw_rate = sum(zs) / len(zs) if zs else None
+        left, right = self._wheel_speeds(raw_data)
+        moving = (left is not None
+                  and (abs(left) + abs(right)) / 2.0 >= GYRO_HEADING_STATIONARY_RPM)
+        diag = {"moving": moving, "rate_deg_s": 0.0, "rate_src": "stationary", "gps_applied": False}
+        if not moving:
+            if raw_rate is not None:
+                self.bias_deg_s = (raw_rate if self.bias_deg_s is None else
+                                   (1 - GYRO_HEADING_BIAS_ALPHA) * self.bias_deg_s
+                                   + GYRO_HEADING_BIAS_ALPHA * raw_rate)
+            rate = 0.0
+        else:
+            bias = self.bias_deg_s or 0.0
+            if raw_rate is not None:
+                rate, src = raw_rate - bias, "gyro"
+                self._last_rate_deg_s, self._last_rate_ts = rate, ts
+            elif (self._last_rate_deg_s is not None and self._last_rate_ts is not None
+                  and ts - self._last_rate_ts <= GYRO_HEADING_HOLD_S):
+                rate, src = self._last_rate_deg_s, "gyro_hold"
+            else:
+                v_l = left / 60.0 * WHEEL_M_PER_REV
+                v_r = right / 60.0 * WHEEL_M_PER_REV
+                rate, src = math.degrees((v_r - v_l) / GYRO_HEADING_RPM_TRACK_W_M), "rpm"
+            diag["rate_deg_s"], diag["rate_src"] = rate, src
+        if self.heading_rad is not None:
+            self.heading_rad += math.radians(rate) * dt
+            if (self.gps_gain > 0 and moving and gps_heading_rad is not None
+                    and gps_path_m >= GYRO_HEADING_GPS_MIN_PATH_M and not gps_frozen):
+                err = (gps_heading_rad - self.heading_rad + math.pi) % (2 * math.pi) - math.pi
+                self.heading_rad += self.gps_gain * err
+                diag["gps_applied"] = True
+            self.heading_rad = (self.heading_rad + math.pi) % (2 * math.pi) - math.pi
+        diag["bias_deg_s"] = self.bias_deg_s
+        return diag
+
+
 def estimate_yaw_delta_from_gyro(raw_data, dt_s):
     """자이로 수직축(z, gravity와 같은 축 — accels z≈1g로 확인됨) 평균 각속도로
     dt_s 동안의 heading 변화량(rad)을 추정. USE_GYRO_FUSION 실험 전용, 검증 전."""
@@ -495,22 +601,88 @@ ACT_CMD_QUANTUM = 0.01          # 펌웨어 절삭 단위(DEFAULT_ANGULAR_QUANTU
 DEFAULT_ENABLE_ACTUATION_CALIBRATION = False
 
 
+DEFAULT_ACT_MIN_HOLD_TICKS = 1
+
+# ── 2026-11-06 추가: 실외용 "오프셋" 변환 방식 (--actuation_mode offset) ──────────
+# 실외 보도블록 실측(deployment/logs/1106_test, 계속 보내기 −0.05~−0.15):
+#   회전 속도 ≈ 57°/s × (|명령| − 0.056)  → 문턱 약 0.056부터 서서히 비례 증가
+#   (실내처럼 0.06에서 4.5°/s로 점프하지 않음; 같은 명령이면 실내의 약 1/3).
+# 공중 테스트(154031/154044)에서 −0.06의 좌우 rpm 차이는 실내 바닥과 같은 +12% →
+# 펌웨어·명령 전달은 정상이고, 실외 바닥의 회전 저항(스키드 스티어)이 바퀴 차이를
+# +4%로 눌러서 생긴 문제. 그래서 0과 ±0.06을 섞는 pwm 방식은 실외에서 거의 무효.
+# offset 방식: 보낼 명령 = 부호 × (문턱 + |원하는 회전| ÷ 기울기)를 계속 보냄
+# (deadband 역보상). 원하는 회전이 아주 작으면 0을 보내 직진 중 좌우 떨림 방지.
+# 문턱/기울기는 run 간 편차(±2°/s)가 커서 대략값 — CLI로 조정 가능.
+ACT_OFFSET_CMD = 0.056            # 실외 반응 시작 명령(문턱)
+ACT_OFFSET_GAIN_RAD_S = 1.0       # 문턱 이후 명령 1.0당 회전 속도(rad/s), 57°/s ≈ 1.0 rad/s
+ACT_OFFSET_MIN_RAD_S = 0.005      # 이보다 작은 회전 요청은 0 (≈0.3°/s)
+ACT_OFFSET_MAX_CMD = 0.40
+DEFAULT_ACTUATION_MODE = "pwm"
+
+
+def actuation_offset(linear_mps, angular_rad_s, accum,
+                     offset=ACT_OFFSET_CMD, gain=ACT_OFFSET_GAIN_RAD_S,
+                     min_rad_s=ACT_OFFSET_MIN_RAD_S, lin_gain=ACT_LINEAR_GAIN_M_S,
+                     q=ACT_CMD_QUANTUM, max_cmd=ACT_OFFSET_MAX_CMD):
+    """실외용 deadband 역보상. 반환 (linear_cmd, angular_cmd, accum).
+    0.01 단위 절삭을 피하려고 인접 두 단계를 섞는 디더링(accum)을 쓰되, 두 단계 모두
+    문턱 이상이라 바퀴는 계속 갈린 상태를 유지함(한 틱 펄스 문제 없음)."""
+    linear_cmd = linear_mps / lin_gain
+    if abs(angular_rad_s) < min_rad_s:
+        return linear_cmd, 0.0, 0.0
+    target = math.copysign(min(offset + abs(angular_rad_s) / gain, max_cmd), angular_rad_s)
+    v = target + accum
+    sent = math.trunc(round(v / q, 6)) * q
+    if abs(sent) < offset - 1e-9:          # 절삭으로 문턱 아래로 떨어지면 한 단계 올림
+        sent = math.copysign(math.ceil(round(offset / q, 6)) * q, target)
+    sent = round(sent, 4)
+    accum = float(np.clip(accum + (target - sent), -2 * q, 2 * q))
+    return linear_cmd, sent, accum
+
+
 def actuation_calibrate(linear_mps, angular_rad_s, accum,
                         ang_gain=ACT_ANGULAR_GAIN_RAD_S, lin_gain=ACT_LINEAR_GAIN_M_S,
-                        min_cmd=ACT_MIN_EFFECTIVE_CMD, q=ACT_CMD_QUANTUM):
+                        min_cmd=ACT_MIN_EFFECTIVE_CMD, q=ACT_CMD_QUANTUM,
+                        min_hold_ticks=1, hold_state=None):
     """원하는 (m/s, rad/s) → 로봇에 보낼 정규화 명령. 반환 (linear_cmd, angular_cmd, accum).
-    angular_cmd는 항상 0 또는 |값| ≥ min_cmd인 q의 정수배(펌웨어가 그대로 받는 값)."""
+    angular_cmd는 항상 0 또는 |값| ≥ min_cmd인 q의 정수배(펌웨어가 그대로 받는 값).
+
+    2026-11-06 추가 (실외 실측, deploy_20261106_151546.jsonl): 한 틱(약 0.47초)짜리
+    ±0.06 펄스 21개 뒤에 좌우 바퀴 rpm 차이가 거의 생기지 않음(기준 대비 +0.00~+0.03,
+    지속 명령 시 실내 +0.11) → 로봇이 짧은 명령 변화에는 반응하지 않음. min_hold_ticks>1이면
+    deadband 보상으로 ±min_cmd를 한 번 켜면 그 틱 수만큼 연속 유지하고(hold_state에
+    남은 틱/부호 저장), 그만큼 덜 자주 켜서 평균 회전량은 같게 맞춘다(누적기 범위를
+    hold 길이만큼 넓혀 정보 손실 방지). 반대 방향으로 min_cmd/2 이상 요청이 오면 유지를
+    끊는다. hold_state=None 또는 min_hold_ticks=1이면 기존 동작과 완전히 같음."""
     linear_cmd = linear_mps / lin_gain
     need = angular_rad_s / ang_gain
+    hold = max(1, int(min_hold_ticks))
     v = need + accum
+    if hold > 1 and hold_state is not None and hold_state.get("left", 0) > 0:
+        sign = hold_state["sign"]
+        if need * sign < 0 and abs(need) >= min_cmd / 2.0:
+            hold_state["left"] = 0          # 반대 방향 요청 → 유지 중단
+        else:
+            hold_state["left"] -= 1
+            if abs(v) >= min_cmd and v * sign > 0:
+                sent = math.copysign(round(round(abs(v) / q, 6)) * q, v)
+            else:
+                sent = math.copysign(min_cmd, sign)
+            sent = round(sent, 4)
+            lim = min_cmd * hold
+            accum = float(np.clip(accum + (need - sent), -lim, lim))
+            return linear_cmd, sent, accum
     if abs(v) < min_cmd / 2.0:
         sent = 0.0
     elif abs(v) < min_cmd:
         sent = math.copysign(min_cmd, v)
+        if hold > 1 and hold_state is not None:
+            hold_state["left"], hold_state["sign"] = hold - 1, (1 if v > 0 else -1)
     else:
         sent = math.copysign(round(round(abs(v) / q, 6)) * q, v)
     sent = round(sent, 4)
-    accum = float(np.clip(accum + (need - sent), -min_cmd, min_cmd))
+    lim = min_cmd * hold
+    accum = float(np.clip(accum + (need - sent), -lim, lim))
     return linear_cmd, sent, accum
 
 # 2026-10-11 추가 (오늘 로그 3995틱 전수 분석): 모델이 같은 크기의 회전 요구에 대해
@@ -686,6 +858,7 @@ def route_bearing_to_control(route_bearing_rad, map_heading_rad, target_time_s,
 class OmniVLAEdgeDeployment:
     def __init__(self, ckpt_path, map_range_m, goal_lat, goal_lon, device=None,
                  debug_port=8080, dry_run=False, heading_mode="auto",
+                 gyro_heading_gps_gain=DEFAULT_GYRO_HEADING_GPS_GAIN,
                  goal_reach_threshold_m=DEFAULT_GOAL_REACH_THRESHOLD_M,
                  initial_heading_lookahead_m=INITIAL_HEADING_LOOKAHEAD_M,
                  allow_reroute=False,
@@ -702,6 +875,10 @@ class OmniVLAEdgeDeployment:
                  angular_quantum=DEFAULT_ANGULAR_QUANTUM,
                  enable_angular_dither=DEFAULT_ENABLE_ANGULAR_DITHER,
                  enable_actuation_calibration=DEFAULT_ENABLE_ACTUATION_CALIBRATION,
+                 act_min_hold_ticks=DEFAULT_ACT_MIN_HOLD_TICKS,
+                 actuation_mode=DEFAULT_ACTUATION_MODE,
+                 act_offset_cmd=ACT_OFFSET_CMD, act_offset_gain=ACT_OFFSET_GAIN_RAD_S,
+                 act_offset_min_rad_s=ACT_OFFSET_MIN_RAD_S, act_linear_gain=ACT_LINEAR_GAIN_M_S,
                  angular_right_gain=DEFAULT_ANGULAR_RIGHT_GAIN,
                  straight_force_zero=DEFAULT_STRAIGHT_FORCE_ZERO,
                  heading_anchor_pull_threshold_deg=DEFAULT_HEADING_ANCHOR_PULL_THRESHOLD_DEG,
@@ -760,7 +937,8 @@ class OmniVLAEdgeDeployment:
         #     단점(사용자 확인 후 채택, 2026-10-04): 로봇이 실제로 경로를 벗어나도
         #     이 모드는 그걸 전혀 못 알아챔(지도가 항상 "경로 위에 있다"고 가정하고
         #     그려짐) — 지금처럼 짧고 통제된 테스트 구간에서만 쓰기로 함.
-        assert heading_mode in ("auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored"), \
+        assert heading_mode in ("auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored",
+                                "gyro"), \
             f"알 수 없는 heading_mode: {heading_mode!r}"
         self.heading_mode = heading_mode
 
@@ -831,6 +1009,14 @@ class OmniVLAEdgeDeployment:
         self._angular_dither_accum = 0.0
         self.enable_actuation_calibration = enable_actuation_calibration
         self._act_cal_accum = 0.0
+        self.act_min_hold_ticks = act_min_hold_ticks
+        self._act_cal_hold = {"left": 0, "sign": 0}
+        assert actuation_mode in ("pwm", "offset"), f"알 수 없는 actuation_mode: {actuation_mode!r}"
+        self.actuation_mode = actuation_mode
+        self.act_offset_cmd = act_offset_cmd
+        self.act_offset_gain = act_offset_gain
+        self.act_offset_min_rad_s = act_offset_min_rad_s
+        self.act_linear_gain = act_linear_gain
         if enable_actuation_calibration:
             if enable_angular_dither:
                 print("[deploy] ⚠ --enable_actuation_calibration이 켜져 있어 "
@@ -946,6 +1132,8 @@ class OmniVLAEdgeDeployment:
         # 실측 GPS course heading이 없을 때의 "최후 대안"으로만 쓰임.
         self._route_aligned_heading_rad = None
         self._route_aligned_confirmed_ts = None
+        # 2026-11-01: --heading_mode gyro 전용 (GyroHeadingTracker 설명 참고)
+        self._gyro_heading = GyroHeadingTracker(gps_gain=gyro_heading_gps_gain)
         self._last_lat, self._last_lon = None, None   # poll_frodobot()이 매 틱 갱신
         self._last_map_heading_source = None            # step()이 매 틱 갱신, run()의 heading-readiness 게이트가 읽음
 
@@ -973,6 +1161,7 @@ class OmniVLAEdgeDeployment:
             "initial_heading_lookahead_m": self.initial_heading_lookahead_m,
             "allow_reroute": self.allow_reroute,
             "heading_mode": self.heading_mode,
+            "gyro_heading_gps_gain": self._gyro_heading.gps_gain,
             "goal_reach_threshold_m": self.goal_reach_threshold_m,
             "near_goal_override_dist_m": self.near_goal_override_dist_m,
             "waypoint_target_step": self.waypoint_target_step,
@@ -990,6 +1179,10 @@ class OmniVLAEdgeDeployment:
             "act_angular_gain_rad_s": ACT_ANGULAR_GAIN_RAD_S,
             "act_linear_gain_m_s": ACT_LINEAR_GAIN_M_S,
             "act_min_effective_cmd": ACT_MIN_EFFECTIVE_CMD,
+            "act_min_hold_ticks": self.act_min_hold_ticks,
+            "actuation_mode": self.actuation_mode,
+            "act_offset_cmd": self.act_offset_cmd, "act_offset_gain": self.act_offset_gain,
+            "act_offset_min_rad_s": self.act_offset_min_rad_s, "act_linear_gain": self.act_linear_gain,
             "angular_right_gain": self.angular_right_gain,
             "straight_force_zero": self.straight_force_zero,
             "heading_anchor_pull_threshold_deg": self.heading_anchor_pull_threshold_deg,
@@ -1199,6 +1392,8 @@ class OmniVLAEdgeDeployment:
         self.past_track.clear()
         self._route_aligned_heading_rad = bearing
         self._route_aligned_confirmed_ts = time.time()
+        if self.heading_mode == "gyro":
+            self._gyro_heading.reset(bearing)
         deg = math.degrees(bearing)
         self.state.log(f"Route-aligned initial heading 확정: {deg:+.1f}° "
                         f"(lookahead={self.initial_heading_lookahead_m}m)"
@@ -1533,7 +1728,45 @@ class OmniVLAEdgeDeployment:
                 -self.cross_track_integral_max_m_s, self.cross_track_integral_max_m_s))
         record["cross_track_integral_m_s"] = self._cross_track_integral_m_s
 
-        if self.heading_mode == "route_bearing_anchored" and route_bearing_rad_now is not None:
+        gyro_diag = None
+        if self.heading_mode == "gyro":
+            # 정렬 확인 전에도 매 틱 갱신 — 정지 중 자이로 오프셋을 미리 추정해 두기 위함.
+            gyro_diag = self._gyro_heading.update(
+                raw_data, record["ts"], gps_heading_rad=gps_heading_rad,
+                gps_path_m=gps_accumulated_path_m, gps_frozen=self._gps_frozen_now)
+            record["gyro_rate_deg_s"] = round(gyro_diag["rate_deg_s"], 3)
+            record["gyro_rate_src"] = gyro_diag["rate_src"]
+            record["gyro_moving"] = gyro_diag["moving"]
+            record["gyro_bias_deg_s"] = (round(gyro_diag["bias_deg_s"], 3)
+                                         if gyro_diag["bias_deg_s"] is not None else None)
+        if self.heading_mode == "gyro" and self._gyro_heading.heading_rad is None:
+            # 2026-11-06 실외(deploy_20261106_145600.jsonl): 정렬 확인 전에는 gyro 모드도
+            # 기존 gps_track 분기로 떨어져, 정지 중 GPS 떠돌기로 지도가 다시 기울어졌음.
+            # 사용자가 "로봇을 경로 방향으로 놓는다"는 전제를 주므로, 경로가 생기는 즉시
+            # 경로 첫 구간 방향(정렬 확인과 같은 lookahead)으로 자동 초기화한다.
+            # 정렬 확인을 누르면 그 시점 값으로 다시 맞춰짐(_confirm_route_alignment).
+            init_bearing = self.map_builder.route_bearing_rad(
+                eff_lat, eff_lon, lookahead_m=self.initial_heading_lookahead_m)
+            if init_bearing is not None:
+                self._gyro_heading.reset(init_bearing)
+                self.state.log(f"gyro heading 자동 초기화: 경로 첫 구간 방향 "
+                                f"{math.degrees(init_bearing):+.1f}° (로봇이 이 방향을 보고 있다고 가정)")
+                self._log_jsonl({"type": "event", "ts": time.time(), "tick_id": tick_id,
+                                  "event": "gyro_heading_auto_init",
+                                  "heading_deg": math.degrees(init_bearing)})
+        if self.heading_mode == "gyro" and self._gyro_heading.heading_rad is not None:
+            # 2026-11-01 추가: --heading_mode gyro — 정렬 확인 heading + 자이로 적분
+            # (GyroHeadingTracker 설명 참고). gps_track/EMA/route_corrected 재동기화는
+            # 전부 건너뜀(source가 "gyro"라 아래 재동기화 조건에 안 걸림).
+            map_heading_rad = self._gyro_heading.heading_rad
+            smoothed_deg = math.degrees(map_heading_rad)
+            record["heading_diff_deg"] = None
+            record["smoothed_heading_deg"] = smoothed_deg
+            record["map_heading_source"] = "gyro_gps" if gyro_diag["gps_applied"] else "gyro"
+            print(f"    [heading] gyro 모드={smoothed_deg:+7.1f}°  회전속도={gyro_diag['rate_deg_s']:+6.2f}deg/s"
+                  f"({gyro_diag['rate_src']})  오프셋={record['gyro_bias_deg_s']}  "
+                  f"GPS궤적={record['gps_heading_deg']}(참고)")
+        elif self.heading_mode == "route_bearing_anchored" and route_bearing_rad_now is not None:
             # 2026-10-04 추가 (Harness 1 제안) — route_bearing을 기본값으로 매 tick
             # 그대로 쓰되(route_bearing 자체는 route 지오메트리 기반이라 안정적임이
             # 실측으로 확인됨, §1-9/1-10: 54틱 연속 완전히 고정됐었음), gps_track이
@@ -1941,11 +2174,20 @@ class OmniVLAEdgeDeployment:
             # 2026-11-01: 명령 변환 보정(ACT_* 상수 설명 참고). 기존 디더링 대체.
             record["linear_desired_mps"] = linear
             if abs(linear) > 1e-6:
-                linear, angular, self._act_cal_accum = actuation_calibrate(
-                    linear, angular, self._act_cal_accum)
+                if self.actuation_mode == "offset":
+                    linear, angular, self._act_cal_accum = actuation_offset(
+                        linear, angular, self._act_cal_accum,
+                        offset=self.act_offset_cmd, gain=self.act_offset_gain,
+                        min_rad_s=self.act_offset_min_rad_s, lin_gain=self.act_linear_gain)
+                else:
+                    linear, angular, self._act_cal_accum = actuation_calibrate(
+                        linear, angular, self._act_cal_accum, lin_gain=self.act_linear_gain,
+                        min_hold_ticks=self.act_min_hold_ticks, hold_state=self._act_cal_hold)
             else:
-                # 안전 정지는 진짜 (0,0) — 누적 잔차도 버림(재출발 시 엉뚱한 조향 방지).
+                # 안전 정지는 진짜 (0,0) — 누적 잔차·유지 상태도 버림(재출발 시 엉뚱한 조향 방지).
                 linear, angular, self._act_cal_accum = 0.0, 0.0, 0.0
+                self._act_cal_hold = {"left": 0, "sign": 0}
+            record["act_cal_hold_left"] = self._act_cal_hold["left"]
             record["act_cal_accum"] = self._act_cal_accum
         elif self.enable_angular_dither and self.angular_quantum > 0 and abs(linear) > 1e-6:
             q = self.angular_quantum
@@ -2171,7 +2413,7 @@ if __name__ == "__main__":
                         "--dry_run은 매 틱 (0,0)을 보내서 teleop을 덮어쓰므로 이 용도에 못 씀. "
                         "GO LIVE도 영구 잠금. ⚠ 이 프로세스는 로봇을 멈추지 않으니 정지는 teleop 쪽에서.")
     p.add_argument("--heading_mode", type=str, default="auto",
-                   choices=["auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored"],
+                   choices=["auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored", "gyro"],
                    help="auto(기본) = 정렬 확인은 실측 GPS heading이 잡히기 전까지의 "
                         "임시값일 뿐, 실측(gps_track)이 확보되면 자동으로 전환됨(기존 동작). "
                         "route_aligned_fixed = 정렬 확인으로 고정한 값을 런 내내 그대로 "
@@ -2186,7 +2428,14 @@ if __name__ == "__main__":
                         "gps_track이 --heading_anchor_pull_threshold_deg 이상 "
                         "--heading_anchor_pull_persist_ticks 연속으로 반박하면 그 tick만 "
                         "gps_track을 신뢰(Harness 1 제안, 2026-10-04) — route_bearing 단독보다 "
-                        "드리프트에 조금 더 반응함.")
+                        "드리프트에 조금 더 반응함. "
+                        "gyro(2026-11-01) = 정렬 확인 시 경로 방향에서 시작해 자이로로 잰 회전만 "
+                        "더함. 바퀴가 안 돌 때는 heading을 고정하고 자이로 오프셋만 측정 → 정지 중 "
+                        "GPS 떠돌기에 영향 없음. 로봇을 경로 첫 구간 방향으로 놓고 정렬 확인 필수.")
+    p.add_argument("--gyro_heading_gps_gain", type=float, default=DEFAULT_GYRO_HEADING_GPS_GAIN,
+                   help=f"heading_mode=gyro 전용: 바퀴가 돌고 GPS 이동이 {GYRO_HEADING_GPS_MIN_PATH_M}m "
+                        f"이상 쌓였을 때 GPS 진행방향으로 틱당 이 비율만큼 보정(기본 "
+                        f"{DEFAULT_GYRO_HEADING_GPS_GAIN} = 끔, 자이로만). 원거리 누적 오차용, 0.02~0.05 권장 범위.")
     p.add_argument("--goal_reach_threshold_m", type=float, default=DEFAULT_GOAL_REACH_THRESHOLD_M,
                    help=f"목표까지 이 거리(m) 이내로 들어오면 도착으로 간주하고 영구 정지 "
                         f"(기본 {DEFAULT_GOAL_REACH_THRESHOLD_M}m). 한 번 도착하면 다시 안 풀림.")
@@ -2275,6 +2524,22 @@ if __name__ == "__main__":
                         "|angular|≤0.05 반응 없음 구간은 0과 ±0.06을 시간 비율로 섞어 보상. "
                         "--enable_angular_dither를 대체함. 보통 --angular_trim 0, "
                         "--angular_right_gain 1.0(기본값)과 함께 쓸 것. ⚠ 실외 게인 미검증.")
+    p.add_argument("--actuation_mode", type=str, default=DEFAULT_ACTUATION_MODE, choices=["pwm", "offset"],
+                   help="명령 변환 보정 방식(--enable_actuation_calibration과 같이). pwm(기본) = 실내 실측 기반, "
+                        "0과 ±0.06을 시간 비율로 섞음. offset(2026-11-06, 실외 실측) = 부호 × (문턱 + "
+                        "|원하는 회전| ÷ 기울기)를 계속 보냄 — 실외 보도에서는 ±0.06 펄스가 거의 안 먹혀서 추가.")
+    p.add_argument("--act_offset_cmd", type=float, default=ACT_OFFSET_CMD,
+                   help=f"offset 방식: 실외 반응이 시작되는 명령(문턱, 기본 {ACT_OFFSET_CMD})")
+    p.add_argument("--act_offset_gain", type=float, default=ACT_OFFSET_GAIN_RAD_S,
+                   help=f"offset 방식: 문턱 이후 명령 1.0당 회전 속도 rad/s (기본 {ACT_OFFSET_GAIN_RAD_S}, ≈57°/s)")
+    p.add_argument("--act_offset_min_rad_s", type=float, default=ACT_OFFSET_MIN_RAD_S,
+                   help=f"offset 방식: 이보다 작은 회전 요청은 0으로 보냄 (기본 {ACT_OFFSET_MIN_RAD_S} rad/s ≈ 0.3°/s)")
+    p.add_argument("--act_linear_gain", type=float, default=ACT_LINEAR_GAIN_M_S,
+                   help=f"명령 변환 보정: linear 명령 1.0당 실제 속도 m/s (기본 {ACT_LINEAR_GAIN_M_S}, 실내 실측)")
+    p.add_argument("--act_min_hold_ticks", type=int, default=DEFAULT_ACT_MIN_HOLD_TICKS,
+                   help="명령 변환 보정 전용(2026-11-06): 반응 없음 구간 보상으로 ±0.06을 켜면 최소 이 "
+                        "틱 수만큼 연속 유지(대신 덜 자주 켬). 1(기본)=기존처럼 한 틱씩. 실외에서 한 틱짜리 "
+                        "펄스에는 바퀴가 거의 반응하지 않음이 확인됨 — 펄스 teleop 실험으로 값 결정.")
     p.add_argument("--angular_quantum", type=float, default=DEFAULT_ANGULAR_QUANTUM,
                    help=f"위 디더링이 가정하는 로봇 측 angular 양자화 단위 (기본 "
                         f"{DEFAULT_ANGULAR_QUANTUM}, 실측 근거는 --enable_angular_dither 설명 참고). "
@@ -2394,6 +2659,7 @@ if __name__ == "__main__":
         goal_lat=args.goal_lat, goal_lon=args.goal_lon,
         debug_port=args.debug_port, dry_run=args.dry_run,
         heading_mode=args.heading_mode,
+        gyro_heading_gps_gain=args.gyro_heading_gps_gain,
         goal_reach_threshold_m=args.goal_reach_threshold_m,
         initial_heading_lookahead_m=args.initial_heading_lookahead_m,
         allow_reroute=args.allow_reroute,
@@ -2410,6 +2676,10 @@ if __name__ == "__main__":
         angular_quantum=args.angular_quantum,
         enable_angular_dither=args.enable_angular_dither,
         enable_actuation_calibration=args.enable_actuation_calibration,
+        act_min_hold_ticks=args.act_min_hold_ticks,
+        actuation_mode=args.actuation_mode, act_offset_cmd=args.act_offset_cmd,
+        act_offset_gain=args.act_offset_gain, act_offset_min_rad_s=args.act_offset_min_rad_s,
+        act_linear_gain=args.act_linear_gain,
         angular_right_gain=args.angular_right_gain,
         straight_force_zero=args.straight_force_zero,
         heading_anchor_pull_threshold_deg=args.heading_anchor_pull_threshold_deg,

@@ -900,6 +900,78 @@ def test_l_actuation_calibration():
     print("[OK] run_start에 enable_actuation_calibration=True와 게인 상수 기록됨")
 
 
+# ── test M: 자이로 heading 모드(2026-11-01) ─────────────────────────────────
+def test_m_gyro_heading_mode():
+    """2026-11-06 실외 사고 재현: 로봇이 정지(rpm 0)해 있는데 GPS가 제자리에서 ~1.3m씩
+    떠돌면 auto 모드는 그걸 이동으로 착각해 heading을 덮어썼음. gyro 모드에서는
+    (1) 정렬 확인 후 정지 구간 내내 heading이 정렬값 그대로여야 하고(자이로 오프셋 0.2deg/s도
+    적분되면 안 됨), (2) 바퀴가 돌기 시작하면 자이로(오프셋 뺀 값)만큼 회전해야 함."""
+    print("\n========== test_m_gyro_heading_mode ==========")
+    import random
+    random.seed(0)
+    camera_frames = _load_camera_frames() * 3
+    n_still, n_move = 14, 8
+    seq, sample_ts = [], [1000.0]
+
+    def gyro_burst(z):
+        out = []
+        for _ in range(5):
+            sample_ts[0] += 0.02
+            out.append([0, 0, z, round(sample_ts[0], 3)])
+        sample_ts[0] += 0.25
+        return out
+
+    for i in range(n_still + 2):            # 정지: rpm 0, GPS ±~1.3m 떠돌기, 자이로 오프셋 0.2
+        g = _base_gps(BASE_LAT + random.uniform(-1.2e-5, 1.2e-5),
+                      BASE_LON + random.uniform(-1.5e-5, 1.5e-5))
+        g["speed"] = 0
+        g["rpms"] = [[0, 0, 0, 0, 0.0]] * 5
+        g["gyros"] = gyro_burst(0.2)
+        seq.append(g)
+    for i in range(n_move):                  # 주행: 좌회전 10 deg/s (+오프셋 0.2)
+        g = _base_gps(BASE_LAT - i * 0.00001, BASE_LON - i * 0.000005)
+        g["rpms"] = [[60, 60, 60, 60, 0.0]] * 5
+        g["gyros"] = gyro_burst(10.2)
+        seq.append(g)
+    fake_get, fake_post, call_state = build_fake_requests(camera_frames, seq)
+    with mock.patch("requests.get", side_effect=fake_get), \
+         mock.patch("requests.post", side_effect=fake_post):
+        deployer = make_deployer(fake_get, fake_post, dry_run_lock=True,
+                                 n_ticks=n_still + n_move, heading_mode="gyro")
+        real_step = deployer.step
+        cnt = [0]
+
+        def wrapped():
+            if cnt[0] == 3:
+                deployer._pending_commands.put("confirm_alignment")
+            cnt[0] += 1
+            return real_step()
+
+        deployer.step = wrapped
+        deployer.run()
+    logs = _read_jsonl(deployer.log_path)
+    align = [l for l in logs if l.get("event") == "route_alignment_confirmed"]
+    assert align, "정렬 확인이 처리되지 않음"
+    aligned_deg = align[0].get("route_aligned_heading_deg")
+    steps = [l for l in logs if l.get("type") == "step" and l.get("map_heading_source") in ("gyro", "gyro_gps")]
+    assert steps, "gyro 모드 heading이 한 번도 쓰이지 않음"
+    still = [l for l in steps if not l.get("gyro_moving")]
+    moving = [l for l in steps if l.get("gyro_moving")]
+    assert still and moving, f"정지/주행 틱 분리 실패 (정지 {len(still)}, 주행 {len(moving)})"
+    drift = max(abs((l["smoothed_heading_deg"] - aligned_deg + 180) % 360 - 180) for l in still)
+    assert drift < 0.01, f"정지 중 heading이 정렬값에서 {drift:.3f}° 움직임"
+    print(f"[OK] 정지 {len(still)}틱(GPS 떠돌기+자이로 오프셋) 동안 heading이 정렬값 {aligned_deg:+.1f}° 그대로")
+    bias = still[-1].get("gyro_bias_deg_s")
+    assert bias is not None and abs(bias - 0.2) < 0.05, f"자이로 오프셋 추정 이상: {bias}"
+    turned = (moving[-1]["smoothed_heading_deg"] - aligned_deg + 180) % 360 - 180
+    elapsed = moving[-1]["ts"] - still[-1]["ts"]
+    expected = 10.0 * elapsed
+    assert turned > 0 and abs(turned - expected) <= 0.35 * expected + 1.0, \
+        f"주행 중 회전량 {turned:.1f}° (예상 약 {expected:.1f}°)"
+    print(f"[OK] 오프셋 추정 {bias:.2f} deg/s, 주행 {len(moving)}틱 동안 좌회전 {turned:+.1f}° "
+          f"(예상 약 {expected:+.1f}°)")
+
+
 if __name__ == "__main__":
     test_a_dry_run_lock()
     test_b_full_workflow()
@@ -913,4 +985,5 @@ if __name__ == "__main__":
     test_j_network_retry()
     test_k_observe_only()
     test_l_actuation_calibration()
+    test_m_gyro_heading_mode()
     print("\n모든 오프라인 스모크 테스트 통과.")
