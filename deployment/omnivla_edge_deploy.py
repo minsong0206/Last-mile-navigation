@@ -96,6 +96,7 @@ sys.path.insert(0, str(REPO_ROOT / "third_party" / "omnivla" / "inference"))
 sys.path.insert(0, str(REPO_ROOT / "deployment"))
 from model_omnivla_edge_odom import OmniVLA_edge_odom
 from build_live_map import LiveMapBuilder
+from pose_filter import PoseFilter, gyro_z_deg_s
 from debug_web import DeploymentState, start_debug_server
 from replay_logger import ReplayLogger
 from dashboard_capture import DashboardRecorder
@@ -857,7 +858,7 @@ def route_bearing_to_control(route_bearing_rad, map_heading_rad, target_time_s,
 
 class OmniVLAEdgeDeployment:
     def __init__(self, ckpt_path, map_range_m, goal_lat, goal_lon, device=None,
-                 debug_port=8080, dry_run=False, heading_mode="auto",
+                 debug_port=8080, record_dashboard=True, dry_run=False, heading_mode="auto",
                  gyro_heading_gps_gain=DEFAULT_GYRO_HEADING_GPS_GAIN,
                  goal_reach_threshold_m=DEFAULT_GOAL_REACH_THRESHOLD_M,
                  initial_heading_lookahead_m=INITIAL_HEADING_LOOKAHEAD_M,
@@ -938,7 +939,7 @@ class OmniVLAEdgeDeployment:
         #     이 모드는 그걸 전혀 못 알아챔(지도가 항상 "경로 위에 있다"고 가정하고
         #     그려짐) — 지금처럼 짧고 통제된 테스트 구간에서만 쓰기로 함.
         assert heading_mode in ("auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored",
-                                "gyro"), \
+                                "gyro", "comp"), \
             f"알 수 없는 heading_mode: {heading_mode!r}"
         self.heading_mode = heading_mode
 
@@ -955,11 +956,18 @@ class OmniVLAEdgeDeployment:
             # 즉시)부터 run() 종료(finally)까지 전체를 동영상으로 녹화 — 주행 전체
             # 과정을 나중에 다시 볼 수 있게. 실패해도(Chrome 없음 등) best-effort라
             # 제어 루프에 영향 없음(DashboardRecorder 자체 안전설계 참고).
-            self._dashboard_recorder = DashboardRecorder(
-                debug_port, DASHBOARD_CAPTURE_DIR, run_id,
-                on_done=lambda p, n: self.state.log(f"대시보드 녹화 저장됨: {p} ({n}프레임)"),
-                on_error=lambda e: self.state.log_error(f"대시보드 녹화 실패(무시하고 계속): {e!r}"),
-            ).start()
+            # 2026-11-07: 녹화기(헤드리스 Chrome+ffmpeg)가 SDK pyppeteer와 CPU를
+            # 경합해 /control 송신이 최대 4초씩 지연되는 문제 확인(run 153516) →
+            # --no-record-dashboard면 라이브 대시보드(8080)는 그대로 켜두고 녹화만 끈다.
+            if record_dashboard:
+                self._dashboard_recorder = DashboardRecorder(
+                    debug_port, DASHBOARD_CAPTURE_DIR, run_id,
+                    on_done=lambda p, n: self.state.log(f"대시보드 녹화 저장됨: {p} ({n}프레임)"),
+                    on_error=lambda e: self.state.log_error(f"대시보드 녹화 실패(무시하고 계속): {e!r}"),
+                ).start()
+            else:
+                self.state.log("대시보드 녹화 비활성화(--no-record-dashboard): "
+                               "라이브 대시보드는 켜져 있음, mp4 녹화만 생략")
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = OmniVLA_edge_odom(**MODEL_PARAMS)
@@ -1134,6 +1142,12 @@ class OmniVLAEdgeDeployment:
         self._route_aligned_confirmed_ts = None
         # 2026-11-01: --heading_mode gyro 전용 (GyroHeadingTracker 설명 참고)
         self._gyro_heading = GyroHeadingTracker(gps_gain=gyro_heading_gps_gain)
+        # 2026-11-07: --heading_mode comp — 상보필터 pose(위치+heading) 추정(pose_filter.py).
+        # comp 모드에서만 활성(기본 off). 위치(eff_lat/eff_lon)와 heading을 둘 다 필터로 대체.
+        self._pose_filter = PoseFilter() if heading_mode == "comp" else None
+        self._pf_last_ts = None
+        self._pf_last_raw_latlon = None
+        self._comp_heading_rad = None
         self._last_lat, self._last_lon = None, None   # poll_frodobot()이 매 틱 갱신
         self._last_map_heading_source = None            # step()이 매 틱 갱신, run()의 heading-readiness 게이트가 읽음
 
@@ -1467,6 +1481,46 @@ class OmniVLAEdgeDeployment:
             self._armed_ts = None
             self.state.update(control_stage=self.control_stage, dry_run=True)
 
+    def _update_pose_filter(self, lat, lon, raw_data, record):
+        """--heading_mode comp 전용. 상보필터(PoseFilter)를 이번 틱 텔레메트리로 갱신하고
+        (eff_lat, eff_lon)을 반환. heading은 self._comp_heading_rad에 저장(heading 선택
+        체인이 읽음). 처음엔 경로 첫 세그먼트 방향으로 seed(gyro 자동초기화와 동일 전제).
+        route가 아직 없으면 seed 보류하고 raw 위치 유지."""
+        pf = self._pose_filter
+        now_ts = record["ts"]
+        dt_s = (max(0.0, min(now_ts - self._pf_last_ts, 2.0))
+                if self._pf_last_ts is not None else 0.0)
+        self._pf_last_ts = now_ts
+        # 새 GPS(raw 위치 변화) 여부 — 동결 중엔 None을 넘겨 예측만 함
+        fresh = self._pf_last_raw_latlon is None or (lat, lon) != self._pf_last_raw_latlon
+        self._pf_last_raw_latlon = (lat, lon)
+        gps_latlon = (lat, lon) if fresh else None
+        if not pf.initialized:
+            init_bearing = self.map_builder.route_bearing_rad(
+                lat, lon, lookahead_m=self.initial_heading_lookahead_m)
+            if init_bearing is None:
+                return lat, lon      # route 아직 없음 → raw 유지
+            pf.seed(lat, lon, init_bearing)
+            self.state.log(f"comp pose filter seed: 경로 첫 구간 방향 "
+                            f"{math.degrees(init_bearing):+.1f}° (로봇이 이 방향을 보고 있다고 가정)")
+            self._log_jsonl({"type": "event", "ts": time.time(),
+                              "event": "pose_filter_seed",
+                              "heading_deg": math.degrees(init_bearing)})
+        v_mps, _ = wheel_speed_mps(raw_data)
+        gz = gyro_z_deg_s(raw_data)
+        moving = v_mps > 0.03
+        f_lat, f_lon, f_th = pf.update(dt_s, v_mps, gz, moving, gps_latlon)
+        if f_th is not None:
+            self._comp_heading_rad = f_th
+        record["pose_filter_active"] = True
+        record["pf_v_mps"] = round(v_mps, 4)
+        record["pf_gyro_z_deg_s"] = (round(gz, 3) if gz is not None else None)
+        record["pf_gps_fresh"] = fresh
+        if f_lat is not None:
+            record["pf_lat"], record["pf_lon"] = f_lat, f_lon
+            return f_lat, f_lon
+        return lat, lon
+
     def build_inputs(self, lat, lon, heading_rad, tick_id=None):
         # 대시보드/로그용 디버그 필드 (2026-09-25 추가) — 0918 replay에서 heading과
         # route bearing 차이가 ~41°였던 것과 비교할 수 있게 매 틱 계산해둠.
@@ -1563,7 +1617,13 @@ class OmniVLAEdgeDeployment:
         eff_lat, eff_lon = lat, lon
         dr_active = False
         advance_m = None
-        if self.enable_route_dead_reckoning and self.map_builder._route_latlon is not None:
+        if self._pose_filter is not None:
+            # 2026-11-07: --heading_mode comp — 상보필터가 위치+heading을 함께 추정.
+            # route dead-reckoning(아래)을 대체함(둘 다 켤 일 없음). self._comp_heading_rad에
+            # heading을 저장하고 eff_lat/eff_lon을 필터 추정 위치로 바꾼다. 아직 seed 안 됐으면
+            # (route 없음) raw 유지.
+            eff_lat, eff_lon = self._update_pose_filter(lat, lon, raw_data, record)
+        elif self.enable_route_dead_reckoning and self.map_builder._route_latlon is not None:
             # 2026-11-01: speed 필드는 m/s가 아님(WHEEL_M_PER_REV 설명 참고) — 환산해서 사용.
             dr_speed_mps, dr_speed_source = wheel_speed_mps(raw_data)
             record["dr_speed_mps"] = round(dr_speed_mps, 4)
@@ -1754,7 +1814,17 @@ class OmniVLAEdgeDeployment:
                 self._log_jsonl({"type": "event", "ts": time.time(), "tick_id": tick_id,
                                   "event": "gyro_heading_auto_init",
                                   "heading_deg": math.degrees(init_bearing)})
-        if self.heading_mode == "gyro" and self._gyro_heading.heading_rad is not None:
+        if self.heading_mode == "comp" and self._comp_heading_rad is not None:
+            # 2026-11-07: --heading_mode comp — 상보필터가 eff 위치 블록에서 이미 갱신됨
+            # (위치는 eff_lat/eff_lon로, heading은 여기로). gps_track/gyro 재동기화는 전부 건너뜀.
+            map_heading_rad = self._comp_heading_rad
+            smoothed_deg = math.degrees(map_heading_rad)
+            record["heading_diff_deg"] = None
+            record["smoothed_heading_deg"] = smoothed_deg
+            record["map_heading_source"] = "comp"
+            print(f"    [heading] comp 모드={smoothed_deg:+7.1f}°  "
+                  f"GPS궤적={record['gps_heading_deg']}(참고)")
+        elif self.heading_mode == "gyro" and self._gyro_heading.heading_rad is not None:
             # 2026-11-01 추가: --heading_mode gyro — 정렬 확인 heading + 자이로 적분
             # (GyroHeadingTracker 설명 참고). gps_track/EMA/route_corrected 재동기화는
             # 전부 건너뜀(source가 "gyro"라 아래 재동기화 조건에 안 걸림).
@@ -2417,6 +2487,10 @@ if __name__ == "__main__":
     p.add_argument("--goal_lon", type=float, default=None)
     p.add_argument("--debug_port", type=int, default=8080,
                    help="모니터링 웹 대시보드 포트 (0이면 비활성화)")
+    p.add_argument("--record-dashboard", action=argparse.BooleanOptionalAction, default=True,
+                   help="대시보드를 헤드리스 Chrome으로 다시 띄워 mp4로 녹화(기본 켜짐). "
+                        "--no-record-dashboard면 라이브 대시보드(8080)는 유지하되 녹화기만 끈다 "
+                        "— 녹화기가 SDK와 CPU를 경합해 제어 송신이 지연되던 문제(run 153516) 회피용.")
     p.add_argument("--dry_run", action="store_true",
                    help="이 프로세스 전체에서 GO LIVE를 영구히 잠금(대시보드에서 눌러도 "
                         "거부됨) — 순수 관찰/검증 세션용. 플래그 없이 실행해도 항상 "
@@ -2429,7 +2503,7 @@ if __name__ == "__main__":
                         "--dry_run은 매 틱 (0,0)을 보내서 teleop을 덮어쓰므로 이 용도에 못 씀. "
                         "GO LIVE도 영구 잠금. ⚠ 이 프로세스는 로봇을 멈추지 않으니 정지는 teleop 쪽에서.")
     p.add_argument("--heading_mode", type=str, default="auto",
-                   choices=["auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored", "gyro"],
+                   choices=["auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored", "gyro", "comp"],
                    help="auto(기본) = 정렬 확인은 실측 GPS heading이 잡히기 전까지의 "
                         "임시값일 뿐, 실측(gps_track)이 확보되면 자동으로 전환됨(기존 동작). "
                         "route_aligned_fixed = 정렬 확인으로 고정한 값을 런 내내 그대로 "
@@ -2673,7 +2747,7 @@ if __name__ == "__main__":
     deployer = OmniVLAEdgeDeployment(
         ckpt_path=args.ckpt, map_range_m=args.map_range,
         goal_lat=args.goal_lat, goal_lon=args.goal_lon,
-        debug_port=args.debug_port, dry_run=args.dry_run,
+        debug_port=args.debug_port, record_dashboard=args.record_dashboard, dry_run=args.dry_run,
         heading_mode=args.heading_mode,
         gyro_heading_gps_gain=args.gyro_heading_gps_gain,
         goal_reach_threshold_m=args.goal_reach_threshold_m,

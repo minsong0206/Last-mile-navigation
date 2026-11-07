@@ -1,0 +1,61 @@
+{
+  "run_id": "20261106_145950",
+  "actuation_calibration": false,
+  "heading_mode": "gyro",
+  "route_mode": "direct",
+  "waypoint_target_step": 5,
+  "n_live_ticks": 59,
+  "n_turn_ticks": 0,
+  "response_lag_ticks": 1,
+  "corr_by_lag": {
+    "0": -0.382,
+    "1": -0.233,
+    "2": -0.287,
+    "3": -0.272,
+    "4": -0.305,
+    "5": -0.324,
+    "6": -0.301,
+    "7": -0.266,
+    "8": -0.28
+  },
+  "mean_speed_mps": 0.23717740112994354,
+  "overrides_seen": [],
+  "heading_sources": [
+    "gyro"
+  ],
+  "all": {
+    "segment": "all",
+    "n": 56,
+    "desired_mean_rad_s": 0.0018556401907364,
+    "actual_mean_rad_s": 0.004344373840964171,
+    "bias_actual_minus_desired": 0.002488733650227771,
+    "gain_actual_over_desired": -0.4346195505470216,
+    "corr": -0.2330022399023579,
+    "yaw_desired_deg": 3.5891866998546726,
+    "yaw_actual_deg": 8.895541268968582,
+    "yaw_predicted_from_cmd_deg": 0.0,
+    "share_desired_in_deadband": 1.0,
+    "share_sent_in_deadband": 1.0
+  },
+  "straight": {
+    "segment": "straight",
+    "n": 56,
+    "desired_mean_rad_s": 0.0018556401907364,
+    "actual_mean_rad_s": 0.004344373840964171,
+    "bias_actual_minus_desired": 0.002488733650227771,
+    "gain_actual_over_desired": -0.4346195505470216,
+    "corr": -0.2330022399023579,
+    "yaw_desired_deg": 3.5891866998546726,
+    "yaw_actual_deg": 8.895541268968582,
+    "yaw_predicted_from_cmd_deg": 0.0,
+    "share_desired_in_deadband": 1.0,
+    "share_sent_in_deadband": 1.0
+  },
+  "turn": {
+    "segment": "turn",
+    "n": 0
+  },
+  "outdoor_gain_rad_s_per_cmd": null,
+  "indoor_gain_rad_s_per_cmd": 1.66,
+  "n_ticks_sent_ge_0.06": 0
+}
