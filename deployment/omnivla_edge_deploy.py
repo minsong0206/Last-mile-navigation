@@ -620,6 +620,35 @@ ACT_OFFSET_MIN_RAD_S = 0.005      # 이보다 작은 회전 요청은 0 (≈0.3�
 ACT_OFFSET_MAX_CMD = 0.40
 DEFAULT_ACTUATION_MODE = "pwm"
 
+# ── 2026-11-15 추가: 데모용 조향 모드/필터 (field-test-1115) ──────────────────
+# 11/15 닭도리로 데모(deploy_20261115_134633) 전수 분석 결과:
+#   (1) heading(route_bearing)은 안정적이었으나, offset 보정이 모델의 "데드밴드 이하
+#       노이즈(±0.01~0.03)"를 ±0.056↑로 증폭 → 직진 구간이 좌우로 위빙(172틱 중 136틱).
+#   (2) 모델의 코너 조향 세기(중앙 0.029)가 직진 노이즈(p90 0.027)와 겹침 → 모델만으론
+#       코너 좌회전 불확실.
+# 그래서 (A) 모델 모드엔 조향 데드존을 추가해 위빙 제거, (B) 고정경로에서는 모델 대신
+# 경로 기하를 직접 추종하는 route_follow 모드를 토글로 제공(heading 추정 불필요 —
+# cross_track + 앞 경로 곡률 피드포워드로만 조향).
+DEFAULT_STEER_MODE = "model"              # model | route_follow
+DEFAULT_ANGULAR_DEADZONE_RAD_S = 0.0      # 모델 모드: |조향|<이 값이면 0(직진). 데모 권장 0.025
+DEFAULT_ROUTE_BEARING_LOOKAHEAD_M = 5.0   # route_bearing heading 선행거리(코너 선회 타이밍). 데모 권장 2.0
+DEFAULT_ROUTE_FOLLOW_FF_GAIN = 1.0        # route_follow: 앞 경로 곡률 피드포워드(rad/s per rad)
+DEFAULT_ROUTE_FOLLOW_XTRACK_GAIN = 0.15   # route_follow: cross-track 복귀 게인(rad/s per m)
+DEFAULT_ROUTE_FOLLOW_LOOKAHEAD_M = 3.0    # route_follow: 곡률 피드포워드 far 선행거리
+DEFAULT_ROUTE_FOLLOW_NEAR_LOOKAHEAD_M = 0.5  # route_follow: 곡률 피드포워드 near 선행거리(작을수록 코너 가까이서 선회)
+DEFAULT_TURN_SLOWDOWN_LINEAR_MPS = 0.0    # 회전 시 감속 linear(0=꺼짐). 켜면 |조향|>trigger일 때 이 속도로
+DEFAULT_TURN_SLOWDOWN_TRIGGER_ANGULAR = 0.1  # 이 이상 조향이면 회전으로 보고 감속
+# ── gyro-latched 코너 턴 (route_follow 전용): ff 펄스가 투영 전진으로 "자기종료"해서
+#    76° 코너를 20-30°만 돌던 문제(11/15 143313) 해결. 큰 ff가 뜨면 "회전 중" 상태로
+#    래치하고, 자이로로 실제 회전각을 적분해 경로의 알려진 코너 각도를 다 돌 때까지
+#    강한 회전(+감속)을 유지한다. 고정경로라 코너 각도를 기하로 미리 구할 수 있음.
+DEFAULT_TURN_LATCH = False                 # route_follow에서 gyro-latched 코너 턴 사용
+DEFAULT_TURN_LATCH_TRIGGER_ANGULAR = 0.3   # route_follow 조향이 이 이상이면 코너 턴 래치 시작
+DEFAULT_TURN_LATCH_MIN_ANGLE_DEG = 30.0    # 코너 회전각이 이 이상일 때만 래치(작은 꺾임 무시)
+DEFAULT_TURN_LATCH_CMD_ANGULAR = 0.40      # 래치 중 유지할 회전 명령(실외 문턱 0.17 훨씬 넘김)
+DEFAULT_TURN_LATCH_MARGIN_DEG = 6.0        # 목표각 - 이 여유에서 종료(관성/지연 고려)
+DEFAULT_TURN_LATCH_TIMEOUT_S = 15.0        # 안전: 이 시간 넘으면 래치 강제 해제
+
 
 def actuation_offset(linear_mps, angular_rad_s, accum,
                      offset=ACT_OFFSET_CMD, gain=ACT_OFFSET_GAIN_RAD_S,
@@ -865,7 +894,7 @@ class OmniVLAEdgeDeployment:
                  allow_reroute=False,
                  near_goal_override_dist_m=DEFAULT_NEAR_GOAL_OVERRIDE_DIST_M,
                  waypoint_target_step=DEFAULT_WAYPOINT_TARGET_STEP,
-                 route_mode="osrm",
+                 route_mode="osrm", route_file=None,
                  cross_track_gain=DEFAULT_CROSS_TRACK_GAIN,
                  cross_track_blend_gain=DEFAULT_CROSS_TRACK_BLEND_GAIN,
                  cross_track_min_accum_path_m=DEFAULT_CROSS_TRACK_MIN_ACCUM_PATH_M,
@@ -896,7 +925,22 @@ class OmniVLAEdgeDeployment:
                  gps_freeze_persist_ticks=DEFAULT_GPS_FREEZE_PERSIST_TICKS,
                  gps_freeze_speed_threshold_mps=DEFAULT_GPS_FREEZE_SPEED_THRESHOLD_MPS,
                  enable_route_dead_reckoning=DEFAULT_ENABLE_ROUTE_DEAD_RECKONING,
-                 observe_only=False):
+                 observe_only=False, session_tag=None,
+                 steer_mode=DEFAULT_STEER_MODE,
+                 angular_deadzone_rad_s=DEFAULT_ANGULAR_DEADZONE_RAD_S,
+                 route_bearing_lookahead_m=DEFAULT_ROUTE_BEARING_LOOKAHEAD_M,
+                 route_follow_ff_gain=DEFAULT_ROUTE_FOLLOW_FF_GAIN,
+                 route_follow_xtrack_gain=DEFAULT_ROUTE_FOLLOW_XTRACK_GAIN,
+                 route_follow_lookahead_m=DEFAULT_ROUTE_FOLLOW_LOOKAHEAD_M,
+                 route_follow_near_lookahead_m=DEFAULT_ROUTE_FOLLOW_NEAR_LOOKAHEAD_M,
+                 turn_slowdown_linear_mps=DEFAULT_TURN_SLOWDOWN_LINEAR_MPS,
+                 turn_slowdown_trigger_angular=DEFAULT_TURN_SLOWDOWN_TRIGGER_ANGULAR,
+                 turn_latch=DEFAULT_TURN_LATCH,
+                 turn_latch_trigger_angular=DEFAULT_TURN_LATCH_TRIGGER_ANGULAR,
+                 turn_latch_min_angle_deg=DEFAULT_TURN_LATCH_MIN_ANGLE_DEG,
+                 turn_latch_cmd_angular=DEFAULT_TURN_LATCH_CMD_ANGULAR,
+                 turn_latch_margin_deg=DEFAULT_TURN_LATCH_MARGIN_DEG,
+                 turn_latch_timeout_s=DEFAULT_TURN_LATCH_TIMEOUT_S):
         # 2026-09-25: --dry_run의 의미가 "이 프로세스는 GO LIVE 자체를 영구히
         # 거부하는 하드 락"으로 바뀜(순수 검증 세션용). 기본(플래그 없음)은
         # DRY_RUN 상태로 시작하되, 대시보드에서 정렬확인→ARM→GO LIVE를 거치면
@@ -946,6 +990,34 @@ class OmniVLAEdgeDeployment:
         # run_id를 여기서 미리 만들어서 JSONL 로그/ReplayLogger(아래)와 대시보드
         # 녹화 파일(dashboard_capture.py)이 같은 이름을 공유하게 함.
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = run_id
+
+        # 2026-11-15: 세션 폴더(기본=오늘 MMDD, 예 "1115")를 __init__ 맨 앞에서 정해서
+        # 로그 JSONL·frames(map/context)·대시보드 mp4를 전부 한 곳(logs/<tag>/frames/<run_id>/)에
+        # 모은다. 예전엔 대시보드만 레포 루트 "1011/"에 따로 떨어져서 못 찾던 문제 해결.
+        self.session_tag = session_tag or datetime.now().strftime("%m%d")
+        self.log_dir = REPO_ROOT / "deployment" / "logs" / self.session_tag
+        self._frames_dir = self.log_dir / "frames" / run_id
+        self._frames_dir.mkdir(parents=True, exist_ok=True)
+
+        # 2026-11-15: 데모용 조향 설정 저장
+        self.steer_mode = steer_mode
+        self.angular_deadzone_rad_s = angular_deadzone_rad_s
+        self.route_bearing_lookahead_m = route_bearing_lookahead_m
+        self.route_follow_ff_gain = route_follow_ff_gain
+        self.route_follow_xtrack_gain = route_follow_xtrack_gain
+        self.route_follow_lookahead_m = route_follow_lookahead_m
+        self.route_follow_near_lookahead_m = route_follow_near_lookahead_m
+        self.turn_slowdown_linear_mps = turn_slowdown_linear_mps
+        self.turn_slowdown_trigger_angular = turn_slowdown_trigger_angular
+        self.turn_latch = turn_latch
+        self.turn_latch_trigger_angular = turn_latch_trigger_angular
+        self.turn_latch_min_angle_deg = turn_latch_min_angle_deg
+        self.turn_latch_cmd_angular = turn_latch_cmd_angular
+        self.turn_latch_margin_deg = turn_latch_margin_deg
+        self.turn_latch_timeout_s = turn_latch_timeout_s
+        self._turn_latch_state = None   # {sign,target,accum,start_ts} 또는 None
+        self._turn_last_rate_deg_s = 0.0
 
         self.state = DeploymentState()
         self.debug_port = debug_port
@@ -961,7 +1033,7 @@ class OmniVLAEdgeDeployment:
             # --no-record-dashboard면 라이브 대시보드(8080)는 그대로 켜두고 녹화만 끈다.
             if record_dashboard:
                 self._dashboard_recorder = DashboardRecorder(
-                    debug_port, DASHBOARD_CAPTURE_DIR, run_id,
+                    debug_port, self._frames_dir, run_id,
                     on_done=lambda p, n: self.state.log(f"대시보드 녹화 저장됨: {p} ({n}프레임)"),
                     on_error=lambda e: self.state.log_error(f"대시보드 녹화 실패(무시하고 계속): {e!r}"),
                 ).start()
@@ -979,6 +1051,19 @@ class OmniVLAEdgeDeployment:
         self.route_mode = route_mode
         self.map_builder = LiveMapBuilder(map_range_m=map_range_m, route_mode=route_mode)
         self.goal_lat, self.goal_lon = goal_lat, goal_lon
+        # 2026-11-15: route_mode='fixed' — 손으로 정의한 고정 폴리라인(출발→코너→목표)을
+        # 파일에서 로드. OSRM/보도망 없음, heading은 --heading_mode route_bearing로 경로
+        # 접선에서 안정적으로 뽑음(gyro/GPS-track 추정 폭주 회피). 목표는 경로 끝으로 고정.
+        if route_mode == "fixed":
+            if not route_file:
+                raise ValueError("route_mode='fixed'에는 --route_file <경로 JSON>이 필요합니다")
+            with open(route_file) as f:
+                route_latlon = json.load(f)
+            self.map_builder.set_fixed_route(route_latlon)
+            end = self.map_builder._route_latlon[-1]
+            self.goal_lat, self.goal_lon = float(end[0]), float(end[1])
+            print(f"[deploy] route_mode=fixed — {route_file} 로드, "
+                  f"목표(경로 끝)=({self.goal_lat:.6f},{self.goal_lon:.6f})")
         # 경로는 배포 시작 시 1번만 계산해서 캐싱 (osmnav 구조 참고 — 매 프레임 재쿼리 안 함).
         # 시작 위치를 아직 모르므로, 첫 poll_frodobot() 이후 run()에서 set_goal() 호출.
         self._route_initialized = False
@@ -1152,9 +1237,9 @@ class OmniVLAEdgeDeployment:
         self._last_map_heading_source = None            # step()이 매 틱 갱신, run()의 heading-readiness 게이트가 읽음
 
         # ── 데이터분석용 로그 (JSONL, 실행마다 날짜시간별 파일) ──
-        # run_id는 __init__ 맨 위에서 이미 만들어둠(대시보드 녹화 파일명과 공유).
-        # 날짜 폴더 관례(MMDD, 위 DASHBOARD_CAPTURE_DIR과 동일) — 2026-10-11 세션은 "1011"로 분리.
-        log_dir = REPO_ROOT / "deployment" / "logs" / "1011"
+        # run_id/log_dir는 __init__ 맨 위에서 이미 정해둠(세션 폴더 self.session_tag,
+        # 대시보드 mp4·frames와 같은 logs/<tag>/ 아래로 통합). 2026-11-15 변경.
+        log_dir = self.log_dir
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = log_dir / f"deploy_{run_id}.jsonl"
         self._log_fp = open(self.log_path, "a", buffering=1, encoding="utf-8")
@@ -1587,6 +1672,47 @@ class OmniVLAEdgeDeployment:
         angular = math.atan2(y, x) / target_time_s  # y=left이므로 양수 angular=왼쪽 회전(CCW)이 되도록
         return float(np.clip(linear, 0, MAX_V * 2)), float(np.clip(angular, -MAX_W * 2, MAX_W * 2))
 
+    def _route_follow_angular(self, lat, lon):
+        """2026-11-15: steer_mode=route_follow — 고정경로를 모델 없이 기하로 추종.
+        heading(로봇이 향한 방향) 추정이 필요 없는 설계:
+          - 피드포워드: 경로가 앞으로 얼마나 꺾이는지(near 1m vs far lookahead_m 방위 차)
+            → 코너를 선행해서 돈다. 직진 구간은 차이 0이라 기여 없음.
+          - 피드백: cross_track_error_m(경로 오른쪽 +)에 비례해 라인으로 복귀.
+        반환 angular(rad/s, +는 좌회전). 경로가 없거나 끝 근처면 None(호출측이 모델 유지).
+        실제 로봇 반응 차이는 하류 actuation_offset(--actuation_mode offset)이 보정."""
+        near = self.map_builder.route_bearing_rad(lat, lon, lookahead_m=self.route_follow_near_lookahead_m)
+        far = self.map_builder.route_bearing_rad(lat, lon, lookahead_m=self.route_follow_lookahead_m)
+        if near is None or far is None:
+            return None
+        ff = (far - near + math.pi) % (2 * math.pi) - math.pi      # 앞 경로 곡률(rad), +는 좌로 꺾임
+        xt = self.map_builder.cross_track_error_m(lat, lon, lookahead_m=2.0)
+        xt_term = 0.0 if xt is None else self.route_follow_xtrack_gain * xt   # +는 오른쪽 이탈 → 좌회전 복귀
+        return self.route_follow_ff_gain * ff + xt_term
+
+    @staticmethod
+    def _tick_gyro_rate_deg_s(raw_data):
+        """이번 틱 gyros 샘플들의 수직축(z, index 2) 평균 각속도(deg/s). +는 좌회전(CCW).
+        샘플이 없으면 None. (버스트로 와도 평균 레이트는 그 순간 회전속도를 대표함.)"""
+        gs = [float(g[2]) for g in (raw_data or {}).get("gyros") or []
+              if isinstance(g, (list, tuple)) and len(g) >= 3]
+        return (sum(gs) / len(gs)) if gs else None
+
+    def _corner_turn_angle_deg(self, lat, lon):
+        """래치 시점(코너 직전)에서 코너 전체 회전각(deg, 부호: +좌/−우)을 경로 기하로
+        계산. **접선(tangent) 비교**: 들어오는 접선(현 위치 0.5m 앞)과 나가는 접선(경로를
+        따라 ahead_m 전진한 점에서의 0.5m 앞)의 차이 — chord가 아니라 양쪽 직선 구간의
+        방향차라 날카로운 코너도 실제 각(예 76°)을 정확히 돌려줌. 투영이 코너를 지나기 전
+        (래치 시점)에 1회만 호출해 고정."""
+        incoming = self.map_builder.route_bearing_rad(lat, lon, lookahead_m=0.5)
+        ahead = self.map_builder.point_ahead_on_route(
+            lat, lon, max(3.0, self.route_follow_lookahead_m + 1.5))
+        if incoming is None or ahead is None:
+            return 0.0
+        outgoing = self.map_builder.route_bearing_rad(ahead[0], ahead[1], lookahead_m=0.5)
+        if outgoing is None:
+            return 0.0
+        return math.degrees((outgoing - incoming + math.pi) % (2 * math.pi) - math.pi)
+
     def step(self):
         tick_id = self.replay_logger.next_tick_id()
         img, lat, lon, heading_rad, raw_data = self.poll_frodobot()
@@ -1754,7 +1880,8 @@ class OmniVLAEdgeDeployment:
         # 한 번 더 구해야 이번 tick의 heading 보정에 쓸 수 있음. route_bearing_rad() 자체는
         # heading과 무관하게 (lat, lon)+캐싱된 route만 쓰는 순수 조회라 중복 호출 비용 작음.
         # (eff_lat/eff_lon: dead reckoning 켜져 동결 중이면 경로 위 추정 위치, 아니면 raw)
-        route_bearing_rad_now = self.map_builder.route_bearing_rad(eff_lat, eff_lon)
+        route_bearing_rad_now = self.map_builder.route_bearing_rad(
+            eff_lat, eff_lon, lookahead_m=self.route_bearing_lookahead_m)
         # 2026-10-11 추가 (Harness 1 실측, deploy_20261011_100941.jsonl 참고, 위
         # DEFAULT_CROSS_TRACK_GAIN 설명) — route_bearing_to_control()의 heading-only
         # 보정에 빠져있던 횡방향(cross-track) 오차. route_bearing_rad_now와 마찬가지로
@@ -2227,6 +2354,72 @@ class OmniVLAEdgeDeployment:
         # 직접 확인: 모델은 내내 직진 예측(+0.04)인데 로봇은 좌로 밀려 3m 이탈 → 최대
         # 우회전 포화). 단, 안전 정지(gps_freeze/off_route stop로 linear=angular=0)일 때는
         # 트림을 더하지 않음 — "멈춰라"는 명령은 진짜 완전 정지여야 함.
+        # ── 2026-11-15: 데모용 최종 조향 결정 (모든 모델 override 이후, trim 직전) ──
+        # steer_mode=route_follow: 모델 조향을 버리고 고정경로 기하를 직접 추종
+        #   angular = ff_gain·(앞 경로 곡률) + xtrack_gain·(cross_track).  heading 추정 불필요.
+        #   직진 구간은 곡률≈0이라 cross_track만으로 라인 유지, 코너에선 곡률 피드포워드로 선회.
+        # steer_mode=model: |angular|<deadzone이면 0 — offset 보정이 데드밴드 이하 노이즈를
+        #   증폭해 좌우로 위빙하던 문제(11/15 로그 136/172틱) 차단.
+        if abs(linear) > 1e-6:   # 안전 정지(0,0)는 건드리지 않음
+            if self.steer_mode == "route_follow":
+                rf = self._route_follow_angular(eff_lat, eff_lon)
+                record["angular_route_follow"] = rf
+                record["angular_before_route_follow"] = angular
+                ts = record.get("ts")
+                rate = self._tick_gyro_rate_deg_s(raw_data)
+                if rate is not None:
+                    self._turn_last_rate_deg_s = rate
+                else:
+                    rate = self._turn_last_rate_deg_s
+                # gyro-latched 코너 턴: 큰 ff가 뜨면 "회전 중" 래치 → 자이로로 실제 회전각을
+                # 적분해 코너의 알려진 각도를 다 돌 때까지 강한 회전을 유지(ff 자기종료 방지).
+                if (self.turn_latch and self._turn_latch_state is None and rf is not None
+                        and abs(rf) >= self.turn_latch_trigger_angular):
+                    tgt = self._corner_turn_angle_deg(eff_lat, eff_lon)
+                    if abs(tgt) >= self.turn_latch_min_angle_deg:
+                        self._turn_latch_state = {"sign": 1.0 if tgt > 0 else -1.0,
+                                                   "target": abs(tgt), "accum": 0.0,
+                                                   "start_ts": ts, "last_ts": ts}
+                        self.state.log(f"코너 턴 래치 시작: 목표 {abs(tgt):.0f}° "
+                                       f"{'좌' if tgt > 0 else '우'}회전")
+                if self._turn_latch_state is not None:
+                    st = self._turn_latch_state
+                    dt = 0.0 if (ts is None or st["last_ts"] is None) else max(0.0, min(ts - st["last_ts"], 2.0))
+                    st["last_ts"] = ts
+                    st["accum"] += rate * st["sign"] * dt      # 회전방향으로의 순회전각(deg) 적분
+                    elapsed = 0.0 if (ts is None or st["start_ts"] is None) else ts - st["start_ts"]
+                    done = st["accum"] >= (st["target"] - self.turn_latch_margin_deg)
+                    timeout = elapsed > self.turn_latch_timeout_s
+                    record["turn_latch_active"] = True
+                    record["turn_latch_accum_deg"] = round(st["accum"], 1)
+                    record["turn_latch_target_deg"] = round(st["target"], 1)
+                    if done or timeout:
+                        self.state.log(f"코너 턴 래치 종료: 적분 {st['accum']:.0f}°/{st['target']:.0f}° "
+                                       f"({'완료' if done else '타임아웃'})")
+                        record["turn_latch_result"] = "done" if done else "timeout"
+                        self._turn_latch_state = None
+                    else:
+                        angular = st["sign"] * self.turn_latch_cmd_angular
+                        if self.turn_slowdown_linear_mps > 0.0:
+                            linear = self.turn_slowdown_linear_mps
+                        linear, angular = clip_control(linear, angular)
+                if rf is not None and self._turn_latch_state is None:
+                    # 래치 미발동/종료 틱: 일반 route_follow 조향 적용.
+                    # 직진 데드존: ff≈0이라 작은 cross-track 보정만 남는 틱을 0으로(위빙 제거),
+                    # 코너의 큰 ff는 통과. 회전 시 감속(피봇)도 여기서.
+                    if self.angular_deadzone_rad_s > 0.0 and abs(rf) < self.angular_deadzone_rad_s:
+                        rf = 0.0
+                    angular = rf
+                    if (self.turn_slowdown_linear_mps > 0.0
+                            and abs(angular) >= self.turn_slowdown_trigger_angular):
+                        record["linear_before_turn_slowdown"] = linear
+                        linear = self.turn_slowdown_linear_mps
+                    linear, angular = clip_control(linear, angular)
+            elif self.angular_deadzone_rad_s > 0.0 and abs(angular) < self.angular_deadzone_rad_s:
+                record["angular_before_deadzone"] = angular
+                angular = 0.0
+        record["steer_mode"] = self.steer_mode
+
         if self.angular_trim != 0.0 and abs(linear) > 1e-6:
             angular += self.angular_trim
             linear, angular = clip_control(linear, angular)
@@ -2502,6 +2695,47 @@ if __name__ == "__main__":
                         "포함). 사람이 teleop으로 경로를 몰고 모델은 예측만 기록할 때 사용 — "
                         "--dry_run은 매 틱 (0,0)을 보내서 teleop을 덮어쓰므로 이 용도에 못 씀. "
                         "GO LIVE도 영구 잠금. ⚠ 이 프로세스는 로봇을 멈추지 않으니 정지는 teleop 쪽에서.")
+    # ── 2026-11-15: 데모용 조향 모드/필터 + 세션 폴더 (field-test-1115) ──
+    p.add_argument("--session_tag", type=str, default=None,
+                   help="로그/frames/대시보드 mp4를 모을 세션 폴더명(기본=오늘 MMDD, 예 1115). "
+                        "deployment/logs/<tag>/ 아래에 전부 저장됨.")
+    p.add_argument("--steer_mode", type=str, default=DEFAULT_STEER_MODE, choices=["model", "route_follow"],
+                   help="조향 결정 방식. model=모델 출력 사용(기본). route_follow=고정경로(route_mode=fixed/"
+                        "osrm/direct 모두)의 기하를 직접 추종(모델 조향 무시, heading 추정 불필요). "
+                        "11/15 분석: 모델 코너 신호가 직진 노이즈와 겹쳐 모델만으론 코너 좌회전 불확실.")
+    p.add_argument("--angular_deadzone_rad_s", type=float, default=DEFAULT_ANGULAR_DEADZONE_RAD_S,
+                   help="model 모드 전용: |조향|<이 값이면 0(직진)으로 못박음. offset 보정이 데드밴드 "
+                        "이하 노이즈를 증폭해 좌우로 위빙하던 문제(11/15) 차단. 데모 권장 0.025.")
+    p.add_argument("--route_bearing_lookahead_m", type=float, default=DEFAULT_ROUTE_BEARING_LOOKAHEAD_M,
+                   help="route_bearing heading의 선행거리(m). 작을수록 코너에서 지도가 늦게(가까이서) 회전. "
+                        f"기본 {DEFAULT_ROUTE_BEARING_LOOKAHEAD_M}은 코너 수 m 전부터 미리 돎 → 데모 권장 2.0.")
+    p.add_argument("--route_follow_ff_gain", type=float, default=DEFAULT_ROUTE_FOLLOW_FF_GAIN,
+                   help="route_follow: 앞 경로 곡률 피드포워드 게인(rad/s per rad).")
+    p.add_argument("--route_follow_xtrack_gain", type=float, default=DEFAULT_ROUTE_FOLLOW_XTRACK_GAIN,
+                   help="route_follow: cross-track 복귀 게인(rad/s per m).")
+    p.add_argument("--route_follow_lookahead_m", type=float, default=DEFAULT_ROUTE_FOLLOW_LOOKAHEAD_M,
+                   help="route_follow: 곡률 피드포워드 far 선행거리(m). 작을수록 코너에 가까이 와서 선회 시작.")
+    p.add_argument("--route_follow_near_lookahead_m", type=float, default=DEFAULT_ROUTE_FOLLOW_NEAR_LOOKAHEAD_M,
+                   help="route_follow: 곡률 피드포워드 near 선행거리(m, 기본 0.5). far와의 차이가 곡률 창.")
+    p.add_argument("--turn_slowdown_linear_mps", type=float, default=DEFAULT_TURN_SLOWDOWN_LINEAR_MPS,
+                   help="회전 시 감속(0=꺼짐). |조향|>trigger인 틱에 linear를 이 값으로 낮춰 같은 각도를 "
+                        "더 짧은 거리에 돌게 함(실외 약한 회전으로 코너를 못 끝내는 문제 완화). 데모 권장 0.12.")
+    p.add_argument("--turn_slowdown_trigger_angular", type=float, default=DEFAULT_TURN_SLOWDOWN_TRIGGER_ANGULAR,
+                   help="이 이상 |조향|이면 회전으로 보고 감속(기본 0.1).")
+    p.add_argument("--turn_latch", action="store_true", default=DEFAULT_TURN_LATCH,
+                   help="route_follow 전용: gyro-latched 코너 턴. 큰 ff가 뜨면 '회전 중'으로 래치하고 "
+                        "자이로로 실제 회전각을 적분해 코너의 알려진 각도를 다 돌 때까지 강한 회전을 유지 "
+                        "(ff가 투영 전진으로 자기종료해 20-30°만 돌던 문제 해결). 데모에 권장.")
+    p.add_argument("--turn_latch_cmd_angular", type=float, default=DEFAULT_TURN_LATCH_CMD_ANGULAR,
+                   help="래치 중 유지할 회전 명령(기본 0.40).")
+    p.add_argument("--turn_latch_min_angle_deg", type=float, default=DEFAULT_TURN_LATCH_MIN_ANGLE_DEG,
+                   help="코너 회전각이 이 이상일 때만 래치(작은 꺾임 무시, 기본 30°).")
+    p.add_argument("--turn_latch_trigger_angular", type=float, default=DEFAULT_TURN_LATCH_TRIGGER_ANGULAR,
+                   help="route_follow 조향이 이 이상이면 래치 시작(기본 0.3).")
+    p.add_argument("--turn_latch_margin_deg", type=float, default=DEFAULT_TURN_LATCH_MARGIN_DEG,
+                   help="목표각-여유에서 종료(관성/지연, 기본 6°). 덜 돌면 줄이고, 더 돌면 키움.")
+    p.add_argument("--turn_latch_timeout_s", type=float, default=DEFAULT_TURN_LATCH_TIMEOUT_S,
+                   help="안전: 래치가 이 시간 넘으면 강제 해제(기본 15s).")
     p.add_argument("--heading_mode", type=str, default="auto",
                    choices=["auto", "route_aligned_fixed", "route_bearing", "route_bearing_anchored", "gyro", "comp"],
                    help="auto(기본) = 정렬 확인은 실측 GPS heading이 잡히기 전까지의 "
@@ -2541,7 +2775,11 @@ if __name__ == "__main__":
                         f"그 신호를 거의 못 씀(실측: wp2=-1.2° vs wp7(4.0m앞)=-21.6°, "
                         f"docs/experiment_log.md §1-19 정정 참고) — 5~7로 올려서 더 먼 예측을 "
                         f"조향에 반영하는 실험용.")
-    p.add_argument("--route_mode", type=str, default="osrm", choices=["osrm", "direct"],
+    p.add_argument("--route_file", type=str, default=None,
+                   help="route_mode=fixed일 때 쓰는 고정 경로 JSON 파일 [[lat,lon],...] "
+                        "(출발→코너→목표). OSRM/보도망 없이 이 폴리라인을 경로로 사용 — "
+                        "닭도리로 오프라인 좌회전 데모용(2026-11-15). --heading_mode route_bearing과 함께.")
+    p.add_argument("--route_mode", type=str, default="osrm", choices=["osrm", "direct", "fixed"],
                    help="경로 생성 방식 (기본 osrm). osrm=보도망에 스냅 후 OSRM foot 라우팅"
                         "(기존 동작, south-korea-latest.osm.pbf 실데이터 기반). "
                         "direct=스냅/라우팅 전부 건너뛰고 시작↔목표 GPS 원좌표를 직선으로 "
@@ -2739,7 +2977,15 @@ if __name__ == "__main__":
 
     args = p.parse_args()
 
-    missing = [name for name in ("ckpt", "map_range", "goal_lat", "goal_lon") if getattr(args, name) is None]
+    # 2026-11-15: route_mode=fixed는 목표를 --route_file 경로 끝에서 가져오므로
+    # goal_lat/goal_lon을 필수에서 제외(대신 route_file이 필수).
+    required = ["ckpt", "map_range"]
+    if args.route_mode == "fixed":
+        if not args.route_file:
+            raise SystemExit("route_mode=fixed에는 --route_file <경로 JSON>이 필수입니다.")
+    else:
+        required += ["goal_lat", "goal_lon"]
+    missing = [name for name in required if getattr(args, name) is None]
     if missing:
         raise SystemExit(f"다음 값이 CLI 플래그로도, --config로도 안 주어짐(실수 방지를 위해 "
                           f"필수): {missing} — 둘 중 하나로는 반드시 지정할 것.")
@@ -2755,7 +3001,7 @@ if __name__ == "__main__":
         allow_reroute=args.allow_reroute,
         near_goal_override_dist_m=args.near_goal_override_dist_m,
         waypoint_target_step=args.waypoint_target_step,
-        route_mode=args.route_mode,
+        route_mode=args.route_mode, route_file=args.route_file,
         cross_track_gain=args.cross_track_gain,
         cross_track_blend_gain=args.cross_track_blend_gain,
         cross_track_min_accum_path_m=args.cross_track_min_accum_path_m,
@@ -2787,5 +3033,21 @@ if __name__ == "__main__":
         gps_freeze_speed_threshold_mps=args.gps_freeze_speed_threshold_mps,
         enable_route_dead_reckoning=args.enable_route_dead_reckoning,
         observe_only=args.observe_only,
+        session_tag=args.session_tag,
+        steer_mode=args.steer_mode,
+        angular_deadzone_rad_s=args.angular_deadzone_rad_s,
+        route_bearing_lookahead_m=args.route_bearing_lookahead_m,
+        route_follow_ff_gain=args.route_follow_ff_gain,
+        route_follow_xtrack_gain=args.route_follow_xtrack_gain,
+        route_follow_lookahead_m=args.route_follow_lookahead_m,
+        route_follow_near_lookahead_m=args.route_follow_near_lookahead_m,
+        turn_slowdown_linear_mps=args.turn_slowdown_linear_mps,
+        turn_slowdown_trigger_angular=args.turn_slowdown_trigger_angular,
+        turn_latch=args.turn_latch,
+        turn_latch_trigger_angular=args.turn_latch_trigger_angular,
+        turn_latch_min_angle_deg=args.turn_latch_min_angle_deg,
+        turn_latch_cmd_angular=args.turn_latch_cmd_angular,
+        turn_latch_margin_deg=args.turn_latch_margin_deg,
+        turn_latch_timeout_s=args.turn_latch_timeout_s,
     )
     deployer.run()

@@ -163,7 +163,7 @@ class LiveMapBuilder:
                     거의 일치함을 미리 확인한 경우에만 쓸 것(장애물 회피는 이
                     프로젝트 범위 밖이라는 전제와 같은 맥락).
         """
-        assert route_mode in ("osrm", "direct"), f"알 수 없는 route_mode: {route_mode!r}"
+        assert route_mode in ("osrm", "direct", "fixed"), f"알 수 없는 route_mode: {route_mode!r}"
         self.route_mode = route_mode
         self.map_range_m = map_range_m
         self.zoom = zoom
@@ -182,9 +182,35 @@ class LiveMapBuilder:
         self.last_start_snap_m = None
         self.last_goal_snap_m = None
 
+    def set_fixed_route(self, route_latlon):
+        """2026-11-15: route_mode='fixed' — 손으로 정의한 고정 폴리라인을 경로로 설정
+        (닭도리로 오프라인 데모용). OSRM/보도망 스냅/실시간 라우팅을 전부 건너뛰고,
+        주어진 [[lat,lon],...]를 학습과 동일하게 1m densify 후 캔버스를 빌드한다.
+        heading은 배포에서 --heading_mode route_bearing(경로 접선)으로 안정적으로 뽑음.
+        로봇 실시간 GPS는 get_map_image()/route_bearing_rad()에서 이 경로에 투영되므로
+        시작 위치가 조금씩 변해도 투영으로 자동 처리됨."""
+        arr = np.array(route_latlon, dtype=float)
+        assert arr.ndim == 2 and arr.shape[0] >= 2 and arr.shape[1] == 2, \
+            "route_latlon은 (>=2,2) 형태 [[lat,lon],...] 이어야 함"
+        self._route_latlon = _densify_route(arr, 1.0)
+        self._canvas = build_canvas(self._route_latlon[:, 0], self._route_latlon[:, 1],
+                                     self.zoom, self.session)
+        self.last_osrm_fallback = False
+        self.last_start_snap_m = None
+        self.last_goal_snap_m = None
+        print(f"[LiveMapBuilder] route_mode=fixed — 고정 경로 {len(self._route_latlon)}개 포인트 "
+              f"(densified) 로드, 캔버스 빌드 완료. "
+              f"목표(경로 끝)=({self._route_latlon[-1][0]:.6f},{self._route_latlon[-1][1]:.6f})")
+
     def set_goal(self, start_lat, start_lon, goal_lat, goal_lon):
         """경로를 1번 계산해서 캐싱. 배포 시작 시(또는 경로 이탈 재계산 시)만 호출.
         get_map_image()는 이후 이 캐싱된 경로만 사용하고 네트워크 요청을 하지 않음."""
+        if self.route_mode == "fixed":
+            # 고정 경로는 set_fixed_route()에서 이미 로드/캔버스 빌드됨 — 재계산/네트워크 없음.
+            if self._route_latlon is None:
+                raise RuntimeError("route_mode='fixed'인데 고정 경로 미로드 "
+                                   "(set_fixed_route()를 먼저 호출해야 함)")
+            return
         if self.route_mode == "direct":
             # 2026-10-11 추가 (사용자 요청): 보도망 스냅/OSRM 라우팅을 완전히
             # 건너뛰고 원좌표 그대로 직선 — query_osrm_route()의 폴백과 동일한
